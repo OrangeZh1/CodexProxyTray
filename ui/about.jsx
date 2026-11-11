@@ -38,7 +38,7 @@ function checkedTime(value){
 }
 export function LicenseText(){return <pre className="license-text">{license}</pre>;}
 function LicenseDialog(){
-  return <Dialog><DialogTrigger disableButtonEnhancement><Button className="license-link" appearance="transparent">MIT 许可</Button></DialogTrigger><DialogSurface className="license-dialog"><DialogBody><DialogTitle>MIT 开源许可</DialogTitle><DialogContent className="license-content"><LicenseText/></DialogContent><DialogActions><DialogTrigger disableButtonEnhancement><Button appearance="subtle">关闭</Button></DialogTrigger></DialogActions></DialogBody></DialogSurface></Dialog>;
+  return <Dialog><DialogTrigger disableButtonEnhancement><Button className="license-link" appearance="transparent" aria-haspopup="dialog">MIT 许可</Button></DialogTrigger><DialogSurface className="license-dialog"><DialogBody><DialogTitle>MIT 开源许可</DialogTitle><DialogContent className="license-content"><LicenseText/></DialogContent><DialogActions><DialogTrigger disableButtonEnhancement><Button appearance="subtle">关闭</Button></DialogTrigger></DialogActions></DialogBody></DialogSurface></Dialog>;
 }
 
 export function About({status,version,busy=()=>false,writable=false,onPreference,onCheck,onSource,onRelease,onLogs}){
