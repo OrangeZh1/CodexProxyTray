@@ -104,7 +104,7 @@ try {
     const result=new RegExp(`<${tag}\\b[^>]*\\bid="${escaped}"[^>]*>`).exec(markup)?.[0];
     assert.ok(result,`Missing ${id}`);return result;
   };
-  const disabled=markup=>/\bdisabled(?:=|\s|>)/.test(markup);
+  const disabled=markup=>/(?:^|\s)disabled(?:=|\s|>)/.test(markup);
   const buttonLabel=(markup,id)=>new RegExp(`<button\\b(?=[^>]*\\bid="${id}")[^>]*>([\\s\\S]*?)<\\/button>`).exec(markup)?.[1]||'';
   const updateState={checking:true,checked_at:Date.UTC(2026,10,11,12,34,56),status:'current',latest:version,notes:'',error:null};
   const background=about({network_enabled:true,auto_check_updates:false,update_interval_hours:3,update:updateState});

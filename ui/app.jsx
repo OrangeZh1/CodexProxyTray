@@ -37,6 +37,7 @@ export function Metric({icon,label,value,detail}){return <article className="met
 
 export function GuardButton({status,observed,writable,busy,onToggle}){
   const [now,setNow]=useState(()=>Date.now());
+  // Retain text for the exit fade; the paused square clips and hides the clock.
   const renderedTime=useRef('—');
   const [pendingVisible,setPendingVisible]=useState(false);
   const pendingShownAt=useRef(0);
