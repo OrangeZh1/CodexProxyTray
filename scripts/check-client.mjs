@@ -23,6 +23,10 @@ for(const view of ['main','tray'])for(const theme of ['light','dark']){
     window.localStorage.setItem('color-theme',theme);
     window.console.error=(...args)=>errors.push(args.map(String).join(' '));
     window.addEventListener('error',event=>errors.push(String(event.error||event.message)));
+    // Happy DOM owns these Promises outside the window realm. Observe normal animation cancellation
+    // without changing the Animation result; actual popup animation is checked in Windows.
+    const animate=window.Element.prototype.animate;
+    window.Element.prototype.animate=function(...args){const animation=animate.apply(this,args);animation.finished.catch(error=>{if(error.name!=='AbortError')errors.push(String(error));});return animation;};
     let focusChanged,hideCount=0,refreshResolve;
     const appWindow={label:view,hide:async()=>{hideCount++;},setTheme:async()=>{},setBackgroundColor:async()=>{throw Error('Do not repaint the native background after mounting.');},isMaximized:async()=>false,onResized:async()=>()=>{},onFocusChanged:async callback=>{focusChanged=callback;return()=>{};}};
     window.__TAURI__={core:{invoke:async(command,args)=>{const firstReady=!commands.includes('frontend_ready');commands.push(command);if(command==='report_ui_error'){errors.push(args.message);return null;}if(command==='frontend_ready'){if(view==='tray'&&firstReady)focusChanged?.({payload:true});return null;}if(command==='get_status')return structuredClone(sample);if(command==='refresh_status')return new Promise(resolve=>{refreshResolve=resolve;});throw Error(`Unexpected startup command: ${command}`);}},window:{getCurrentWindow:()=>appWindow},event:{listen:async()=>()=>{}}};
@@ -71,5 +75,5 @@ for(const view of ['main','tray'])for(const theme of ['light','dark']){
     }
     assert.equal(window.document.documentElement.dataset.theme,theme);
     console.log(`Client startup passed: ${view}/${theme}, production bundle and backend reply.`);
-  }finally{await window.happyDOM.close();}
+  }finally{await window.happyDOM.close();await delay(0);assert.deepEqual(errors,[]);}
 }

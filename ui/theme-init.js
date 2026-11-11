@@ -26,5 +26,5 @@
     if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',show,{once:true});else queueMicrotask(show);
   };
   window.addEventListener('error',event=>window.reportUiError(event.error||event.message||'界面资源加载失败'));
-  window.addEventListener('unhandledrejection',event=>window.reportUiError(event.reason));
+  window.addEventListener('unhandledrejection',event=>{if(event.reason?.name==='AbortError'){event.preventDefault();return;}window.reportUiError(event.reason);});
 })();
