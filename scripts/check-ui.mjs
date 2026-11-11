@@ -17,8 +17,8 @@ const {renderToStaticMarkup:renderReactMarkup}=require('react-dom/server');
 const {SSRProvider}=require('@fluentui/react-components');
 const renderToStaticMarkup=node=>renderReactMarkup(React.createElement(SSRProvider,null,node));
 const {App,About,LicenseText,GuardButton,ConnectivityCard,TrafficCard,CollectorSettings,StatusLabel,trafficAmount,readThemeMode,resolveTheme}=require(output);
-const labels=['仪表盘','代理','设置','运行日志','关于'];
-const render=(page,status=null)=>renderToStaticMarkup(React.createElement(App,{initialPage:page,initialStatus:status}));
+const labels=['仪表盘','代理','运行日志','设置'];
+const render=(page,status=null,initialSettingsTab='general')=>renderToStaticMarkup(React.createElement(App,{initialPage:page,initialStatus:status,initialSettingsTab}));
 function sections(html) {
   // App pages are sibling sections; nested settings groups use divs/articles.
   return [...html.matchAll(/<section\b([^>]*)>([\s\S]*?)<\/section>/g)].map(([,attributes,body])=>({name:/aria-label="([^"]+)"/.exec(attributes)?.[1],visible:!/(?:^|\s)hidden(?:=|\s|$)/.test(attributes),body}));
@@ -28,18 +28,38 @@ function active(html,label) {
   assert.deepEqual(pages.filter(page=>page.visible).map(page=>page.name),[label]);
   return pages.find(page=>page.name===label).body;
 }
+function settingsPanel(html,name){
+  const body=active(html,'设置');
+  const panels=[...body.matchAll(/<article\b([^>]*)>([\s\S]*?)<\/article>/g)].map(([,attributes,content])=>({id:/\bid="([^"]+)"/.exec(attributes)?.[1],visible:!/(?:^|\s)hidden(?:=|\s|$)/.test(attributes),body:content}));
+  assert.equal(panels.length,2);
+  assert.deepEqual(panels.filter(panel=>panel.visible).map(panel=>panel.id),[`settings-panel-${name}`]);
+  return panels.find(panel=>panel.id===`settings-panel-${name}`).body;
+}
 const sample={revision:7,enabled:true,guard_ready:true,proxy_url:'http://127.0.0.1:7890',proxy_reachable:true,proxy_latency_ms:0.25,probe_history:[{at:1000,latency_ms:0.5},{at:2000,latency_ms:null},{at:3000,latency_ms:0.25}],package_count:1,package_version:'26.1',codex_running:true,desktop_pid:42,tcp_connections:12,helper_memory_bytes:8388608,started_at:1000,updated_at:3662000,cli_detected:true,cli_ready:true,autostart:false,launch_desktop:false,backend_ready:true,logs:[{id:1,at:1000,level:'info',category:'检测',message:'检测完成',details:'耗时：23 ms\n<script>unsafe()</script>'}]};
 let checks=0;
 try {
-  for(const [page,label] of [['dashboard','仪表盘'],['proxy','代理'],['settings','设置'],['logs','运行日志'],['about','关于']]) {
-    const html=render(page,sample),body=active(html,label);
-    assert.equal(sections(html).length,5);
+  for(const [page,label] of [['dashboard','仪表盘'],['proxy','代理'],['logs','运行日志'],['settings','设置']]) {
+    const html=render(page,sample),body=page==='settings'?settingsPanel(html,'general'):active(html,label);
+    assert.equal(sections(html).length,4);
     if(page!=='settings')assert.doesNotMatch(body,/登录时自动启动|启动后打开/);
     else {assert.match(body,/登录时自动启动/);assert.match(body,/启动后打开/);}
     assert.doesNotMatch(html,/保存启动设置|关闭设置窗口后，守护继续运行/);
     checks++;
   }
+  const settingsAbout=render('settings',sample,'about');
+  const aboutPanel=settingsPanel(settingsAbout,'about');
+  assert.match(aboutPanel,/版本 /);assert.match(aboutPanel,/本机数据与隐私/);assert.match(aboutPanel,/检查更新/);
+  assert.doesNotMatch(aboutPanel,/登录时自动启动|启动后打开|aria-label="界面主题"/);
+  assert.match(active(settingsAbout,'设置'),/aria-label="设置分类"/);
+  assert.doesNotMatch(settingsAbout,/\bdata-page="about"/);
+  assert.equal(sections(settingsAbout).length,4);
+  settingsPanel(render('settings',sample,'invalid'),'general');
+  settingsPanel(render('about',sample),'about');
+  assert.match(active(render('not-a-page',sample),'仪表盘'),/本地代理连接耗时/);
+  checks++;
   const html=render('dashboard',sample);
+  const navigation=/<nav\b[^>]*>([\s\S]*?)<\/nav>/.exec(html)?.[1];
+  assert.ok(navigation);assert.deepEqual([...navigation.matchAll(/\bdata-page="([^"]+)"/g)].map(match=>match[1]),['dashboard','proxy','logs','settings']);
   assert.equal((html.match(/class="window-controls"/g)||[]).length,1);
   for(const label of ['最小化','最大化','关闭到托盘'])assert.ok(html.includes(`aria-label="${label}"`));
   const brand=/<div\b[^>]*class="brand"[^>]*>([\s\S]*?)<\/div>/.exec(html)?.[1];
@@ -201,7 +221,7 @@ try {
   }
   const trafficStarting=traffic({state:'starting'});
   assert.match(trafficStarting,/正在启动/);assert.match(control(trafficStarting,'button','disable-traffic'),/aria-busy="false"/);
-  const enabling=traffic({state:'starting'},new Set(['enable-traffic']),runningService,true);
+  const enabling=traffic({state:'starting'},new Set(['dashboard-enable-traffic']),runningService,true);
   assert.match(control(enabling,'button','enable-traffic'),/aria-busy="true"/);assert.match(control(enabling,'button','disable-traffic'),/aria-busy="false"/);assert.equal(disabled(control(enabling,'button','disable-traffic')),true);
   const missingService=traffic({state:'collecting',receive_bps:2048},new Set(),{state:'not_installed'});
   assert.match(missingService,/请先安装辅助服务/);assert.match(missingService,/前往设置/);assert.doesNotMatch(missingService,/\bid="enable-traffic"|2\.0 KB\/s/);
@@ -230,6 +250,18 @@ try {
   const installing=collector({state:'not_installed'},{state:'disabled'},new Set(['install-traffic-service']));
   assert.match(control(installing,'button','install-traffic-service'),/aria-busy="true"/);
   assert.match(control(installing,'input','traffic-enabled'),/aria-busy="false"/);assert.equal(disabled(control(installing,'input','traffic-enabled')),true);
+  checks++;
+
+  const dashboardInitiated=collector(runningService,{state:'starting'},new Set(['dashboard-enable-traffic']));
+  assert.match(control(dashboardInitiated,'input','traffic-enabled'),/aria-busy="false"/);assert.equal(disabled(control(dashboardInitiated,'input','traffic-enabled')),true);
+  const settingsInitiated=traffic({state:'starting'},new Set(['settings-enable-traffic']),runningService,true);
+  assert.match(control(settingsInitiated,'button','disable-traffic'),/aria-busy="false"/);assert.equal(disabled(control(settingsInitiated,'button','disable-traffic')),true);
+  const ownSettings=collector(runningService,{state:'starting'},new Set(['settings-enable-traffic']));
+  assert.match(control(ownSettings,'input','traffic-enabled'),/aria-busy="true"/);
+  const dashboardStop=collector(runningService,{state:'collecting'},new Set(['dashboard-disable-traffic']));
+  assert.match(control(dashboardStop,'input','traffic-enabled'),/aria-busy="false"/);assert.equal(disabled(control(dashboardStop,'input','traffic-enabled')),true);
+  const settingsStop=traffic({state:'collecting'},new Set(['settings-disable-traffic']),runningService,true);
+  assert.match(control(settingsStop,'button','disable-traffic'),/aria-busy="false"/);assert.equal(disabled(control(settingsStop,'button','disable-traffic')),true);
   checks++;
   const normalStatus=renderToStaticMarkup(React.createElement(StatusLabel,null,'待检测'));
   assert.match(normalStatus,/data-status="neutral"/);assert.match(normalStatus,/status-label-dot[^>]*aria-hidden="true"/);

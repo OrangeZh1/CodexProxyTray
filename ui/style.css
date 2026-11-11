@@ -218,6 +218,10 @@ h2 { font-size: 14px; font-weight: 600; color: var(--text-secondary); margin: 18
 .log-filters { gap: 4px; }
 .log-filter-tab { border-radius: 5px; font-size: 13px; }
 .log-filter-tab[aria-selected="true"] { color: var(--accent); background: var(--selection-bg); }
+.settings-tabs { width: 100%; gap: 8px; margin: 0 0 18px; }
+.settings-tab { min-height: 36px; padding-inline: 12px; border-radius: 5px; font-size: 14px; font-weight: 500; }
+.settings-tab[aria-selected="true"] { color: var(--accent); }
+.settings-panel { min-width: 0; width: 100%; }
 .empty-state { padding: 32px; color: var(--text-muted); text-align: center; }
 .first-section { margin-top: 0; }
 .about-links { display: flex; flex-wrap: wrap; gap: 4px; }
