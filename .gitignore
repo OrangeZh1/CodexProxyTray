@@ -1,11 +1,7 @@
-# Local settings, diagnostics, and generated shortcuts are not source files.
-.env
-.env.*
-*.lnk
-*.ico
+/src-tauri/target/
+/target/
+/node_modules/
+/dist/
+/.local/
+/design-qa.md
 *.log
-*.bak
-*.zip
-work/
-.DS_Store
-Thumbs.db

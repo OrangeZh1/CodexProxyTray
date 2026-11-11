@@ -5,3 +5,14 @@
 *.txt text eol=crlf
 *.md text eol=lf
 LICENSE text eol=lf
+*.rs text eol=lf
+*.mjs text eol=lf
+*.jsx text eol=lf
+*.css text eol=lf
+*.svg text eol=lf
+*.json text eol=lf
+*.toml text eol=lf
+*.lock text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+.gitignore text eol=lf

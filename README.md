@@ -1,175 +1,87 @@
-# ChatGPT Proxy Launcher
+# CodexProxyTray
 
-**Codex 一直“重新连接（Reconnecting 1/5～5/5）”？代理已经开了，ChatGPT / Codex 还是连不上？**
+面向 Windows x64 的 Tauri 托盘程序，为 ChatGPT 桌面端和 Windows Codex CLI 提供专用代理启动环境。
 
-给 Windows 桌面应用一个带代理、保留包身份的启动入口。
+当前为开发版本，尚未发布 CodexProxyTray 正式安装包。
 
-一个由 PowerShell 和 VBScript 组成的小工具。从桌面快捷方式启动应用，为本次进程设置本地代理，启动前检查代理端口，并在 Windows 应用包上下文中运行。无需安装 Node.js、Python 或额外依赖。
+## 功能
 
-> 这是社区启动工具，与 OpenAI 无隶属关系。当前适配的是包名为 `OpenAI.Codex`、入口为 `app\ChatGPT.exe` 的 Windows 桌面应用。它不是代理服务器，也不提供代理节点。
+- 启动助手后开启守护，关闭窗口收起到托盘。
+- 为 ChatGPT 应用包的后续启动提供代理环境；不结束正在运行的桌面应用。
+- 接入 Windows `codex` 命令入口。助手运行且守护启用时，代理变量仅传给 CLI 子进程。
+- 仪表盘展示本地代理连接耗时、ChatGPT TCP 连接、本次运行时长与守护进程工作集；数据来自实际采样。
+- 配置本地 HTTP 代理地址，分别查看代理端口、桌面应用、CLI 的状态。
+- 独立设置页：登录自动启动、启动后打开 ChatGPT / Codex CLI / 两者，偏好即时保存；CLI 可设置工作目录。
+- 从页面或托盘打开 ChatGPT、Codex CLI。
+- 手动检查 GitHub Releases，显示新版本、更新说明和发布页入口；可关闭更新联网，自动检查支持 1/3/6/12/24 小时间隔。
+- 一体化窗口顶部、可收放侧栏、分组托盘菜单、单实例运行。
+- 分类日志包含检测结果、耗时、进程与失败详情，保留最近 200 条，并在本机持续保存。
 
-## 为什么做这个
+## 使用边界
 
-有时浏览器能联网、代理客户端也正常，桌面应用里的部分请求却依然失败。反复重装、切换配置，甚至关闭 WSL，都不一定找对原因。
+- FlClash 或其他本地 HTTP 代理需要正常运行；助手不提供代理节点。
+- 本机需有 Microsoft Edge WebView2 Runtime。仪表盘中的耗时表示本地 TCP 连接耗时，不代表外部服务响应时间；TCP 连接数只统计 ChatGPT 应用进程树中的已建立连接。
+- 启用守护前已经启动的 ChatGPT，需要在方便时完整退出并重新打开一次。
+- CLI 首次接入会把专用入口目录加入当前用户 PATH。请新开终端后运行 `codex`；直接调用原 CLI 的绝对路径会绕过该入口。
+- CLI 接入目标是当前电脑安装的 Windows CLI，不修改 WSL、远程主机或容器内的命令。
+- 暂停或退出助手后，新启动的 CLI 按原配置运行；已经运行的进程保留启动时的环境。
+- 开机自启和自动打开 ChatGPT 默认关闭。代理设置保存在 `%LOCALAPPDATA%\CodexProxyTray`。
+- 当前桌面应用的 Windows 包标识仍为 `OpenAI.Codex_2p2nqsd0c76g0`，界面名称使用 ChatGPT。
 
-本项目把几个容易遗漏的启动条件放到一个入口里：
+## 开发
 
-| 遇到的痛点 | 启动器做什么 |
-| --- | --- |
-| Codex 反复“重新连接（Reconnecting 1/5～5/5）” | 针对代理未传入进程、启动环境不正确的场景，提供统一启动入口；使用者反馈改用后已恢复正常 |
-| 已开启代理，应用或子进程仍未拿到代理设置 | 在启动链中设置 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY`，供遵循这些变量的进程使用 |
-| 为了带代理直接运行商店安装目录里的 EXE，缺少应用包上下文 | 使用 `Invoke-CommandInDesktopPackage` 创建带包身份的进程，启动前再次核验身份 |
-| 代理没启动或端口填错，只看到应用连接失败 | 先检查本地 TCP 端口，连接失败时给出明确提示 |
-| 每次启动都留着一个 PowerShell 窗口 | 使用 VBS 隐藏启动，不等待应用退出 |
-| 应用升级后安装目录变了，旧快捷方式失效 | 每次通过当前用户的已安装包查找 EXE，不固定版本路径 |
+前端使用 React 19、Fluent UI React v9 和本地打包的 Iconify Fluent 图标。原生部分使用 Rust、Tauri 2 和 Windows API。
 
-### 实际使用中遇到的重连、WSL 和内置提示词问题
-
-这个工具最初用于处理自己的 Windows 桌面使用问题：代理已经开启，但 **Codex 仍反复显示“重新连接（Reconnecting 1/5～5/5）”**；同时遇到过**卡在“结束 WSL”以及内置提示词加载异常**的现象。改用这个代理快捷方式后，这些现象在该使用环境中恢复正常。这是使用者反馈的案例。
-
-这里把观察到的效果和代码能力分开说明：启动器直接处理的是**代理环境变量和 Windows 包身份**。它没有执行 `wsl --shutdown`，没有修改 WSL 配置，也没有读取、注入或修改内置提示词。因此，这个案例不代表已证明所有重连、WSL 或提示词问题都由同一原因引起，也不保证可以修复应用自身的缺陷。服务端故障、登录状态或不可用的代理节点等其他原因，仍需单独排查。
-
-## 开启 WSL 有什么优势
-
-WSL 是 Windows Subsystem for Linux，可以在 Windows 上同时使用 Linux 环境。对需要写代码、运行项目的人来说，它主要有这些价值：
-
-- **直接使用 Linux 工具链**：运行 Bash、Linux 包管理器，以及面向 Linux 的 Node.js、Python、Go 等开发工具。
-- **更贴近 Linux 服务器**：提前发现路径大小写、文件权限、Shell 脚本和依赖差异，减少本地能跑、部署后出问题的情况。
-- **Windows 和 Linux 配合工作**：继续使用 Windows 桌面应用，同时在 Linux 环境里构建、测试和运行服务。
-- **按项目选择环境**：依赖 Linux 的项目可以放在 WSL 中；Windows 原生项目继续在 Windows 中开发。
-
-这些是 WSL 本身的能力，不是本启动器提供的新功能。仅使用桌面聊天或原生 Windows 工具时，不必为了这个启动器额外安装 WSL。可参考 [Microsoft 的 WSL 介绍](https://learn.microsoft.com/en-us/windows/wsl/about)。
-
-**WSL 的网络需要单独核对。** 本工具设置的是 Windows 启动进程的环境，不会自动配置 Linux 内的代理。WSL 2 默认 NAT 模式下，Linux 中的 `127.0.0.1` 不能直接当作 Windows 的本地代理地址；受支持系统上的镜像网络模式可以让 WSL 通过 `127.0.0.1` 访问 Windows 服务。具体以 [Microsoft 的 WSL 网络说明](https://learn.microsoft.com/en-us/windows/wsl/networking)为准。
-
-另外，WSL 和 WS / WebSocket 是两回事：前者是 Linux 开发环境，后者是网络通信协议。这个启动器既不会关闭 WSL，也不会强制关闭 WebSocket。
-
-## 使用条件
-
-- Windows 桌面系统，已为当前用户安装上述 `OpenAI.Codex` 应用包。
-- 系统自带的 **Windows PowerShell 5.1**、Appx 模块及 Windows Script Host / VBScript 可用。运行下方的 `powershell.exe` 命令，不需要 PowerShell 7。
-- 已有可用的本地 HTTP 或 mixed 代理，例如 FlClash 提供的 `127.0.0.1:7890`。SOCKS-only 端口不适用。
-- 当前版本只支持 `127.0.0.1` 上的代理，可自定义端口；不处理代理认证。
-
-安装目录位于当前用户目录。脚本不会主动请求管理员权限；如果系统策略禁用脚本宿主或阻止相关命令，应按组织策略处理。
-
-## 安装和使用
-
-### 下载即用（推荐）
-
-1. 打开 [最新 Release](https://github.com/OrangeZh1/chatgpt-proxy-launcher/releases/latest)，下载附件 **chatgpt-proxy-launcher-windows-v1.0.0.zip**。这是整理好的安装包；GitHub 自动生成的 Source code 是源码包。
-2. 右键 ZIP，选择“全部解压”，打开解压后的文件夹。
-3. 先开启代理客户端，再双击 **Install.cmd**。安装器会自动读取 Windows 系统代理和代理环境变量，识别到可连接的本地代理后直接使用。无法识别时才提示输入端口，默认 `7890`。
-4. 安装完成后，先开启代理，保存任务并完全退出 ChatGPT/Codex（包括托盘），再双击桌面 **ChatGPT Proxy**。
-
-已有安装时会询问是否更新，确认后只替换启动器文件和快捷方式。包内 [QUICKSTART.txt](QUICKSTART.txt) 提供离线中文说明，Release 同时附带 SHA-256 校验值。
-
-安装完成后，启动文件已复制到当前用户目录，可以删除下载的 ZIP 和解压目录。更换端口时重新运行安装入口并确认更新即可。
-
-自动识别按“已启用的 Windows 系统代理 → `HTTPS_PROXY` → `HTTP_PROXY` → `ALL_PROXY`”顺序选择可连接的 `127.0.0.1` / `localhost` HTTP 代理，不扫描其他端口、不执行 PAC，也不接受带账号密码的地址。TCP 可连接不等于代理节点可用。端口在安装时保存到快捷方式中，不会每次启动都重新检测；需要固定端口时可使用下方 `-ProxyPort` 参数，手动值优先。
-
-### 从源码安装
-
-1. 下载此仓库的 ZIP 并解压，或克隆仓库：
-
-   ```powershell
-   git clone https://github.com/OrangeZh1/chatgpt-proxy-launcher.git
-   cd chatgpt-proxy-launcher
-   ```
-
-2. 在解压后的项目目录打开 PowerShell，安装启动器：
-
-   ```powershell
-   powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Install.ps1
-   ```
-
-   脚本会把两个启动文件复制到 `%LOCALAPPDATA%\ChatGPTProxyLauncher`，并创建桌面快捷方式 **ChatGPT Proxy**。快捷方式使用系统 PowerShell 图标，仓库不分发 OpenAI 图标。命令中的执行策略参数仅作用于本次 PowerShell 进程，不会持久修改系统执行策略。
-
-3. 启动代理客户端，确认 HTTP / mixed 端口已经开启。
-4. 保存任务并完全退出现有 ChatGPT / Codex，包括托盘进程，再双击 **ChatGPT Proxy**。
-
-启动器检测到目标应用仍在运行时会提示退出，不会强制结束任务。新的环境变量无法追加给已经运行的应用进程。
-
-### 自定义代理端口
-
-默认安装会尝试自动识别代理；无可用设置时使用 `7890`。例如需要固定为 `127.0.0.1:7897`，首次安装时运行：
+开发预览使用 Node.js 24.14 或以上版本；最终 Windows 程序不依赖 Node.js 运行前端。
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Install.ps1 -ProxyPort 7897
+npm install
+npm run build:ui
+npm run check:ui
+npm run preview
+npm run tauri dev
 ```
 
-已有安装时，先检查安装目录是否有自己改过的脚本，再使用 `-Force` 更新：
+`preview` 监听 `127.0.0.1:4173`，读取 `dist/`；修改 `ui/` 后重新执行 `build:ui`，预览自动刷新。普通浏览器只读本机状态；Tauri 窗口使用真实 IPC 后台，支持实际操作。
+
+Windows 常规构建需按 Tauri 官方要求准备 Rust 与 C++ 工具链。生产构建将页面内嵌，不依赖预览服务器：
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Install.ps1 -ProxyPort 7897 -Force
+npm run build
 ```
 
-`-Force` 会替换安装目录里的两个同名启动脚本和目标桌面快捷方式，不清空目录。默认不覆盖已有文件。
+便携目录必须同时包含 `CodexProxyTray.exe`、`codex-proxy-cli.exe` 和 x64 `WebView2Loader.dll`。本机 GNU 构建的 loader 来自锁定依赖 `webview2-com-sys 0.39.1` 的 `x64/WebView2Loader.dll`，不能只复制两个 exe。
 
-### 不安装，直接运行
+`scripts/package-windows.mjs --bin-dir <release目录> --loader <已校验DLL> --out <新的空目录>` 会先校验三份 PE 均为 x64、loader 的 SHA256 与已验证依赖一致，再生成便携目录和校验回执。`custom-protocol` 生产构建内嵌 `dist/`；devUrl 开发版不能当作独立交付包。
 
-```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Start-ChatGPT-With-Proxy.ps1 -ProxyPort 7890
-```
+## 验证
 
-直接运行便于排查；日常使用桌面快捷方式可以隐藏启动窗口。
-
-## 只检查，不启动应用
-
-在仓库目录执行：
-
-```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Start-ChatGPT-With-Proxy.ps1 -CheckOnly -ProxyPort 7890
-```
-
-成功时输出 JSON，包含应用路径、是否正在运行、代理端口是否可达、期望/当前包身份及代理变量。失败时返回非零退出码。此模式不会启动或关闭应用，可以在当前会话运行时使用。
-
-`proxy_reachable: true` 仅表示 **TCP 端口可连接**，不证明该端口提供正确的 HTTP 代理服务、节点可用或远端请求一定成功。外层检查的 `current_package` 也可能为空；真正启动时会在内层再次验证包身份。
-
-诊断输出含本机路径，反馈问题前请去掉个人用户名等信息。不要提交账号令牌、聊天记录或完整应用配置。
-
-## 工作原理与边界
+本仓库为 public，完整测试和构建默认通过 GitHub Actions。工作流仅提供手动触发，不自动在每次 push/PR 上跑全量：
 
 ```text
-桌面快捷方式
-  → VBS 隐藏启动 PowerShell
-  → 检查应用包、代理端口和运行状态
-  → 在目标 Windows 应用包上下文中启动内层 PowerShell
-  → 核验包身份，设置代理环境变量
-  → 启动 ChatGPT.exe
+gh workflow run ci.yml --ref main
 ```
 
-- 代理变量只在启动进程及继承其环境的子进程中设置，不写入用户/系统全局环境变量，也不修改系统代理。
-- 设置 `NO_PROXY=localhost,127.0.0.1,::1`，让遵循该变量的本地请求绕过代理。
-- 不修改应用安装文件、账号、提示词、模型提供方、WSL 或开机启动配置。
-- 不接管所有流量。忽略代理环境变量的组件、已启动的后台服务以及 WSL 内的工具，可能需要各自配置。
-- 保留 Windows 包身份通过 Microsoft 的调试命令实现。它不等同于官方启动入口的全部行为；Microsoft 对该命令的保证限于包身份及虚拟化资源访问，应用版本或系统策略变化仍可能影响兼容性。参见 [Invoke-CommandInDesktopPackage](https://learn.microsoft.com/en-us/powershell/module/appx/invoke-commandindesktoppackage?view=windowsserver2025-ps) 和 [GetCurrentPackageFullName](https://learn.microsoft.com/en-us/windows/win32/api/appmodel/nf-appmodel-getcurrentpackagefullname)。
+Linux job 执行 Rust 核心检查、JavaScript 状态/更新/采样检查、前端构建及实际 JSX 的 SSR 结构检查；Windows job 编译 x64 MSVC 内嵌版本，验证隔离 CLI 的环境、参数和退出码，再保存仅含必要运行文件与校验回执的临时 CI 制品。CI 不使用真实账号、业务数据库、密钥或实例材料，也不自动创建 GitHub Release。
 
-## 常见问题
+GitHub CI 不可用时明确记录缺口，不将未运行的检查写为通过。真实 ChatGPT 应用包、本机终端与托盘的专项运行验收不使用账号模拟替代。
 
-| 提示或现象 | 处理方法 |
-| --- | --- |
-| `Cannot connect to the proxy` | 启动代理客户端，核对 HTTP / mixed 端口；用 `-ProxyPort` 指定实际端口 |
-| `ChatGPT is already running` | 保存工作并完全退出应用及托盘后重试 |
-| `ChatGPT/Codex is not installed` | 确认当前用户安装的应用包名是否为 `OpenAI.Codex`；其他包名暂不支持 |
-| 找不到 EXE、应用入口或包身份验证失败 | 应用包装结构可能变化；附上脱敏后的检查结果反馈，不要直接删除包身份校验 |
-| 双击无反应 | 先运行 `-CheckOnly`；若检查通过，核对 Windows Script Host / VBScript 是否可用，或使用直接运行命令 |
-| 仍卡在结束 WSL、提示词仍异常 | 本工具不修复 WSL 或提示词实现；记录具体报错，分别检查应用版本、WSL 状态和网络情况 |
-
-卸载时删除桌面 **ChatGPT Proxy** 快捷方式，以及安装目录中的 `Start-ChatGPT-With-Proxy.ps1`、`Launch-ChatGPT.vbs`。只有确认目录为空时再删除目录，保留自己存放的其他文件。
-
-## 本地验证
-
-在已安装目标应用的 Windows 环境中，从源码仓库目录执行（Release 安装包不包含开发测试）：
+Windows 原生检查先在助手未启动时捕获代理环境基线，再启动助手，使用新的空证据目录运行：
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\Test-Launcher.ps1
+.\tests\Start-Independent.ps1 -CheckScript .\tests\Test-Native.ps1 -CaptureBaseline -BaselinePath "$env:TEMP\CodexProxyTray-proxy-baseline.json"
+# 启动本轮构建的 CodexProxyTray，等待守护就绪。
+.\tests\Start-Independent.ps1 -CheckScript .\tests\Test-Native.ps1 -EvidenceDirectory "$env:TEMP\CodexProxyTray-native-new-run" -BaselinePath "$env:TEMP\CodexProxyTray-proxy-baseline.json"
 ```
 
-检查脚本语法、端口参数、可达/不可达端口、代理变量、自动识别、临时安装、覆盖保护、双击安装入口和 VBS 参数传递。测试使用临时目录和本地测试端口，不需要外网代理，不启动或结束真实应用，也不调用 WSL。完整应用冷启动和服务端功能仍需在保存任务、退出应用后手动验证。
+基线和证据路径每次使用新名称，脚本拒绝覆盖旧记录。只保存代理变量指纹，不导出完整环境或凭据。检查包括连续两次包内启动、普通子进程环境隔离，以及通过 `CreateEnvironmentBlock` 获取新用户环境，确认 `Get-Command codex` 解析到专用入口并实际执行版本命令。旧终端的 PATH 不会被这些检查修改。
 
-项目不配置自动触发的远端 CI。
+原生脚本必须运行在独立桌面环境，避免 MSIX 宿主的 AppData 虚拟化导致读到旧状态；细节见 `tests/native-checks.md`。托盘、窗口关闭后常驻、真实交互与退出恢复分别验证。SSR 检查不能替代视觉或真实点击验收，脚本也不会关闭当前 ChatGPT。
 
-## 许可证
+## 更新与许可
 
-[MIT](LICENSE)。许可证覆盖本仓库的启动脚本和文档，不授予 ChatGPT、Codex 或第三方商标的权利。
+更新检查从 GitHub Releases 的公开下载入口读取 `CodexProxyTray-update.json`，不使用共享 IP 易触发限流的 REST API，也不需要令牌。成功结果缓存 15 分钟，失败缓存 1 分钟；错误只显示可读提示。仓库改名后保留 GitHub 重定向。
+
+新版本必须随正式 Release 提供如下清单，并将对应 Release 设为 latest：`{"schema":1,"product":"CodexProxyTray","version":"0.1.0","notes":"发行说明"}`。仅接受三个数字组成的正式版本号。历史 `chatgpt-proxy-launcher` v1.0.0 没有新产品清单，因此不会被当作 CodexProxyTray 升级；缺少清单显示“暂无正式版本”。CI 制品用于验收，正式 Release 需要独立发布。
+
+项目沿用 MIT 许可。界面图标统一来自 Iconify 的 Fluent 集合，随构建内嵌，不连接图标 CDN。应用 Logo 的矢量源为 `ui/icon.svg`，图标导出脚本为 `scripts/Export-Icons.ps1`。

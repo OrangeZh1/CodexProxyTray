@@ -1,0 +1,37 @@
+[package]
+name = "codex-proxy-tray"
+version = "0.1.0"
+description = "ChatGPT desktop and Codex CLI proxy companion"
+edition = "2021"
+default-run = "CodexProxyTray"
+license = "MIT"
+
+[features]
+default = []
+custom-protocol = ["tauri/custom-protocol"]
+
+[[bin]]
+name = "CodexProxyTray"
+path = "src/main.rs"
+
+[[bin]]
+name = "codex-proxy-cli"
+path = "src/cli.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[target.'cfg(windows)'.dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-single-instance = "2"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+
+[profile.release]
+opt-level = "s"
+codegen-units = 1
+strip = true
+panic = "unwind"
