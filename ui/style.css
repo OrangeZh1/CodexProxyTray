@@ -199,6 +199,9 @@ h2 { font-size: 14px; font-weight: 600; color: var(--text-secondary); margin: 18
 .inline-note .symbol { width: 18px; height: 18px; }
 .error-text { color: var(--error-text); }
 .restart-hint { border: 1px solid var(--warning-stroke); border-radius: 7px; margin-top: 14px; background: var(--warning-bg); }
+.restart-hint-shell { display: grid; grid-template-rows: 0fr; opacity: 0; transition: grid-template-rows var(--motion-layout) var(--motion-ease), opacity var(--motion-fast) ease; }
+.restart-hint-shell.is-visible { grid-template-rows: 1fr; opacity: 1; }
+.restart-hint-clip { min-height: 0; overflow: hidden; }
 .group-footer { border-top: 1px solid var(--panel-stroke); padding: 10px 20px; display: flex; align-items: center; justify-content: space-between; gap: 12px; color: var(--text-muted); font-size: 12px; }
 .preview-note { font-size: 12px; color: var(--text-muted); margin: -8px 0 14px; }
 .release-notes { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 13px; max-height: 330px; overflow: auto; line-height: 1.7; padding: 0 20px 18px; color: var(--text-secondary); }
@@ -260,8 +263,6 @@ h2 { font-size: 14px; font-weight: 600; color: var(--text-secondary); margin: 18
 .log-preview { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; }
 .log-date-filters { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 10px; margin-bottom: 16px; }
 .log-quick-filters { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-bottom: 12px; }
-.log-quick-filters .fui-Button { min-width: 0; min-height: 28px; padding: 3px 10px; font-size: 12px; font-weight: 400; }
-.log-quick-filters [aria-pressed="true"] { background: var(--selection-bg); color: var(--accent); }
 .log-retention { margin: -4px 0 14px; color: var(--text-muted); font-size: 12px; }
 .log-date-filters label { display: grid; gap: 5px; color: var(--text-secondary); font-size: 12px; }
 .log-date-filters input { min-width: 136px; font-size: 12px; }
@@ -285,11 +286,12 @@ h2 { font-size: 14px; font-weight: 600; color: var(--text-secondary); margin: 18
 .level-warning .log-message { color: var(--warning-text); }
 .log-toolbar { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-bottom: 12px; font-size: 11px; color: var(--text-muted); }
 .log-filters { gap: 4px; }
-.log-filter-tab { border-radius: 5px; font-size: 13px; }
-.log-filter-tab[aria-selected="true"] { color: var(--accent); background: var(--selection-bg); }
-.settings-tabs { width: 100%; gap: 8px; margin: 0 0 18px; }
-.settings-tab { min-height: 36px; padding-inline: 12px; border-radius: 5px; font-size: 14px; font-weight: 500; }
-.settings-tab[aria-selected="true"] { color: var(--accent); }
+.settings-tabs { width: 100%; gap: 4px; margin: 0 0 18px; }
+:is(.settings-tabs, .log-filters, .log-quick-filters) > :is(.fui-Tab, .fui-Button) { min-width: 0; height: 32px; min-height: 32px; padding: 5px 10px; border: 0; border-radius: 6px; font-size: 13px; line-height: 22px; font-weight: 400; color: var(--text-secondary); background: transparent; transition: background-color var(--motion-fast) ease, color var(--motion-fast) ease; }
+:is(.settings-tabs, .log-filters, .log-quick-filters) > :is([aria-selected="true"], [aria-pressed="true"]) { color: var(--accent); background: var(--selection-bg); font-weight: 600; }
+:is(.settings-tabs, .log-filters) > .fui-Tab::before, :is(.settings-tabs, .log-filters) > .fui-Tab::after { display: none !important; }
+:is(.settings-tabs, .log-filters) .fui-Tab__content { color: inherit; font-weight: inherit; }
+:is(.settings-tabs, .log-filters, .log-quick-filters) > :is(.fui-Tab, .fui-Button):not([aria-selected="true"]):not([aria-pressed="true"]):hover { background: var(--panel-hover); color: var(--text-primary); }
 .settings-panel { min-width: 0; width: 100%; }
 .empty-state { padding: 32px; color: var(--text-muted); text-align: center; }
 .first-section { margin-top: 0; }
@@ -307,12 +309,14 @@ h2 { font-size: 14px; font-weight: 600; color: var(--text-secondary); margin: 18
 .workdir-row .row-control { flex: 1; min-width: 230px; }
 .workdir-row .row-control > span { flex: 1; min-width: 0; }
 .workdir-row input { font: 12px Consolas, monospace; }
-.guard-floating { position: absolute !important; right: 24px; bottom: 20px; z-index: 50; height: 46px; min-width: 46px; border-radius: 14px !important; box-shadow: var(--float-shadow); padding: 0 16px; gap: 8px; }
-.guard-floating .symbol { width: 22px; height: 22px; }
-.guard-floating.guard-running { min-width: 140px; }
-.guard-floating.guard-paused { width: 46px; padding: 0; }
-.guard-floating.guard-unknown { width: auto; min-width: 92px; color: var(--text-muted); background: var(--panel-bg); }
-.guard-elapsed { font-variant-numeric: tabular-nums; font-size: 15px; font-weight: 600; }
+.guard-floating { position: absolute !important; right: 24px; bottom: 20px; z-index: 50; display: grid !important; grid-template-columns: 46px 94px; align-items: center; justify-content: start !important; width: 140px; height: 46px; min-width: 0 !important; overflow: hidden; border: 0 !important; border-radius: 12px !important; box-shadow: var(--float-shadow); padding: 0 !important; gap: 0 !important; }
+.app-shell .guard-floating { transition: width var(--motion-enter) var(--motion-ease), background-color var(--motion-fast) ease, box-shadow var(--motion-fast) ease, transform var(--motion-fast) ease; }
+.guard-floating > .symbol { justify-self: center; width: 22px; height: 22px; }
+.guard-floating.guard-paused, .guard-floating.guard-unknown { width: 46px; }
+.guard-floating.guard-unknown { color: var(--text-muted); background: var(--panel-bg); }
+.guard-floating[aria-busy="true"] { background-color: var(--colorBrandBackground) !important; color: var(--colorNeutralForegroundOnBrand) !important; cursor: wait; }
+.guard-elapsed { text-align: left; white-space: nowrap; font-variant-numeric: tabular-nums; font-size: 15px; font-weight: 600; opacity: 1; transition: opacity 90ms ease 60ms; }
+.guard-paused .guard-elapsed, .guard-unknown .guard-elapsed { opacity: 0; transition-delay: 0s; }
 .spin { animation: spin .7s linear infinite; transform-origin: center; transform-box: fill-box; }
 @keyframes spin { to { transform: rotate(360deg); } }
 @keyframes content-enter { from { opacity: .65; transform: translateY(5px); } to { opacity: 1; transform: none; } }

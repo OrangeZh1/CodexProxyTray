@@ -14,7 +14,7 @@ $report=[ordered]@{schema=1;status='running';started_at=[DateTime]::UtcNow.ToStr
 $tempRoot=[IO.Path]::GetFullPath($env:RUNNER_TEMP)
 $stage=Join-Path $tempRoot ('CodexProxyTray-release-'+[Guid]::NewGuid().ToString('N'))
 $core=@('CodexProxyTray.exe','codex-proxy-cli.exe','WebView2Loader.dll','LICENSE')
-$payload=$core+@('package-receipt.json','QUICKSTART.txt','SHA256SUMS.txt')
+$payload=$core+@('package-receipt.json','QUICKSTART.txt','fluent-icons-license.txt','SHA256SUMS.txt')
 function Hash([string]$Path){(Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()}
 function Require([bool]$Condition,[string]$Name){if(-not $Condition){throw $Name};$script:report.checks+=@{name=$Name;status='passed'}}
 try {
@@ -34,8 +34,9 @@ try {
     [void](New-Item -ItemType Directory -Path $stage)
     foreach($name in $core+@('package-receipt.json')){Copy-Item -LiteralPath (Join-Path $package $name) -Destination (Join-Path $stage $name)}
     Copy-Item -LiteralPath $quick -Destination (Join-Path $stage 'QUICKSTART.txt')
+    Copy-Item -LiteralPath (Join-Path $repo 'docs/fluent-icons-license.txt') -Destination (Join-Path $stage 'fluent-icons-license.txt')
     $hashes=[ordered]@{}
-    foreach($name in $core+@('package-receipt.json','QUICKSTART.txt')){$hashes[$name]=Hash (Join-Path $stage $name)}
+    foreach($name in $core+@('package-receipt.json','QUICKSTART.txt','fluent-icons-license.txt')){$hashes[$name]=Hash (Join-Path $stage $name)}
     $sums=($hashes.Keys|ForEach-Object {"$($hashes[$_])  $_"}) -join "`n"
     [IO.File]::WriteAllText((Join-Path $stage 'SHA256SUMS.txt'),$sums+"`n",[Text.UTF8Encoding]::new($false))
     $hashes['SHA256SUMS.txt']=Hash (Join-Path $stage 'SHA256SUMS.txt')

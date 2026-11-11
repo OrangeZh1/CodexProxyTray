@@ -191,7 +191,9 @@ try {
     const running=renderToStaticMarkup(React.createElement(GuardButton,{status:{enabled:true,guard_uptime_ms:1000,updated_at:4000},observed:true,writable:true,busy:false,onToggle:noop}));
     assert.match(running,/aria-label="暂停守护"/);assert.match(running,/00:00:02/);
     const paused=renderToStaticMarkup(React.createElement(GuardButton,{status:{enabled:false,guard_uptime_ms:2000,updated_at:4000},observed:true,writable:true,busy:false,onToggle:noop}));
-    assert.match(paused,/aria-label="恢复守护"/);assert.doesNotMatch(paused,/guard-elapsed/);
+    assert.match(paused,/aria-label="恢复守护"/);assert.match(paused,/guard-paused/);assert.match(paused,/class="guard-elapsed" aria-hidden="true"/);assert.doesNotMatch(paused,/00:00:02/);
+    const toggling=renderToStaticMarkup(React.createElement(GuardButton,{status:{enabled:true,guard_uptime_ms:0,updated_at:5000},observed:true,writable:true,busy:true,onToggle:noop}));
+    assert.match(control(toggling,'button','toggle'),/aria-busy="true"/);assert.match(control(toggling,'button','toggle'),/aria-disabled="true"/);assert.equal(disabled(control(toggling,'button','toggle')),false);assert.match(toggling,/00:00:00/);
     const unavailable=renderToStaticMarkup(React.createElement(GuardButton,{observed:false,writable:false,busy:false,onToggle:noop}));
     assert.equal(disabled(control(unavailable,'button','toggle')),true);assert.match(unavailable,/—/);
   } finally {Date.now=originalNow;}

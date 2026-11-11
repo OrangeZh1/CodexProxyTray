@@ -37,7 +37,14 @@ export function Metric({icon,label,value,detail}){return <article className="met
 
 export function GuardButton({status,observed,writable,busy,onToggle}){
   const [now,setNow]=useState(()=>Date.now());
+  const renderedTime=useRef('—');
+  const [pendingVisible,setPendingVisible]=useState(false);
+  const pendingShownAt=useRef(0);
   const enabled=!!status?.enabled;
+  useEffect(()=>{
+    const timer=busy?setTimeout(()=>{pendingShownAt.current=performance.now();setPendingVisible(true);},180):setTimeout(()=>setPendingVisible(false),Math.max(0,120-(performance.now()-pendingShownAt.current)));
+    return()=>clearTimeout(timer);
+  },[busy]);
   useEffect(()=>{
     if(!observed||!enabled)return;
     setNow(Date.now());const timer=setInterval(()=>setNow(Date.now()),1000);
@@ -45,8 +52,10 @@ export function GuardButton({status,observed,writable,busy,onToggle}){
   },[observed,enabled]);
   const known=observed&&Number.isFinite(status?.guard_uptime_ms);
   const milliseconds=known?status.guard_uptime_ms+(enabled?Math.max(0,now-(status.updated_at||now)):0):null;
+  if(enabled)renderedTime.current=known?duration(milliseconds):'—';
   const label=enabled?'暂停守护':'恢复守护';
-  return <Button id="toggle" className={`guard-floating ${enabled?'guard-running':'guard-paused'} ${observed?'':'guard-unknown'}`} appearance="primary" aria-label={label} title={label} aria-busy={busy} disabled={!observed||!writable||busy} icon={<Symbol name={busy?'refresh':enabled?'pause':'play'} spin={busy}/>} onClick={onToggle}>{enabled||!observed?<span className="guard-elapsed">{known?duration(milliseconds):'—'}</span>:null}</Button>;
+  const pending=busy||pendingVisible;
+  return <Button id="toggle" className={`guard-floating ${enabled?'guard-running':'guard-paused'} ${observed?'':'guard-unknown'}`} appearance="primary" aria-label={label} title={label} aria-busy={pending} aria-disabled={pending||undefined} disabled={!observed||!writable} onClick={()=>{if(!pending)onToggle?.();}}><Symbol name={pendingVisible?'refresh':enabled?'pause':'play'} spin={pendingVisible}/><span className="guard-elapsed" aria-hidden={!enabled}>{renderedTime.current}</span></Button>;
 }
 
 export function ConnectivityCard({result,observed,writable,enabled,busy,onCheck}){
@@ -103,7 +112,7 @@ export function App({initialStatus=null,initialPage='dashboard',initialSettingsT
   const resolvedTheme=resolveTheme(themeMode,systemDark);
   const [maximized,setMaximized]=useState(false),[status,setStatus]=useState(initialStatus),current=useRef(initialStatus);
   const [online,setOnline]=useState(!!initialStatus),[,setActionVersion]=useState(0);
-  const actions=useRef(null);if(!actions.current)actions.current=createActions(()=>setActionVersion(v=>v+1),{minimumVisibleMs:650});
+  const actions=useRef(null);if(!actions.current)actions.current=createActions(()=>setActionVersion(v=>v+1),{minimumVisibleMs:150});
   const [notice,setNotice]=useState(null),[proxy,setProxy]=useState(initialStatus?.proxy_url||'');
   const proxyEdit=useRef({dirty:false,version:0}),systemPending=useRef(new Set());
   const [system,setSystem]=useState(()=>systemPreferences({},initialStatus||{},new Set()));
@@ -205,7 +214,7 @@ export function App({initialStatus=null,initialPage='dashboard',initialSettingsT
 
         </div>
         {status?.error&&<div className="inline-note error-text"><Symbol name="warning"/>{status.error}</div>}
-        {status?.restart_required&&status.enabled&&<div className="inline-note restart-hint"><Symbol name="about"/><span>当前 ChatGPT 需完整退出并重开一次。</span></div>}
+        <div className={`restart-hint-shell ${status?.restart_required&&status.enabled?'is-visible':''}`} aria-hidden={!status?.restart_required||!status.enabled}><div className="restart-hint-clip"><div className="inline-note restart-hint"><Symbol name="about"/><span>当前 ChatGPT 需完整退出并重开一次。</span></div></div></div>
         <div className="section-heading"><h2>最近事件</h2><Button appearance="subtle" size="small" onClick={()=>setPage('logs')}>全部日志</Button></div>{page==='dashboard'&&<EventList logs={logs.slice(0,4)} compact/>}
       </section>
       <section hidden={page!=='proxy'} aria-label="代理">
@@ -235,7 +244,7 @@ export function App({initialStatus=null,initialPage='dashboard',initialSettingsT
 export function TrayApp({initialStatus=null}={}){
   const [status,setStatus]=useState(initialStatus),[online,setOnline]=useState(!!initialStatus),[active,setActive]=useState(false),[notice,setNotice]=useState('');
   const [mode,setMode]=useState(readThemeMode),[systemDark,setSystemDark]=useState(prefersDark),[,changed]=useState(0);
-  const actions=useRef(null);if(!actions.current)actions.current=createActions(()=>changed(v=>v+1),{minimumVisibleMs:650});
+  const actions=useRef(null);if(!actions.current)actions.current=createActions(()=>changed(v=>v+1),{minimumVisibleMs:150});
   const busy=name=>actions.current.has(name),resolved=resolveTheme(mode,systemDark);
   const mounted=useRef(true),menu=useRef(null);
   useThemeLayoutEffect(()=>applyDocumentTheme(resolved),[resolved]);

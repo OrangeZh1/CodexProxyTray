@@ -27,9 +27,10 @@ for(const view of ['main','tray'])for(const theme of ['light','dark']){
     // without changing the Animation result; actual popup animation is checked in Windows.
     const animate=window.Element.prototype.animate;
     window.Element.prototype.animate=function(...args){const animation=animate.apply(this,args);animation.finished.catch(error=>{if(error.name!=='AbortError')errors.push(String(error));});return animation;};
-    let focusChanged,navigate,hideCount=0,refreshResolve;
+    let focusChanged,navigate,hideCount=0,refreshResolve,toggleResolve;
+    const backend=structuredClone(sample);backend.guard_uptime_ms=125000;backend.restart_required=true;
     const appWindow={label:view,hide:async()=>{hideCount++;},setTheme:async()=>{},setBackgroundColor:async()=>{throw Error('Do not repaint the native background after mounting.');},isMaximized:async()=>false,onResized:async()=>()=>{},onFocusChanged:async callback=>{focusChanged=callback;return()=>{};}};
-    window.__TAURI__={core:{invoke:async(command,args)=>{const firstReady=!commands.includes('frontend_ready');commands.push(command);if(command==='report_ui_error'){errors.push(args.message);return null;}if(command==='frontend_ready'){if(view==='tray'&&firstReady)focusChanged?.({payload:true});return null;}if(command==='get_status')return structuredClone(sample);if(command==='refresh_status')return new Promise(resolve=>{refreshResolve=resolve;});throw Error(`Unexpected startup command: ${command}`);}},window:{getCurrentWindow:()=>appWindow},event:{listen:async(name,callback)=>{if(name==='navigate')navigate=callback;return()=>{};}}};
+    window.__TAURI__={core:{invoke:async(command,args)=>{const firstReady=!commands.includes('frontend_ready');commands.push(command);if(command==='report_ui_error'){errors.push(args.message);return null;}if(command==='frontend_ready'){if(view==='tray'&&firstReady)focusChanged?.({payload:true});return null;}if(command==='get_status')return structuredClone(backend);if(command==='refresh_status')return new Promise(resolve=>{refreshResolve=resolve;});if(command==='set_enabled')return new Promise(resolve=>{toggleResolve=()=>{Object.assign(backend,{revision:backend.revision+1,enabled:args.enabled,guard_ready:args.enabled,restart_required:args.enabled,guard_uptime_ms:args.enabled?0:125000,updated_at:Date.now()});resolve(structuredClone(backend));};});throw Error(`Unexpected startup command: ${command}`);}},window:{getCurrentWindow:()=>appWindow},event:{listen:async(name,callback)=>{if(name==='navigate')navigate=callback;return()=>{};}}};
     window.eval(boot);window.eval(code);
     for(let i=0;i<150&&!errors.length&&(!commands.includes('frontend_ready')||!(view==='tray'?window.document.querySelector('.tray-header')?.textContent.includes('守护已就绪'):window.document.querySelector('.sidebar-footer')?.textContent.includes('后台运行中')));i++)await delay(20);
     assert.deepEqual(errors,[],`${view}/${theme}: client render errors`);
@@ -42,6 +43,18 @@ for(const view of ['main','tray'])for(const theme of ['light','dark']){
       assert.match(window.document.querySelector('.sidebar-footer')?.textContent||'',/后台运行中/);
       assert.match(window.document.querySelector('#root').textContent,/网页可达/);
       assert.equal(window.document.querySelector('section[aria-label="仪表盘"] .traffic-card'),null,'Traffic belongs in settings.');
+      const guard=window.document.querySelector('#toggle'),restartHint=window.document.querySelector('.restart-hint-shell');
+      guard.click();await delay(30);guard.click();await delay(220);
+      assert.equal(commands.filter(command=>command==='set_enabled').length,1,'A pending toggle cannot submit another action.');
+      assert.equal(guard.getAttribute('aria-busy'),'true');assert.equal(guard.getAttribute('aria-disabled'),'true');assert.equal(guard.disabled,false,'Busy must not apply the native disabled repaint or remove focus.');
+      assert.ok(guard.querySelector('.spin'),'A deliberately delayed toggle shows its own loading state.');
+      assert.equal(window.document.querySelector('#refresh').getAttribute('aria-busy'),'false');
+      toggleResolve();for(let i=0;i<50&&guard.getAttribute('aria-busy')==='true';i++)await delay(20);
+      assert.ok(guard.classList.contains('guard-paused'));assert.equal(guard.querySelector('.guard-elapsed').getAttribute('aria-hidden'),'true');
+      assert.equal(window.document.querySelector('#toggle'),guard);assert.equal(window.document.querySelector('.restart-hint-shell'),restartHint,'Toggle must not remount the hint or page.');assert.equal(restartHint.getAttribute('aria-hidden'),'true');
+      guard.click();await delay(30);toggleResolve();for(let i=0;i<50&&guard.getAttribute('aria-busy')==='true';i++)await delay(20);
+      assert.ok(guard.classList.contains('guard-running'));assert.equal(guard.querySelector('.guard-elapsed').getAttribute('aria-hidden'),'false');assert.equal(guard.querySelector('.guard-elapsed').textContent,'00:00:00','Each restored guard starts a new timer.');
+      assert.equal(restartHint.getAttribute('aria-hidden'),'false');assert.deepEqual(errors,[]);
       const settingsEntry=[...window.document.querySelectorAll('button')].find(button=>button.textContent.trim()==='前往设置')||window.document.querySelector('[data-page="settings"]');
       settingsEntry.click();await delay(50);
       assert.deepEqual(errors,[],'Dashboard to settings must not call a scroll Promise as a cleanup function.');
