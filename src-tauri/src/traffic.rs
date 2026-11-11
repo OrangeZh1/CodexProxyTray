@@ -5,7 +5,7 @@ use serde::{Serialize,Deserialize};
 use windows::{core::{GUID,PCWSTR,PWSTR},Win32::{Foundation::*,Security::{GetTokenInformation,TOKEN_QUERY,TOKEN_USER,TokenUser,SECURITY_ATTRIBUTES,PSECURITY_DESCRIPTOR},Security::{Authorization::{ConvertSidToStringSidW,ConvertStringSecurityDescriptorToSecurityDescriptorW},Cryptography::{BCryptGenRandom,BCRYPT_USE_SYSTEM_PREFERRED_RNG}},Storage::FileSystem::*,System::{Pipes::*,Threading::*}}};
 use crate::{traffic_core::{self,ProcessIdentity},traffic_etw::{EtwSession,EngineError}};
 
-const PROTOCOL:u32=1;const MAX_FRAME:usize=32768;const PIPE_PREFIX:&str=r"\\.\pipe\CodexProxyTray.Traffic.";
+const PROTOCOL:u32=2;const MAX_FRAME:usize=32768;const PIPE_PREFIX:&str=r"\\.\pipe\CodexProxyTray.Traffic.";
 #[derive(Clone,Copy,Debug,Serialize,Deserialize,PartialEq,Eq)]#[serde(rename_all="snake_case")]
 pub enum TrafficState{Disabled,Starting,Collecting,NeedsInstallation,NeedsPermission,Unavailable}
 #[derive(Clone,Debug,Serialize,Deserialize)]#[serde(deny_unknown_fields)]
@@ -18,7 +18,7 @@ impl TrafficSnapshot{
 }
 #[derive(Clone,Copy)]pub enum EnableMode{Normal}
 #[derive(Serialize,Deserialize)]#[serde(tag="type",rename_all="snake_case",deny_unknown_fields)]
-enum ToCollector{Targets{protocol:u32,targets:Vec<ProcessIdentity>},Stop{protocol:u32}}
+enum ToCollector{Targets{protocol:u32,targets:Vec<ProcessIdentity>},Stop{protocol:u32},StoppedReceived{protocol:u32}}
 #[derive(Serialize,Deserialize)]#[serde(deny_unknown_fields)]struct FromCollector{protocol:u32,snapshot:TrafficSnapshot,stopped:bool}
 struct Shared{snapshot:Mutex<TrafficSnapshot>,targets:Mutex<(u64,Vec<ProcessIdentity>)>,target_error:Mutex<Option<String>>,stop_confirmed:AtomicBool}
 struct Running{stop:Arc<AtomicBool>,thread:JoinHandle<()>}
@@ -94,6 +94,11 @@ impl Pipe{
         let bytes=serde_json::to_vec(value).map_err(|_|"采样消息编码失败。")?;if bytes.len()>MAX_FRAME{return Err("采样消息超过允许范围。".into())}let deadline=Instant::now()+Duration::from_secs(3);
         loop{if !alive(){return Err("采样连接已停止。".into())}let mut written=0;match WriteFile(self.handle.0,Some(&bytes),Some(&mut written),None){Ok(())if written as usize==bytes.len()=>return Ok(()),Ok(())if written==0=>{},_=>return Err("采样消息写入失败。".into())}if Instant::now()>=deadline{return Err("采样通信超时。".into())}thread::sleep(Duration::from_millis(10));}
     }}
+    fn finish(&self,value:&FromCollector,alive:impl Fn()->bool)->Result<(),String>{
+        self.write(value,&alive)?;let deadline=Instant::now()+Duration::from_secs(3);
+        while alive()&&Instant::now()<deadline{match self.read::<ToCollector>()?{Some(ToCollector::StoppedReceived{protocol})if protocol==PROTOCOL=>return Ok(()),Some(ToCollector::Targets{protocol,..}|ToCollector::Stop{protocol})if protocol==PROTOCOL=>{},Some(_)=>return Err("采样停止回执确认无效。".into()),None=>thread::sleep(Duration::from_millis(10))}}
+        Err("助手未确认采样停止回执。".into())
+    }
 }
 
 struct ChildProcess(OwnedHandle);
@@ -131,7 +136,7 @@ fn relay(shared:&Arc<Shared>,stop:&Arc<AtomicBool>,mode:EnableMode)->Result<(),S
 }
 fn accept_frame(shared:&Shared,pipe:&Pipe)->Result<Option<TrafficState>,String>{
     let Some(frame)=pipe.read::<FromCollector>()?else{return Ok(None)};if frame.protocol!=PROTOCOL{return Err("采样协议版本无效。".into())}
-    if frame.stopped{shared.stop_confirmed.store(true,Ordering::Release);}let state=frame.snapshot.state;put(shared,frame.snapshot);Ok(Some(state))
+    if frame.stopped{shared.stop_confirmed.store(true,Ordering::Release);let _=pipe.write(&ToCollector::StoppedReceived{protocol:PROTOCOL},||true);}let state=frame.snapshot.state;put(shared,frame.snapshot);Ok(Some(state))
 }
 
 /// Main must call this before Tauri, COM and package-debug resume handling.
@@ -152,8 +157,8 @@ fn collect(token:&str,parent_identity:ProcessIdentity)->Result<(),String>{
     let pipe=Pipe::client(&format!("{PIPE_PREFIX}{token}"),&parent)?;let mut server=0;unsafe{GetNamedPipeServerProcessId(pipe.handle.0,&mut server).map_err(|_|"无法验证采样服务端。")?;}if server!=parent_identity.pid||identity_on(parent.0).map_err(|_|"父进程身份无效。")?!=parent_identity{return Err("采样服务端身份不匹配。".into())}
     // Writes depend only on the GUI. A dead broker must not prevent the final STOP acknowledgement.
     let alive=||unsafe{WaitForSingleObject(parent.0,0)==WAIT_TIMEOUT};let broker_alive=||broker.as_ref().is_none_or(|process|unsafe{WaitForSingleObject(process.0,0)==WAIT_TIMEOUT});let deadline=Instant::now()+Duration::from_secs(10);
-    let targets=loop{if !alive(){return Ok(())}if !broker_alive(){let message="流量辅助服务已退出，未开始采样。";let _=pipe.write(&FromCollector{protocol:PROTOCOL,snapshot:TrafficSnapshot::state(TrafficState::Unavailable,Some(message.into())),stopped:true},alive);return Err(message.into())}match pipe.read::<ToCollector>()?{Some(ToCollector::Targets{protocol,targets})if protocol==PROTOCOL=>{traffic_core::validate_targets(&targets)?;break targets},Some(ToCollector::Stop{protocol})if protocol==PROTOCOL=>{let _=pipe.write(&FromCollector{protocol:PROTOCOL,snapshot:TrafficSnapshot::disabled(),stopped:true},alive);return Ok(())},Some(_)=>return Err("采样协议无效。".into()),None=>{if Instant::now()>=deadline{return Err("采样名单等待超时。".into())}thread::sleep(Duration::from_millis(20));}}};
-    let owner_sid=process_sid(parent.0)?;let(_,guid)=random_token()?;let mut session=match EtwSession::start(&format!("CodexProxyTray.Network.{token}"),guid,&targets,owner_sid){Ok(session)=>session,Err(error)=>{let _=pipe.write(&FromCollector{protocol:PROTOCOL,snapshot:engine_failure(error),stopped:true},alive);return Ok(())}};
+    let targets=loop{if !alive(){return Ok(())}if !broker_alive(){let message="流量辅助服务已退出，未开始采样。";let _=pipe.finish(&FromCollector{protocol:PROTOCOL,snapshot:TrafficSnapshot::state(TrafficState::Unavailable,Some(message.into())),stopped:true},alive);return Err(message.into())}match pipe.read::<ToCollector>()?{Some(ToCollector::Targets{protocol,targets})if protocol==PROTOCOL=>{traffic_core::validate_targets(&targets)?;break targets},Some(ToCollector::Stop{protocol})if protocol==PROTOCOL=>{let _=pipe.finish(&FromCollector{protocol:PROTOCOL,snapshot:TrafficSnapshot::disabled(),stopped:true},alive);return Ok(())},Some(_)=>return Err("采样协议无效。".into()),None=>{if Instant::now()>=deadline{return Err("采样名单等待超时。".into())}thread::sleep(Duration::from_millis(20));}}};
+    let owner_sid=process_sid(parent.0)?;let(_,guid)=random_token()?;let mut session=match EtwSession::start(&format!("CodexProxyTray.Network.{token}"),guid,&targets,owner_sid){Ok(session)=>session,Err(error)=>{let _=pipe.finish(&FromCollector{protocol:PROTOCOL,snapshot:engine_failure(error),stopped:true},alive);return Ok(())}};
     let mut sampled=Instant::now()-Duration::from_secs(1);let mut previous:Option<(Instant,u64,u64)>=None;
     let result=(||->Result<(),String>{loop{
         if !alive(){return Ok(())}
@@ -165,5 +170,5 @@ fn collect(token:&str,parent_identity:ProcessIdentity)->Result<(),String>{
     // Parent death and IPC errors take this same cleanup path; no global logger name is ever stopped.
     if let Err(error)=session.stop(){let _=pipe.write(&FromCollector{protocol:PROTOCOL,snapshot:engine_failure(error),stopped:false},alive);return Err("本次采样停止未确认。".into())}
     let snapshot=match &result{Ok(())=>TrafficSnapshot::disabled(),Err(message)=>TrafficSnapshot::state(TrafficState::Unavailable,Some(message.clone()))};
-    let _=pipe.write(&FromCollector{protocol:PROTOCOL,snapshot,stopped:true},alive);result
+    let _=pipe.finish(&FromCollector{protocol:PROTOCOL,snapshot,stopped:true},alive);result
 }

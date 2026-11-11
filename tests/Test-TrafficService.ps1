@@ -280,7 +280,7 @@ function Run-ServicePipeline {
         $until=[DateTime]::UtcNow.AddSeconds(12)
         do{$collectors=@(Get-CimInstance Win32_Process -Filter "Name = 'CodexProxyTrayTrafficService.exe'"|Where-Object {$_.CommandLine -like '*--traffic-collector*' -and (Same-Path $_.ExecutablePath $serviceImage)});if($collectors.Count){Start-Sleep -Milliseconds 100}}while($collectors.Count -and [DateTime]::UtcNow -lt $until)
         if($collectors.Count -and -not $pipelineFailure){$pipelineFailure='pipeline_collectors_remain'}
-        $report['pipeline_stop_state']=$final.traffic.state
+        $report['pipeline_stop_state']=$final.traffic.state;$report['pipeline_stop_message']=[string]$final.traffic.message
         if(-not $pipelineFailure){try{No-Reparse $sandbox;Require (Is-Within (Full-Path $sandbox) $diagnosticRoot) 'pipeline_cleanup_boundary';Start-Sleep -Seconds 2;Remove-Item -LiteralPath $sandbox -Recurse -Force}catch{$pipelineFailure=$_}}
     }
     if($pipelineFailure){throw $pipelineFailure}
