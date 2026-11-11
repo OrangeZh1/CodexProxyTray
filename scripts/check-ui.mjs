@@ -217,7 +217,7 @@ try {
   for(const state of ['disabled','starting','needs_permission','unavailable']){
     const inactive=traffic({state,receive_bps:2048,send_bps:1024,received_bytes:4096,sent_bytes:0,target_count:2});
     assert.doesNotMatch(inactive,/2\.0 KB\/s|累计 0 B|授权采集/);
-    assert.doesNotMatch(inactive,/<button|前往设置|安装辅助服务|开启统计|停止统计/);
+    assert.doesNotMatch(inactive,/<button|前往设置|安装辅助服务|卸载辅助服务/);
   }
   const trafficStarting=traffic({state:'starting'});
   assert.match(trafficStarting,/正在启动/);assert.doesNotMatch(trafficStarting,/<button/);
