@@ -1,6 +1,7 @@
 mod core;
 mod settings;
 #[cfg(windows)] mod native;
+#[cfg(windows)] mod traffic_core;
 #[cfg(windows)] mod platform;
 
 #[cfg(windows)]

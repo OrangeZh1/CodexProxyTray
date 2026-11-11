@@ -82,7 +82,7 @@ fn check_security(security:PSECURITY_DESCRIPTOR,file:bool)->Result<(),String>{un
     let mut details=ACL_SIZE_INFORMATION::default();GetAclInformation(acl,(&mut details as *mut ACL_SIZE_INFORMATION).cast(),size_of::<ACL_SIZE_INFORMATION>()as u32,AclSizeInformation).map_err(win)?;
     if details.AceCount!=if file{3}else{2}{return Err("辅助服务访问控制含有未知授权。".into())}
     let mut seen=std::collections::HashSet::new();for index in 0..details.AceCount{let mut raw=std::ptr::null_mut();GetAce(acl,index,&mut raw).map_err(win)?;let ace=&*(raw as *const ACCESS_ALLOWED_ACE);if ace.Header.AceType!=0{return Err("辅助服务访问控制含有未知规则。".into())}let sid=sid_string(PSID((&ace.SidStart as *const u32).cast_mut().cast()))?;
-        let expected=match sid.as_str(){"S-1-5-18"|"S-1-5-32-544"=>if file{0x1f01ff}else{0x1f0001},"S-1-5-32-545"if file=>0x1200a9,_=>return Err("辅助服务访问控制含有未知用户。".into())};if ace.Mask!=expected||!seen.insert(sid){return Err("辅助服务访问控制权限不匹配。".into())}}
+        let expected=match sid.as_str(){"S-1-5-18"|"S-1-5-32-544"=>if file{0x1f01ff}else{0x1f0001},"S-1-5-32-545" if file=>0x1200a9,_=>return Err("辅助服务访问控制含有未知用户。".into())};if ace.Mask!=expected||!seen.insert(sid){return Err("辅助服务访问控制权限不匹配。".into())}}
     Ok(())
 }}
 fn sha256(path:&Path)->Result<String,String>{unsafe{
