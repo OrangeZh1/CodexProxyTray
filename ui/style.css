@@ -336,6 +336,9 @@ h2 { font-size: 14px; font-weight: 600; color: var(--text-secondary); margin: 18
 :is(.main-scroll, .license-content, .release-notes)::-webkit-scrollbar-button { display: none !important; width: 0 !important; height: 0 !important; }
 
 @media (max-width: 1000px) {
+  .log-date-filters { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto; }
+  .log-date-filters .log-search { grid-column: 1 / -1; min-width: 0; max-width: none; }
+  .log-date-filters .log-date-separator { display: none; }
   .dashboard-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .probe-card, .guard-card { grid-column: 1 / -1; }
   .guard-card { display: grid; grid-template-columns: 1fr auto; column-gap: 20px; row-gap: 10px; }
