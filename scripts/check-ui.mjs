@@ -210,23 +210,22 @@ try {
   checks++;
 
   const runningService={state:'running',version};
-  const traffic=(result,pending=new Set(),service=runningService,trafficEnabled=false)=>renderToStaticMarkup(React.createElement(TrafficCard,{result,service,trafficEnabled,observed:true,writable:true,busy:name=>pending.has(name),onEnable:noop,onDisable:noop,onSettings:noop}));
+  const traffic=(result,service=runningService,trafficEnabled=true)=>renderToStaticMarkup(React.createElement(TrafficCard,{result,service,trafficEnabled,observed:true}));
   const collecting=traffic({state:'collecting',receive_bps:2048,send_bps:1024,received_bytes:4096,sent_bytes:0,target_count:2});
   assert.match(collecting,/2\.0 KB\/s/);assert.match(collecting,/1\.0 KB\/s/);assert.match(collecting,/4\.0 KB/);assert.match(collecting,/累计 0 B/);
   assert.match(collecting,/可能漏掉短命进程，不是网卡计费量/);
   for(const state of ['disabled','starting','needs_permission','unavailable']){
     const inactive=traffic({state,receive_bps:2048,send_bps:1024,received_bytes:4096,sent_bytes:0,target_count:2});
     assert.doesNotMatch(inactive,/2\.0 KB\/s|累计 0 B|授权采集/);
-    if(state==='unavailable')assert.match(inactive,/停止统计/);
+    assert.doesNotMatch(inactive,/<button|前往设置|安装辅助服务|开启统计|停止统计/);
   }
   const trafficStarting=traffic({state:'starting'});
-  assert.match(trafficStarting,/正在启动/);assert.match(control(trafficStarting,'button','disable-traffic'),/aria-busy="false"/);
-  const enabling=traffic({state:'starting'},new Set(['dashboard-enable-traffic']),runningService,true);
-  assert.match(control(enabling,'button','enable-traffic'),/aria-busy="true"/);assert.match(control(enabling,'button','disable-traffic'),/aria-busy="false"/);assert.equal(disabled(control(enabling,'button','disable-traffic')),true);
-  const missingService=traffic({state:'collecting',receive_bps:2048},new Set(),{state:'not_installed'});
-  assert.match(missingService,/请先安装辅助服务/);assert.match(missingService,/前往设置/);assert.doesNotMatch(missingService,/\bid="enable-traffic"|2\.0 KB\/s/);
-  const needsInstall=traffic({state:'needs_installation'},new Set(),{state:'not_installed'});
-  assert.match(needsInstall,/需要安装/);assert.match(needsInstall,/前往设置/);assert.doesNotMatch(needsInstall,/授权采集|\bid="enable-traffic"/);
+  assert.match(trafficStarting,/正在启动/);assert.doesNotMatch(trafficStarting,/<button/);
+  const missingService=traffic({state:'collecting',receive_bps:2048},{state:'not_installed'});
+  assert.match(missingService,/暂不可用/);assert.doesNotMatch(missingService,/安装辅助服务|前往设置|2\.0 KB\/s/);
+  const disabledTraffic=traffic({state:'collecting',receive_bps:2048},runningService,false);
+  assert.match(disabledTraffic,/未开启/);assert.doesNotMatch(disabledTraffic,/2\.0 KB\/s|<button/);
+  assert.doesNotMatch(active(render('dashboard',sample),'仪表盘'),/前往设置|安装辅助服务|卸载辅助服务|记录网络流量/);
   assert.equal(trafficAmount(null,true),'—');assert.equal(trafficAmount(-1),'—');
   checks++;
 
@@ -252,16 +251,11 @@ try {
   assert.match(control(installing,'input','traffic-enabled'),/aria-busy="false"/);assert.equal(disabled(control(installing,'input','traffic-enabled')),true);
   checks++;
 
-  const dashboardInitiated=collector(runningService,{state:'starting'},new Set(['dashboard-enable-traffic']));
-  assert.match(control(dashboardInitiated,'input','traffic-enabled'),/aria-busy="false"/);assert.equal(disabled(control(dashboardInitiated,'input','traffic-enabled')),true);
-  const settingsInitiated=traffic({state:'starting'},new Set(['settings-enable-traffic']),runningService,true);
-  assert.match(control(settingsInitiated,'button','disable-traffic'),/aria-busy="false"/);assert.equal(disabled(control(settingsInitiated,'button','disable-traffic')),true);
   const ownSettings=collector(runningService,{state:'starting'},new Set(['settings-enable-traffic']));
   assert.match(control(ownSettings,'input','traffic-enabled'),/aria-busy="true"/);
-  const dashboardStop=collector(runningService,{state:'collecting'},new Set(['dashboard-disable-traffic']));
-  assert.match(control(dashboardStop,'input','traffic-enabled'),/aria-busy="false"/);assert.equal(disabled(control(dashboardStop,'input','traffic-enabled')),true);
-  const settingsStop=traffic({state:'collecting'},new Set(['settings-disable-traffic']),runningService,true);
-  assert.match(control(settingsStop,'button','disable-traffic'),/aria-busy="false"/);assert.equal(disabled(control(settingsStop,'button','disable-traffic')),true);
+  assert.match(control(ownSettings,'button','uninstall-traffic-service'),/aria-busy="false"/);assert.equal(disabled(control(ownSettings,'button','uninstall-traffic-service')),true);
+  const stoppingSettings=collector(runningService,{state:'collecting'},new Set(['settings-disable-traffic']));
+  assert.match(control(stoppingSettings,'input','traffic-enabled'),/aria-busy="true"/);assert.match(control(stoppingSettings,'button','uninstall-traffic-service'),/aria-busy="false"/);
   checks++;
   const normalStatus=renderToStaticMarkup(React.createElement(StatusLabel,null,'待检测'));
   assert.match(normalStatus,/data-status="neutral"/);assert.match(normalStatus,/status-label-dot[^>]*aria-hidden="true"/);

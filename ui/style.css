@@ -213,7 +213,7 @@ h2 { font-size: 14px; font-weight: 600; color: var(--text-secondary); margin: 18
 .connectivity-footer { display: flex; align-items: center; justify-content: space-between; gap: 12px; color: var(--text-muted); font-size: 11px; }
 .traffic-card { grid-column: 1 / -1; }
 .traffic-card .metric-label { flex-wrap: wrap; }
-.traffic-actions { margin-left: auto; display: flex; flex-wrap: wrap; gap: 4px; }
+.collector-section-title { margin: 20px 0 8px; font-size: 13px; font-weight: 600; color: var(--text-secondary); }
 .traffic-service-actions { display: flex; flex-wrap: wrap; gap: 4px; justify-content: flex-end; }
 .traffic-values { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 24px; margin: 18px 0 14px; }
 .traffic-values > div { display: flex; flex-direction: column; gap: 6px; min-width: 0; }

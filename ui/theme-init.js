@@ -11,8 +11,9 @@
   window.reportUiError=error=>{
     if(reported)return;reported=true;
     const message=String(error?.message||error||'未知界面错误').slice(0,2000);
+    const diagnostic=String(error?.stack||message).slice(0,2000);
     const invoke=window.__TAURI__?.core?.invoke;
-    invoke?.('report_ui_error',{message}).catch(()=>{});
+    invoke?.('report_ui_error',{message:diagnostic}).catch(()=>{});
     const show=()=>{
       const root=document.getElementById('root');if(!root)return;
       const panel=document.createElement('div');panel.className='startup-error';
@@ -22,7 +23,7 @@
       panel.append(title,detail,retry);root.replaceChildren(panel);
       invoke?.('frontend_ready').catch(()=>{});
     };
-    if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',show,{once:true});else show();
+    if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',show,{once:true});else queueMicrotask(show);
   };
   window.addEventListener('error',event=>window.reportUiError(event.error||event.message||'界面资源加载失败'));
   window.addEventListener('unhandledrejection',event=>window.reportUiError(event.reason));
