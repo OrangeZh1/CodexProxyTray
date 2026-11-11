@@ -4,6 +4,9 @@ CodexProxyTray v0.1.0 · Windows x64
 为 ChatGPT 桌面端和 Windows Codex CLI 提供指定的本地 HTTP 代理环境，
 保留桌面应用包身份，并在托盘中持续守护。
 不修改 Windows 系统代理或全局代理环境变量。
+可让代理客户端只提供本地 HTTP / mixed 端口，单独接入目标应用，
+无需为了 ChatGPT / Codex 开启 TUN 或系统全局代理、影响其他软件。
+助手不会替你切换 TUN / 系统代理开关；客户端已有的全局规则仍由客户端管理。
 本项目为社区工具，与 OpenAI 无隶属关系，不提供代理节点。
 
 开始使用
