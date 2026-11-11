@@ -52,6 +52,14 @@ for(const view of ['main','tray'])for(const theme of ['light','dark']){
       for(const tab of ['about','general']){window.document.querySelector(`#settings-tab-${tab}`).click();await delay(30);assert.equal(window.document.querySelector(`#settings-panel-${tab}`).hidden,false);assert.deepEqual(errors,[]);}
       for(const page of ['dashboard','proxy','logs','settings','dashboard']){window.document.querySelector(`[data-page="${page}"]`).click();await delay(30);assert.deepEqual(errors,[],`Navigation failed at ${page}`);assert.ok(window.document.querySelector('.sidebar'));}
       window.document.querySelector('[data-page="logs"]').click();await delay(30);
+      window.document.querySelector('[data-log-period="today"]').click();await delay(30);
+      assert.ok(window.document.querySelector('#log-start-date').value);
+      assert.equal(window.document.querySelector('#log-start-date').value,window.document.querySelector('#log-end-date').value);
+      assert.equal(window.document.querySelectorAll('section[aria-label="运行日志"] .log-open').length,1);
+      window.document.querySelector('[data-log-period="yesterday"]').click();await delay(30);
+      assert.equal(window.document.querySelectorAll('section[aria-label="运行日志"] .log-open').length,0);
+      assert.match(window.document.querySelector('#log-results').textContent,/没有符合条件/);
+      window.document.querySelector('[data-log-period="all"]').click();await delay(30);
       window.document.querySelector('.log-open').click();await delay(50);
       assert.match(window.document.querySelector('.log-detail-dialog')?.textContent||'',/客户端启动回归/);
       [...window.document.querySelectorAll('.log-detail-dialog button')].find(button=>button.textContent.trim()==='关闭').click();await delay(10);

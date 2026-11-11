@@ -1,6 +1,14 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {logDate,filterLogs} from '../ui/logs.mjs';
+import {logDate,logDateRange,filterLogs} from '../ui/logs.mjs';
+test('quick date ranges follow the displayed day across midnight, year and leap day boundaries',()=>{
+  const now=Date.UTC(2026,11,31,16);
+  assert.deepEqual(logDateRange('today',now),{start:'2027-01-01',end:'2027-01-01'});
+  assert.deepEqual(logDateRange('yesterday',now),{start:'2026-12-31',end:'2026-12-31'});
+  assert.deepEqual(logDateRange('week',now),{start:'2026-12-26',end:'2027-01-01'});
+  assert.deepEqual(logDateRange('yesterday',Date.UTC(2028,2,1)),{start:'2028-02-29',end:'2028-02-29'});
+  assert.deepEqual(logDateRange('all',now),{start:'',end:''});
+});
 test('log dates and inclusive date ranges use the displayed Shanghai day',()=>{
   const logs=[{id:1,at:Date.UTC(2026,10,11,15,59,59),level:'info'},{id:2,at:Date.UTC(2026,10,11,16),level:'warning'},{id:3,at:Date.UTC(2026,10,12,15,59,59),level:'error'},{id:4,at:Date.UTC(2026,10,12,16),level:'warning'}];
   assert.equal(logDate(logs[0].at),'2026-11-11');assert.equal(logDate(logs[1].at),'2026-11-12');
