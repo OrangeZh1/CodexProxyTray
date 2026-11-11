@@ -288,7 +288,7 @@ h2 { font-size: 14px; font-weight: 600; color: var(--text-secondary); margin: 18
 .log-filters { gap: 4px; }
 .settings-tabs { width: 100%; gap: 4px; margin: 0 0 18px; }
 :is(.settings-tabs, .log-filters, .log-quick-filters) > :is(.fui-Tab, .fui-Button) { min-width: 0; height: 32px; min-height: 32px; padding: 5px 10px; border: 0; border-radius: 6px; font-size: 13px; line-height: 22px; font-weight: 400; color: var(--text-secondary); background: transparent; transition: background-color var(--motion-fast) ease, color var(--motion-fast) ease; }
-:is(.settings-tabs, .log-filters, .log-quick-filters) > :is([aria-selected="true"], [aria-pressed="true"]) { color: var(--accent); background: var(--selection-bg) !important; font-weight: 600; }
+:is(.settings-tabs, .log-filters, .log-quick-filters) > :is([aria-selected="true"], [aria-pressed="true"]) { color: var(--accent) !important; background: var(--selection-bg) !important; font-weight: 600 !important; }
 :is(.settings-tabs, .log-filters) > .fui-Tab::before, :is(.settings-tabs, .log-filters) > .fui-Tab::after { display: none !important; }
 :is(.settings-tabs, .log-filters) .fui-Tab__content { color: inherit !important; font: inherit !important; }
 :is(.settings-tabs, .log-filters, .log-quick-filters) > :is(.fui-Tab, .fui-Button):not([aria-selected="true"]):not([aria-pressed="true"]):hover { background: var(--panel-hover); color: var(--text-primary); }
