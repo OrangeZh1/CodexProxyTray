@@ -198,7 +198,7 @@ namespace CodexProxyTray {
     $freshCode = @'
 $ErrorActionPreference='Stop'
 [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false)
-$command=Get-Command codex -ErrorAction Stop
+$command=Get-Command codex -ErrorAction Stop | Select-Object -First 1
 $info=& codex --proxy-info | ConvertFrom-Json
 if($LASTEXITCODE -ne 0){throw 'CLI proxy-info failed'}
 $version=(& codex --version | Out-String).Trim()

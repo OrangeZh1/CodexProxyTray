@@ -133,7 +133,7 @@ function Remove-OwnedSandbox {
 
 $cliBinary=(Resolve-Path -LiteralPath $BinaryPath).Path
 if(-not (Test-Path -LiteralPath $cliBinary -PathType Leaf) -or [IO.Path]::GetFileName($cliBinary) -ne 'codex-proxy-cli.exe'){throw 'BinaryPath must explicitly name the compiled codex-proxy-cli.exe.'}
-$nodeProgram=if($NodePath){(Resolve-Path -LiteralPath $NodePath).Path}else{(Get-Command node.exe -CommandType Application -ErrorAction Stop).Source}
+$nodeProgram=if($NodePath){(Resolve-Path -LiteralPath $NodePath).Path}else{(Get-Command node.exe -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source}
 if(-not (Test-Path -LiteralPath $nodeProgram -PathType Leaf) -or [IO.Path]::GetFileName($nodeProgram) -ne 'node.exe'){throw 'Use a real Node.js executable.'}
 if(-not $TempRoot){$TempRoot=Join-Path ([IO.Path]::GetTempPath()) ('CodexProxyTray-cli-qa-'+$nonce)}
 $qaTempRoot=Check-NewTempDirectory $TempRoot
