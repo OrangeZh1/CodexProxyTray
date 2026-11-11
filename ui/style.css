@@ -9,7 +9,7 @@
   --panel-stroke: #d6dde8;
   --text-primary: #1c2738;
   --text-secondary: #46546a;
-  --text-muted: #64748b;
+  --text-muted: #5c6c82;
   --accent: #005fb8;
   --selection-bg: #dceafb;
   --selection-mark: #0066bf;
@@ -250,6 +250,7 @@ h2 { font-size: 14px; font-weight: 600; color: var(--text-secondary); margin: 18
 .log-date-filters { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 10px; margin-bottom: 16px; }
 .log-date-filters label { display: grid; gap: 5px; color: var(--text-secondary); font-size: 12px; }
 .log-date-filters input { min-width: 136px; font-size: 12px; }
+.log-date-filters .log-search { flex: 1; min-width: 180px; max-width: 280px; }
 .log-date-separator { align-self: flex-end; line-height: 32px; color: var(--text-muted); }
 .log-detail-dialog { width: min(720px, calc(100vw - 48px)); max-height: calc(100dvh - 48px); color: var(--text-primary); }
 .log-detail-dialog .fui-DialogTitle { margin: 0; color: var(--text-primary); }

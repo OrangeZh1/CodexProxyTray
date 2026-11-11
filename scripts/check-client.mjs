@@ -54,7 +54,8 @@ for(const view of ['main','tray'])for(const theme of ['light','dark']){
       window.document.querySelector('[data-page="logs"]').click();await delay(30);
       window.document.querySelector('.log-open').click();await delay(50);
       assert.match(window.document.querySelector('.log-detail-dialog')?.textContent||'',/客户端启动回归/);
-      [...window.document.querySelectorAll('.log-detail-dialog button')].find(button=>button.textContent.trim()==='关闭').click();await delay(50);
+      [...window.document.querySelectorAll('.log-detail-dialog button')].find(button=>button.textContent.trim()==='关闭').click();await delay(10);
+      const closingDetail=window.document.querySelector('.log-detail-dialog');if(closingDetail)assert.match(closingDetail.textContent,/客户端启动回归/,'Closing animation must retain the selected log content.');await delay(50);
       window.document.querySelector('[data-page="settings"]').click();await delay(30);
       window.document.querySelector('#color-theme').click();await delay(50);
       assert.ok(window.document.querySelector('[role="listbox"]'),'Theme uses the Fluent listbox.');
