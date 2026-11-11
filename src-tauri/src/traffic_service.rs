@@ -247,7 +247,13 @@ pub(crate) fn collector_broker()->Result<OwnedHandle,String>{unsafe{
     if process_sid(process.0)?!="S-1-5-18"||process_image(process.0)?!=image.canonicalize().map_err(|_|"辅助服务映像不存在。")?||identity_on(process.0).map_err(win)?.created_filetime>identity_on(GetCurrentProcess()).map_err(win)?.created_filetime||status(&service)?.dwProcessId!=state.dwProcessId||WaitForSingleObject(process.0,0)!=WAIT_TIMEOUT{return Err("采集辅助服务身份已变化。".into())}Ok(process)
 }}
 fn broker(handle:SERVICE_STATUS_HANDLE)->Result<(),String>{
-    let record=installed_self()?;let pipe=BrokerPipe::server(&record.owner_sid)?;let mut children=Vec::<Child>::new();let mut idle=Instant::now();let mut checkpoint=1;
+    let record=installed_self()?;
+    // Only this broker process is changed: the GUI may inspect/wait, never mutate,
+    // terminate, duplicate handles, change security, or inherit a broader token DACL.
+    let query=(PROCESS_QUERY_LIMITED_INFORMATION|PROCESS_SYNCHRONIZE).0;let all=PROCESS_ALL_ACCESS.0;
+    let security=descriptor(&format!("D:P(A;;0x{all:x};;;SY)(A;;0x{all:x};;;BA)(A;;0x{query:x};;;{})",record.owner_sid))?;
+    unsafe{SetKernelObjectSecurity(GetCurrentProcess(),DACL_SECURITY_INFORMATION,security.0).map_err(win)?;}
+    let pipe=BrokerPipe::server(&record.owner_sid)?;let mut children=Vec::<Child>::new();let mut idle=Instant::now();let mut checkpoint=1;
     report(handle,SERVICE_RUNNING,SERVICE_ACCEPT_STOP,0,0);
     loop{
         children.retain_mut(|child|child.try_wait().ok().flatten().is_none());if !children.is_empty(){idle=Instant::now();}

@@ -94,8 +94,16 @@ namespace CodexProxyTray {
   [DllImport("advapi32.dll",SetLastError=true)] static extern bool QueryServiceConfigW(IntPtr service,IntPtr config,uint length,out uint needed);
   [DllImport("advapi32.dll",SetLastError=true)] static extern bool QueryServiceStatusEx(IntPtr service,int kind,out Status status,uint length,out uint needed);
   [DllImport("advapi32.dll",SetLastError=true)] static extern bool QueryServiceObjectSecurity(IntPtr service,uint info,byte[] descriptor,uint length,out uint needed);
+  [DllImport("kernel32.dll",SetLastError=true)] static extern IntPtr OpenProcess(uint access,bool inherit,uint pid);
+  [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr handle);
+  [DllImport("advapi32.dll",SetLastError=true)] static extern bool GetKernelObjectSecurity(IntPtr handle,uint info,byte[] descriptor,uint length,out uint needed);
   public static bool Elevated() {using(var user=WindowsIdentity.GetCurrent()){uint elevated,returned;if(!GetTokenInformation(user.Token,20,out elevated,4,out returned))throw new Win32Exception();return elevated!=0;}}
   public static string ProgramFiles() {var path=new StringBuilder(260);if(SHGetFolderPathW(IntPtr.Zero,0x26,IntPtr.Zero,0,path)<0)throw new InvalidOperationException("known_folder_failed");return path.ToString();}
+  public static byte[] ProcessSecurity(uint pid) {
+   IntPtr process=OpenProcess(0x20000,false,pid);if(process==IntPtr.Zero)throw new Win32Exception();
+   try {uint needed;GetKernelObjectSecurity(process,4,null,0,out needed);if(needed==0||needed>65536)throw new InvalidOperationException("process_security_size");var security=new byte[(int)needed];if(!GetKernelObjectSecurity(process,4,security,needed,out needed))throw new Win32Exception();return security;}
+   finally {CloseHandle(process);}
+  }
   public static ServiceQaInfo Inspect(string name) {
    IntPtr manager=OpenSCManagerW(null,null,1);if(manager==IntPtr.Zero)throw new Win32Exception();IntPtr service=IntPtr.Zero,memory=IntPtr.Zero;
    try {
@@ -141,6 +149,17 @@ function Assert-ServiceConfig($Info) {
         $sid=$ace.SecurityIdentifier.Value;Require ($seen.Add($sid)) 'service_acl_duplicate_rule'
         $expected=if($sid -in @('S-1-5-18','S-1-5-32-544')){0xf01ff}elseif($sid -eq $ownerSid){0x20015}else{throw 'service_acl_unknown_principal'}
         Require ($ace.AccessMask -eq $expected) 'service_acl_rights_invalid'
+    }
+}
+function Assert-ProcessAcl([uint32]$ProcessId) {
+    $descriptor=[Security.AccessControl.RawSecurityDescriptor]::new([CodexProxyTray.ServiceQaNative]::ProcessSecurity($ProcessId),0)
+    Require ($null -ne $descriptor.DiscretionaryAcl -and $descriptor.DiscretionaryAcl.Count -eq 3) 'process_acl_unknown_rules'
+    $seen=[Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach($ace in $descriptor.DiscretionaryAcl){
+        Require ($ace -is [Security.AccessControl.CommonAce] -and $ace.AceType -eq [Security.AccessControl.AceType]::AccessAllowed -and -not ($ace.AceFlags -band [Security.AccessControl.AceFlags]::Inherited)) 'process_acl_unexpected_rule_type'
+        $sid=$ace.SecurityIdentifier.Value;Require ($seen.Add($sid)) 'process_acl_duplicate_rule'
+        $expected=if($sid -in @('S-1-5-18','S-1-5-32-544')){0x1fffff}elseif($sid -eq $ownerSid){0x101000}else{throw 'process_acl_unknown_principal'}
+        Require ($ace.AccessMask -eq $expected) 'process_acl_rights_invalid'
     }
 }
 function Assert-OwnedInstall([switch]$AllowPrepared,[switch]$AllowMissingService) {
@@ -263,6 +282,8 @@ try {
         $verified=Assert-OwnedInstall;Require ($verified.service.State -eq 4 -and $verified.service.ProcessId -gt 0) 'service_main_not_running'
         $script:serviceProcess=Get-Process -Id $verified.service.ProcessId -ErrorAction Stop
         Require (Same-Path $serviceProcess.Path $serviceImage) 'running_service_image_mismatch'
+        Assert-ProcessAcl $verified.service.ProcessId
+        $report.process_acl_verified=$true
         $report.real_service_main_running=$true
     }
     Run-Case 'stop_only_owned_service' {Stop-OwnedService;$report.service_stop_verified=$true}
