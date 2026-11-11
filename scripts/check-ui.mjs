@@ -221,8 +221,8 @@ try {
   assert.match(outdated,/版本不匹配/);assert.match(outdated,/辅助服务与当前应用不匹配，请先卸载后重新安装/);assert.match(outdated,/卸载辅助服务/);
   assert.doesNotMatch(outdated,/更新辅助服务|\bid="install-traffic-service"/);
   assert.equal(disabled(control(outdated,'input','traffic-enabled')),true);
-  const denied=collector({state:'error',version:null,error:'无法读取服务状态'});
-  assert.match(denied,/无法读取服务状态/);assert.doesNotMatch(denied,/\bid="(?:install|uninstall)-traffic-service"|版本 /);
+  const deniedCollector=collector({state:'error',version:null,error:'无法读取服务状态'});
+  assert.match(deniedCollector,/无法读取服务状态/);assert.doesNotMatch(deniedCollector,/\bid="(?:install|uninstall)-traffic-service"|版本 /);
   const cancelled=collector({state:'not_installed',error:'已取消权限授权'});
   assert.match(cancelled,/已取消权限授权/);
   const installing=collector({state:'not_installed'},{state:'disabled'},new Set(['install-traffic-service']));
