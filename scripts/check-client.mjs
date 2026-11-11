@@ -94,7 +94,7 @@ for(const view of ['main','tray'])for(const theme of ['light','dark']){
       refresh.click();await delay(50);
       assert.equal(refresh.getAttribute('aria-busy'),'true');assert.equal(toggle.getAttribute('aria-busy'),'false');assert.equal(hideCount,0);
       refreshResolve(structuredClone(sample));
-      for(let i=0;i<50&&!hideCount;i++)await delay(20);
+      for(let i=0;i<50&&(!hideCount||refresh.getAttribute('aria-busy')==='true');i++)await delay(20);
       assert.equal(refresh.getAttribute('aria-busy'),'false');assert.equal(hideCount,1);
       assert.deepEqual(errors,[]);
     }
