@@ -37,12 +37,27 @@ for(const view of ['main','tray'])for(const theme of ['light','dark']){
       assert.equal(window.document.querySelector('h1')?.textContent,'仪表盘');
       assert.match(window.document.querySelector('.sidebar-footer')?.textContent||'',/后台运行中/);
       assert.match(window.document.querySelector('#root').textContent,/网页可达/);
+      assert.equal(window.document.querySelector('section[aria-label="仪表盘"] .traffic-card'),null,'Traffic belongs in settings.');
       const settingsEntry=[...window.document.querySelectorAll('button')].find(button=>button.textContent.trim()==='前往设置')||window.document.querySelector('[data-page="settings"]');
       settingsEntry.click();await delay(50);
       assert.deepEqual(errors,[],'Dashboard to settings must not call a scroll Promise as a cleanup function.');
       assert.equal(window.document.querySelector('h1')?.textContent,'设置');
+      assert.ok(window.document.querySelector('#log-start-date'));assert.ok(window.document.querySelector('#log-end-date'));
+      assert.equal(window.document.querySelector('#color-theme')?.getAttribute('role'),'combobox');
+      assert.equal(window.document.querySelector('#launch-target')?.getAttribute('role'),'combobox');
       for(const tab of ['about','general']){window.document.querySelector(`#settings-tab-${tab}`).click();await delay(30);assert.equal(window.document.querySelector(`#settings-panel-${tab}`).hidden,false);assert.deepEqual(errors,[]);}
       for(const page of ['dashboard','proxy','logs','settings','dashboard']){window.document.querySelector(`[data-page="${page}"]`).click();await delay(30);assert.deepEqual(errors,[],`Navigation failed at ${page}`);assert.ok(window.document.querySelector('.sidebar'));}
+      window.document.querySelector('[data-page="logs"]').click();await delay(30);
+      window.document.querySelector('.log-open').click();await delay(50);
+      assert.match(window.document.querySelector('.log-detail-dialog')?.textContent||'',/客户端启动回归/);
+      [...window.document.querySelectorAll('.log-detail-dialog button')].find(button=>button.textContent.trim()==='关闭').click();await delay(50);
+      window.document.querySelector('[data-page="settings"]').click();await delay(30);
+      window.document.querySelector('#color-theme').click();await delay(50);
+      assert.ok(window.document.querySelector('[role="listbox"]'),'Theme uses the Fluent listbox.');
+      const chosen=[...window.document.querySelectorAll('[role="option"]')].find(option=>option.textContent.trim()===(theme==='light'?'浅色':'深色'));
+      assert.ok(chosen);chosen.click();await delay(700);assert.deepEqual(errors,[]);
+      window.document.querySelector('[aria-label="收起侧边栏"]').click();await delay(30);assert.ok(window.document.querySelector('.sidebar-collapsed'));
+      window.document.querySelector('[aria-label="展开侧边栏"]').click();await delay(30);assert.equal(window.document.querySelector('.sidebar-collapsed'),null);
     }else{
       assert.equal(window.document.querySelectorAll('[role="menuitem"]').length,8);
       assert.equal(window.document.activeElement?.getAttribute('role'),'menu');

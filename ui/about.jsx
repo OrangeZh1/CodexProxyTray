@@ -1,7 +1,8 @@
 import React from 'react';
-import {Button,Select,Switch,Dialog,DialogTrigger,DialogSurface,DialogBody,DialogTitle,DialogContent,DialogActions} from '@fluentui/react-components';
+import {Button,Switch,Dialog,DialogTrigger,DialogSurface,DialogBody,DialogTitle,DialogContent,DialogActions} from '@fluentui/react-components';
 import {Icon} from '@iconify/react';
 import icons from '#fluent-icons';
+import {Choice} from './choice.jsx';
 
 const intervals=[1,3,6,12,24];
 const license=`MIT License
@@ -62,7 +63,7 @@ export function About({status,version,busy=()=>false,writable=false,onPreference
     <div className="settings-group">
       <Row icon="plug-connected-24-regular" title="允许联网检测" description="用于 GitHub 更新检查和 ChatGPT 网页连通性探测。"><div className="switch-control">{networkBusy&&<Symbol name="arrow-sync-24-regular" spin/>}<Switch id="network-enabled" aria-label="允许联网检测" aria-busy={networkBusy} checked={networkEnabled} disabled={!writable||typeof onPreference!=='function'||networkBusy} onChange={(_,data)=>onPreference('networkEnabled',data.checked)}/></div></Row>
       <Row icon="arrow-sync-24-regular" title="自动检查更新" description="按设定间隔在后台检查，不自动下载或安装。"><div className="switch-control">{automaticBusy&&<Symbol name="arrow-sync-24-regular" spin/>}<Switch id="auto-check-updates" aria-label="自动检查更新" aria-busy={automaticBusy} checked={automatic} disabled={!writable||typeof onPreference!=='function'||!networkEnabled||automaticBusy} onChange={(_,data)=>onPreference('autoCheckUpdates',data.checked)}/></div></Row>
-      <Row icon="clock-24-regular" title="检查间隔" description="可先设置间隔，再开启自动检查。"><div className="switch-control">{intervalBusy&&<Symbol name="arrow-sync-24-regular" spin/>}<Select id="update-interval" aria-label="自动检查更新间隔" aria-busy={intervalBusy} value={String(interval)} icon={<Icon icon={icons['chevron-down-24-regular']} width={16} height={16} aria-hidden="true"/>} disabled={!writable||typeof onPreference!=='function'||!networkEnabled||intervalBusy} onChange={(_,data)=>onPreference('updateIntervalHours',Number(data.value))}>{intervals.map(hours=><option key={hours} value={String(hours)}>{hours} 小时</option>)}</Select></div></Row>
+      <Row icon="clock-24-regular" title="检查间隔" description="可先设置间隔，再开启自动检查。"><div className="switch-control">{intervalBusy&&<Symbol name="arrow-sync-24-regular" spin/>}<Choice id="update-interval" label="自动检查更新间隔" busy={intervalBusy} value={String(interval)} options={intervals.map(hours=>({value:String(hours),label:`${hours} 小时`}))} disabled={!writable||typeof onPreference!=='function'||!networkEnabled||intervalBusy} onChange={value=>onPreference('updateIntervalHours',Number(value))}/></div></Row>
       <Row icon="info-24-regular" title={title} description={<><span>上次检查：{checkedTime(update.checked_at)}</span>{update.checking&&!manualBusy&&<span className="background-check" role="status">后台检查中</span>}</>}><Button id="check-updates" className="text-action" appearance="subtle" aria-busy={manualBusy} disabled={!writable||!networkEnabled||typeof onCheck!=='function'||manualBusy} icon={<Symbol name="arrow-sync-24-regular" spin={manualBusy}/>} onClick={onCheck}>{manualBusy?'正在检查':'检查更新'}</Button></Row>
       {!update.checking&&update.status==='error'&&error&&<div className="release-notes error-text" role="status">{error}</div>}
       {!update.checking&&update.status!=='error'&&update.status!=='unpublished'&&notes&&<div className="release-notes" role="status">{notes}</div>}

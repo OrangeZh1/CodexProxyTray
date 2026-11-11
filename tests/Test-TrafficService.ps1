@@ -78,7 +78,7 @@ using System.Security.Principal;
 using System.Text;
 namespace CodexProxyTray {
  public sealed class ServiceQaInfo {
-  public uint Type,StartType,ErrorControl,State,ProcessId,Win32Exit,SpecificExit;
+  public uint Type,StartType,ErrorControl,State,ProcessId,Win32Exit,SpecificExit,Controls;
   public string Binary,Account,Display;
   public bool NoDependencies,NoLoadGroup;
   public byte[] Security;
@@ -112,7 +112,7 @@ namespace CodexProxyTray {
     memory=Marshal.AllocHGlobal((int)needed);if(!QueryServiceConfigW(service,memory,needed,out needed))throw new Win32Exception();var config=(Config)Marshal.PtrToStructure(memory,typeof(Config));
     Status status;if(!QueryServiceStatusEx(service,0,out status,(uint)Marshal.SizeOf(typeof(Status)),out needed))throw new Win32Exception();
     QueryServiceObjectSecurity(service,5,null,0,out needed);if(needed==0||needed>65536)throw new InvalidOperationException("service_security_size");var security=new byte[needed];if(!QueryServiceObjectSecurity(service,5,security,needed,out needed))throw new Win32Exception();
-    return new ServiceQaInfo {Type=config.type,StartType=config.start,ErrorControl=config.error,State=status.state,ProcessId=status.pid,Win32Exit=status.exit,SpecificExit=status.specific,Binary=Marshal.PtrToStringUni(config.binary),Account=Marshal.PtrToStringUni(config.account),Display=Marshal.PtrToStringUni(config.display),NoDependencies=config.dependencies==IntPtr.Zero||Marshal.ReadInt16(config.dependencies)==0,NoLoadGroup=config.group==IntPtr.Zero||Marshal.ReadInt16(config.group)==0,Security=security};
+    return new ServiceQaInfo {Type=config.type,StartType=config.start,ErrorControl=config.error,State=status.state,ProcessId=status.pid,Win32Exit=status.exit,SpecificExit=status.specific,Controls=status.controls,Binary=Marshal.PtrToStringUni(config.binary),Account=Marshal.PtrToStringUni(config.account),Display=Marshal.PtrToStringUni(config.display),NoDependencies=config.dependencies==IntPtr.Zero||Marshal.ReadInt16(config.dependencies)==0,NoLoadGroup=config.group==IntPtr.Zero||Marshal.ReadInt16(config.group)==0,Security=security};
    } finally {if(memory!=IntPtr.Zero)Marshal.FreeHGlobal(memory);if(service!=IntPtr.Zero)CloseServiceHandle(service);CloseServiceHandle(manager);}
   }
  }
@@ -216,6 +216,8 @@ function Run-Installer([ValidateSet('--install-traffic-service','--uninstall-tra
 function Stop-OwnedService {
     $owned=Assert-OwnedInstall;$info=$owned.service
     if($info.State -eq 1){return}
+    $deadline=[DateTime]::UtcNow.AddSeconds($ServiceTimeoutSeconds)
+    while($info.State -eq 4 -and -not($info.Controls -band 1)){Require ([DateTime]::UtcNow -lt $deadline) 'service_stop_control_not_ready';Start-Sleep -Milliseconds 50;$info=(Assert-OwnedInstall).service}
     $controller=Get-Service -Name $serviceName -ErrorAction Stop
     try {
         if($info.State -ne 3){Require (-not $script:stopSent) 'stop_already_requested';$script:stopSent=$true;Stop-Service -Name $serviceName -NoWait -ErrorAction Stop -WarningAction Stop -Confirm:$false}

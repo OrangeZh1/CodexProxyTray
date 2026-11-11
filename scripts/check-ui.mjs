@@ -105,12 +105,13 @@ try {
     assert.ok(result,`Missing ${id}`);return result;
   };
   const disabled=markup=>/\bdisabled(?:=|\s|>)/.test(markup);
+  const buttonLabel=(markup,id)=>new RegExp(`<button\\b(?=[^>]*\\bid="${id}")[^>]*>([\\s\\S]*?)<\\/button>`).exec(markup)?.[1]||'';
   const updateState={checking:true,checked_at:Date.UTC(2026,10,11,12,34,56),status:'current',latest:version,notes:'',error:null};
   const background=about({network_enabled:true,auto_check_updates:false,update_interval_hours:3,update:updateState});
   assert.match(background,/后台检查中/);assert.match(control(background,'button','check-updates'),/aria-busy="false"/);
   assert.equal(disabled(control(background,'button','check-updates')),false);
-  assert.equal(disabled(control(background,'select','update-interval')),false);
-  assert.match(background,/<option\b(?=[^>]*\bvalue="3")(?=[^>]*\bselected(?:=|\s|>))[^>]*>/);
+  assert.equal(disabled(control(background,'button','update-interval')),false);
+  assert.match(buttonLabel(background,'update-interval'),/3 小时/);
   assert.doesNotMatch(background,/<img\b|about-brand|北京时间/);
   assert.match(background,/20:34:56/);
   assert.match(background,/不记录或上报对话、提示词、用户 CLI 参数/);
@@ -125,20 +126,20 @@ try {
   assert.equal(disabled(control(offline,'button','check-updates')),true);
   assert.equal(disabled(control(offline,'input','auto-check-updates')),true);
   assert.match(control(offline,'input','auto-check-updates'),/\bchecked(?:=|\s|>)/);
-  assert.match(offline,/<option\b(?=[^>]*\bvalue="12")(?=[^>]*\bselected(?:=|\s|>))[^>]*>/);
+  assert.match(buttonLabel(offline,'update-interval'),/12 小时/);
   assert.equal(disabled(control(offline,'button','open-source')),false);
   checks++;
 
   const manual=about({network_enabled:true,update:updateState},new Set(['check-updates']));
   assert.match(control(manual,'button','check-updates'),/aria-busy="true"/);
   for(const id of ['network-enabled','auto-check-updates'])assert.match(control(manual,'input',id),/aria-busy="false"/);
-  assert.match(control(manual,'select','update-interval'),/aria-busy="false"/);
+  assert.match(control(manual,'button','update-interval'),/aria-busy="false"/);
   const interval=about({network_enabled:true,auto_check_updates:false},new Set(['update-interval']));
-  assert.match(control(interval,'select','update-interval'),/aria-busy="true"/);
+  assert.match(control(interval,'button','update-interval'),/aria-busy="true"/);
   assert.match(control(interval,'button','check-updates'),/aria-busy="false"/);
   assert.equal(disabled(control(interval,'button','check-updates')),false);
   const firstTime=about({network_enabled:true});
-  assert.match(firstTime,/上次检查：尚未检查/);assert.match(firstTime,/<option\b(?=[^>]*\bvalue="6")(?=[^>]*\bselected(?:=|\s|>))[^>]*>/);
+  assert.match(firstTime,/上次检查：尚未检查/);assert.match(buttonLabel(firstTime,'update-interval'),/6 小时/);
   checks++;
 
   const unpublished=about({update:{status:'unpublished',notes:'尚未发布 CodexProxyTray 正式安装包。'}});
@@ -155,7 +156,7 @@ try {
       const themed=render('settings',sample);
       assert.ok(themed.includes(`data-theme="${resolved}"`));
       assert.match(active(themed,'设置'),/aria-label="界面主题"/);
-      assert.match(themed,new RegExp(`<option\\b(?=[^>]*\\bvalue="${saved}")(?=[^>]*\\bselected(?:=|\\s|>))[^>]*>`));
+      assert.match(buttonLabel(themed,'color-theme'),new RegExp({light:'浅色',dark:'深色',system:'跟随系统'}[saved]));
       assert.equal(resolveTheme(readThemeMode(),dark),resolved);
     }
     assert.equal(readThemeMode({getItem:()=> 'invalid'}),'system');
@@ -225,7 +226,8 @@ try {
   assert.match(missingService,/暂不可用/);assert.doesNotMatch(missingService,/安装辅助服务|前往设置|2\.0 KB\/s/);
   const disabledTraffic=traffic({state:'collecting',receive_bps:2048},runningService,false);
   assert.match(disabledTraffic,/未开启/);assert.doesNotMatch(disabledTraffic,/2\.0 KB\/s|<button/);
-  assert.doesNotMatch(active(render('dashboard',sample),'仪表盘'),/前往设置|安装辅助服务|卸载辅助服务|记录网络流量/);
+  assert.doesNotMatch(active(render('dashboard',sample),'仪表盘'),/前往设置|安装辅助服务|卸载辅助服务|记录网络流量|目标进程流量/);
+  assert.match(settingsPanel(render('settings',sample),'general'),/目标进程流量/);
   assert.equal(trafficAmount(null,true),'—');assert.equal(trafficAmount(-1),'—');
   checks++;
 

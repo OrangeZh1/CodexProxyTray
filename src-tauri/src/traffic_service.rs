@@ -7,7 +7,7 @@ use crate::{traffic::{OwnedHandle,identity_on,open_identity},traffic_core::Proce
 
 const NAME:&str="CodexProxyTrayTraffic";
 const DISPLAY:&str="CodexProxyTray Traffic Collector";
-const PIPE:&str=r"\\.\pipe\CodexProxyTray.Traffic.Service.v1";
+const PIPE:&str=r"\\.\pipe\CodexProxyTray.Traffic.Service.v2";
 const IMAGE:&str="CodexProxyTrayTrafficService.exe";
 const LOADER:&str="WebView2Loader.dll";
 const IMAGE_PENDING:&str="CodexProxyTrayTrafficService.exe.pending";
@@ -17,7 +17,7 @@ const RECEIPT:&str="receipt.json";
 const PENDING:&str="receipt.pending.json";
 const PRODUCT:&str="CodexProxyTray.TrafficService";
 const FILE_SDDL:&str="O:BAG:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)";
-const PROTOCOL:u32=1;
+const PROTOCOL:u32=2;
 const MAX_FRAME:usize=4096;
 static SELF_HASH:OnceLock<Result<String,String>>=OnceLock::new();
 static STOP:AtomicBool=AtomicBool::new(false);
@@ -34,6 +34,9 @@ struct Request {protocol:u32,token:String,parent:ProcessIdentity}
 #[derive(Serialize,Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Reply {protocol:u32,handle:u64,child:Option<ProcessIdentity>,error:Option<String>}
+#[derive(Serialize,Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReplyReceived {protocol:u32}
 struct Sc(SC_HANDLE);
 impl Drop for Sc {fn drop(&mut self){unsafe{let _=CloseServiceHandle(self.0);}}}
 struct Descriptor(PSECURITY_DESCRIPTOR);
@@ -233,6 +236,12 @@ impl BrokerPipe{
     fn client()->Result<Self,String>{unsafe{let name=wide(PIPE);let raw=CreateFileW(PCWSTR(name.as_ptr()),(GENERIC_READ|GENERIC_WRITE).0,FILE_SHARE_MODE(0),None,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL|SECURITY_SQOS_PRESENT|SECURITY_IDENTIFICATION,None).map_err(win)?;let pipe=Self(OwnedHandle(raw));let mode=PIPE_READMODE_MESSAGE|PIPE_NOWAIT;SetNamedPipeHandleState(pipe.0.0,Some(&mode),None,None).map_err(win)?;Ok(pipe)}}
     fn read<T:for<'de>Deserialize<'de>>(&self)->Result<Option<T>,String>{unsafe{let(mut total,mut remaining)=(0,0);PeekNamedPipe(self.0.0,None,0,None,Some(&mut total),Some(&mut remaining)).map_err(win)?;if total==0{return Ok(None)}if remaining==0||remaining as usize>MAX_FRAME{return Err("辅助服务消息大小无效。".into())}let mut bytes=vec![0u8;remaining as usize];let mut count=0;ReadFile(self.0.0,Some(&mut bytes),Some(&mut count),None).map_err(win)?;bytes.truncate(count as usize);serde_json::from_slice(&bytes).map(Some).map_err(|_|"辅助服务消息格式无效。".into())}}
     fn write<T:Serialize>(&self,value:&T)->Result<(),String>{unsafe{let bytes=serde_json::to_vec(value).map_err(|_|"辅助服务消息编码失败。")?;if bytes.len()>MAX_FRAME{return Err("辅助服务消息大小无效。".into())}let mut count=0;WriteFile(self.0.0,Some(&bytes),Some(&mut count),None).map_err(win)?;if count as usize!=bytes.len(){return Err("辅助服务消息写入不完整。".into())}Ok(())}}
+    fn reply(&self,value:&Reply)->Result<(),String>{
+        self.write(value)?;self.wait_received()
+    }
+    fn wait_received(&self)->Result<(),String>{let deadline=Instant::now()+Duration::from_secs(3);
+        loop{if STOP.load(Ordering::Acquire){return Err("辅助服务正在停止。".into())}if let Some(received)=self.read::<ReplyReceived>()?{if received.protocol!=PROTOCOL{return Err("辅助服务响应确认无效。".into())}return Ok(())}if Instant::now()>=deadline{return Err("辅助服务响应未被客户端确认。".into())}thread::sleep(Duration::from_millis(10));}
+    }
 }
 fn valid_token(token:&str)->bool{token.len()==32&&token.bytes().all(|v|v.is_ascii_hexdigit())}
 fn trusted_gui(parent:HANDLE,record:&Receipt)->Result<(),String>{if process_sid(parent)?!=record.owner_sid||sha256(&process_image(parent)?)?!=record.sha256{return Err("辅助服务客户端身份或版本不匹配。".into())}Ok(())}
@@ -262,7 +271,7 @@ fn broker(handle:SERVICE_STATUS_HANDLE)->Result<(),String>{
         report(handle,SERVICE_RUNNING,if children.is_empty(){SERVICE_ACCEPT_STOP}else{0},0,0);
         let connected=unsafe{match ConnectNamedPipe(pipe.0.0,None){Ok(())=>true,Err(error)if code(&error)==535=>true,Err(error)if code(&error)==536=>false,Err(error)=>return Err(win(error))}};
         if connected{
-            let result=serve_request(&pipe,&record,&mut children);if let Err(error)=result{let _=pipe.write(&Reply{protocol:PROTOCOL,handle:0,child:None,error:Some(error)});}unsafe{let _=DisconnectNamedPipe(pipe.0.0);}idle=Instant::now();
+            let result=serve_request(&pipe,&record,&mut children);if let Err(error)=result{let _=pipe.reply(&Reply{protocol:PROTOCOL,handle:0,child:None,error:Some(error)});}unsafe{let _=DisconnectNamedPipe(pipe.0.0);}idle=Instant::now();
         }
         thread::sleep(Duration::from_millis(25));
     }
@@ -275,7 +284,9 @@ fn serve_request(pipe:&BrokerPipe,record:&Receipt,children:&mut Vec<Child>)->Res
     // The only launch target and arguments are fixed; no request-supplied executable or directory is accepted.
     let(_,image)=paths()?;let child=Command::new(&image).args(["--traffic-collector","--pipe-token",&request.token,"--parent-pid",&identity.pid.to_string(),"--parent-created",&identity.created_filetime.to_string()]).current_dir(image.parent().ok_or("辅助服务目录无效。")?).creation_flags(0x08000000).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().map_err(|_|"系统采集器未能启动。")?;
     let child_handle=HANDLE(child.as_raw_handle());children.push(child);let child_identity=identity_on(child_handle).map_err(win)?;let mut remote=HANDLE::default();DuplicateHandle(GetCurrentProcess(),child_handle,peer.0,&mut remote,(PROCESS_QUERY_LIMITED_INFORMATION|PROCESS_SYNCHRONIZE).0,false,DUPLICATE_HANDLE_OPTIONS(0)).map_err(win)?;
-    let response=Reply{protocol:PROTOCOL,handle:remote.0 as usize as u64,child:Some(child_identity),error:None};if let Err(error)=pipe.write(&response){let mut local=HANDLE::default();let _=DuplicateHandle(peer.0,remote,GetCurrentProcess(),&mut local,0,false,DUPLICATE_CLOSE_SOURCE);if !local.is_invalid(){let _=CloseHandle(local);}return Err(error)}Ok(())
+    let response=Reply{protocol:PROTOCOL,handle:remote.0 as usize as u64,child:Some(child_identity),error:None};if let Err(error)=pipe.write(&response){let mut local=HANDLE::default();let _=DuplicateHandle(peer.0,remote,GetCurrentProcess(),&mut local,0,false,DUPLICATE_CLOSE_SOURCE);if !local.is_invalid(){let _=CloseHandle(local);}return Err(error)}
+    // DisconnectNamedPipe discards unread replies. The client confirms the frame before this connection is released.
+    pipe.wait_received()
 }}
 pub(crate) fn start_collector(token:&str,parent:ProcessIdentity)->Result<OwnedHandle,String>{unsafe{
     if !valid_token(token)||identity_on(GetCurrentProcess()).map_err(win)?!=parent{return Err("采集请求身份无效。".into())}let(directory,image)=paths()?;let record=load_receipt(&directory,&image,true)?;if record.phase!="installed"||record.owner_sid!=current_sid()?||record.sha256!=self_hash()?{return Err("辅助服务未安装或版本不同。".into())}
@@ -284,7 +295,8 @@ pub(crate) fn start_collector(token:&str,parent:ProcessIdentity)->Result<OwnedHa
     let deadline=Instant::now()+Duration::from_secs(8);let pipe=loop{let state=status(&service)?.dwCurrentState;if state==SERVICE_RUNNING{if let Ok(pipe)=BrokerPipe::client(){break pipe}}else if state==SERVICE_STOPPED{match StartServiceW(service.0,None){Ok(())=>{},Err(error)if code(&error)==1056=>{},Err(error)=>return Err(win(error))}}if Instant::now()>=deadline{return Err("辅助服务启动尚未完成。".into())}thread::sleep(Duration::from_millis(25));};
     let mut server=0;GetNamedPipeServerProcessId(pipe.0.0,&mut server).map_err(win)?;let state=status(&service)?;if state.dwCurrentState!=SERVICE_RUNNING||state.dwProcessId!=server{return Err("辅助服务管道身份不匹配。".into())}let service_process=OwnedHandle(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,false,server).map_err(win)?);if process_image(service_process.0)?!=image.canonicalize().map_err(|_|"辅助服务映像不存在。")?{return Err("辅助服务进程映像不匹配。".into())}
     pipe.write(&Request{protocol:PROTOCOL,token:token.into(),parent})?;let deadline=Instant::now()+Duration::from_secs(8);let reply:Reply=loop{if let Some(reply)=pipe.read()?{break reply}if Instant::now()>=deadline{return Err("辅助服务采集器响应超时。".into())}thread::sleep(Duration::from_millis(10));};
-    if reply.protocol!=PROTOCOL||reply.handle==0||reply.error.is_some(){return Err(reply.error.unwrap_or_else(||"辅助服务采集器启动失败。".into()))}let handle=OwnedHandle(HANDLE(reply.handle as usize as *mut std::ffi::c_void));if identity_on(handle.0).map_err(win)?!=reply.child.ok_or("辅助服务进程身份缺失。")?{return Err("辅助服务返回的进程身份不匹配。".into())}validate_collector(handle.0)?;Ok(handle)
+    if reply.protocol!=PROTOCOL{return Err("辅助服务响应协议不匹配。".into())}let returned=if reply.handle!=0{Some(OwnedHandle(HANDLE(reply.handle as usize as *mut std::ffi::c_void)))}else{None};pipe.write(&ReplyReceived{protocol:PROTOCOL})?;
+    if reply.error.is_some(){return Err(reply.error.unwrap())}let handle=returned.ok_or("辅助服务采集器启动失败。")?;if identity_on(handle.0).map_err(win)?!=reply.child.ok_or("辅助服务进程身份缺失。")?{return Err("辅助服务返回的进程身份不匹配。".into())}validate_collector(handle.0)?;Ok(handle)
 }}
 
 #[cfg(test)]mod tests{
@@ -293,5 +305,6 @@ pub(crate) fn start_collector(token:&str,parent:ProcessIdentity)->Result<OwnedHa
         assert!(valid_token("0123456789abcdef0123456789abcdef"));assert!(!valid_token("../codex.exe"));assert!(!valid_token(&"a".repeat(33)));
         assert!(serde_json::from_str::<Request>(r#"{"protocol":1,"token":"0123456789abcdef0123456789abcdef","parent":{"pid":1,"created_filetime":2},"command":"cmd.exe"}"#).is_err());
         assert!(serde_json::from_str::<Request>(r#"{"protocol":1,"token":"0123456789abcdef0123456789abcdef","parent":{"pid":1,"created_filetime":2,"path":"C:\\evil.exe"}}"#).is_err());
+        assert!(serde_json::from_str::<ReplyReceived>(r#"{"protocol":2,"command":"cmd.exe"}"#).is_err());
     }
 }
