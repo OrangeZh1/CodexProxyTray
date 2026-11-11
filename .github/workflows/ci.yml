@@ -70,12 +70,14 @@ jobs:
         with:
           name: frontend-dist
           path: dist/
-      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: native-cache
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-          key: windows-cargo-${{ env.RUST_VERSION }}-${{ hashFiles('src-tauri/Cargo.lock') }}
+            target/
+          key: windows-native-v1-${{ env.RUST_VERSION }}-${{ hashFiles('src-tauri/Cargo.lock') }}
       - name: 准备 Windows Rust
         shell: pwsh
         run: rustup toolchain install $env:RUST_VERSION --profile minimal --target x86_64-pc-windows-msvc --no-self-update
@@ -85,6 +87,19 @@ jobs:
       - name: Windows 配置迁移与边界检查
         shell: pwsh
         run: cargo "+$env:RUST_VERSION" test --locked --release --manifest-path src-tauri/Cargo.toml --target x86_64-pc-windows-msvc --bin CodexProxyTray --features custom-protocol
+      - name: 缓存已编译的原生依赖
+        if: steps.native-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/
+          key: ${{ steps.native-cache.outputs.cache-primary-key }}
+      - name: 真实 ETW 回环流量与会话收尾检查
+        timeout-minutes: 3
+        shell: pwsh
+        run: cargo "+$env:RUST_VERSION" test --locked --release --manifest-path src-tauri/Cargo.toml --target x86_64-pc-windows-msvc --bin CodexProxyTray --features custom-protocol traffic_etw::tests::etw_loopback_counts_only_verified_targets_and_stops -- --ignored --exact --test-threads=1
       - name: 隔离 CLI 验收
         shell: pwsh
         run: ./tests/Test-Cli.ps1 -BinaryPath "$env:CARGO_TARGET_DIR/x86_64-pc-windows-msvc/release/codex-proxy-cli.exe" -EvidenceDirectory "$env:RUNNER_TEMP/CodexProxyTray-cli-evidence"
@@ -106,6 +121,17 @@ jobs:
           $loaderPath=$loaders[0]
           node scripts/package-windows.mjs --bin-dir "$env:CARGO_TARGET_DIR/x86_64-pc-windows-msvc/release" --loader "$loaderPath" --out package
           if($LASTEXITCODE -ne 0){exit $LASTEXITCODE}
+      - name: 隔离验证辅助服务安装与卸载
+        shell: pwsh
+        run: ./tests/Test-TrafficService.ps1 -BinaryPath "${{ github.workspace }}/package/CodexProxyTray.exe" -EvidenceDirectory "$env:RUNNER_TEMP/CodexProxyTray-service-evidence"
+      - name: 保存辅助服务验收证据
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: service-evidence
+          path: ${{ runner.temp }}/CodexProxyTray-service-evidence/
+          if-no-files-found: ignore
+          retention-days: 7
       - name: 保存验收产物
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:

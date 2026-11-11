@@ -78,6 +78,11 @@ pub fn count_tcp_rows(bytes:&[u8], row_size:usize, state_offset:usize, pid_offse
     Some(established)
 }
 pub fn valid_log_position(id:u64,at:u64)->bool { id>0&&id<=9_007_199_254_740_991&&at<=8_640_000_000_000_000 }
+pub fn network_trace(text:&str)->(Option<String>,Option<String>){
+    let mut ip=None;let mut country=None;
+    for line in text.lines(){if let Some(value)=line.strip_prefix("ip="){if let Ok(address)=value.trim().parse::<IpAddr>(){ip=Some(address.to_string());}}if let Some(value)=line.strip_prefix("loc="){let value=value.trim();if value.len()==2&&value.bytes().all(|b|b.is_ascii_uppercase()){country=Some(value.into());}}}
+    (ip,country)
+}
 
 #[cfg(test)]
 mod tests {
@@ -109,4 +114,5 @@ mod tests {
         assert_eq!(descendant_pids(&[(2,1),(3,2),(4,99),(1,3)],&[1]),vec![1,2,3]);
     }
     #[test] fn history_rejects_overflowing_ids_and_unrenderable_dates(){assert!(valid_log_position(1,0));assert!(!valid_log_position(u64::MAX,1));assert!(!valid_log_position(1,u64::MAX));}
+    #[test] fn connectivity_trace_accepts_only_ip_and_country_metadata(){assert_eq!(network_trace("fl=ignored\nip=203.0.113.4\nloc=JP\n"),(Some("203.0.113.4".into()),Some("JP".into())));assert_eq!(network_trace("ip=<script>\nloc=long-value"),(None,None));}
 }

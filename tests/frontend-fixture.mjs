@@ -7,11 +7,13 @@ import { fileURLToPath } from 'node:url';
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '../dist');
 const port = Number(process.env.QA_PORT || 4174);
 if (!Number.isInteger(port) || port < 1 || port > 65535 || port === 4173) throw Error('QA_PORT must be a separate port; 4173 is reserved for the real preview.');
-const commands = ['get_status', 'refresh_status', 'set_enabled', 'save_proxy', 'save_system', 'launch_codex', 'launch_cli', 'check_updates', 'open_release', 'open_source', 'open_logs'];
+const commands = ['get_status', 'frontend_ready', 'refresh_status', 'set_enabled', 'save_proxy', 'save_system', 'launch_codex', 'launch_cli', 'check_updates', 'check_connectivity', 'enable_traffic', 'disable_traffic', 'install_traffic_service', 'uninstall_traffic_service', 'open_release', 'open_source', 'open_logs'];
 const defaults = new Map(), queued = new Map(), history = [];
 let online = true, epoch = 0, revision = 0, requestId = 0;
 const freshState = () => ({ revision: ++revision, enabled: true, guard_ready: true, proxy_url: 'http://127.0.0.1:7890', proxy_reachable: true, package_count: 1, package_version: 'QA', codex_running: false, restart_required: false, cli_detected: true, cli_ready: true, autostart: false, launch_target:'none',cli_workdir:'',network_enabled:true,auto_check_updates:false,update_interval_hours:6,update:{checking:false,checked_at:null,status:'unchecked',latest:null,notes:'',error:null},backend_ready: true, read_only: false, logs: [{ at: Date.now(), level: 'info',category:'QA',details:'仅测试，不修改真实应用或配置。',message: 'QA 模拟 IPC，无真实代理操作。' }] });
-let state = freshState();
+const emptyTraffic=()=>({state:'disabled',timestamp_ms:Date.now(),received_bytes:null,sent_bytes:null,receive_bps:null,send_bps:null,target_count:0,lost_events:null,lost_buffers:null,message:null});
+const initialize=()=>({...freshState(),traffic_enabled:false,traffic_service:{state:'not_installed',version:null,error:null},traffic:emptyTraffic()});
+let state = initialize();
 const view = () => ({ online, state, defaults: Object.fromEntries(defaults), queued: Object.fromEntries(queued), history });
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 const fault = (message, name = 'Error') => Object.assign(Error(message), { name });
@@ -24,7 +26,7 @@ async function body(req) {
 }
 
 function control(input) {
-  if (input.reset) { epoch++; online = true; defaults.clear(); queued.clear(); history.length = 0; state = freshState(); }
+  if (input.reset) { epoch++; online = true; defaults.clear(); queued.clear(); history.length = 0; state = initialize(); }
   if (typeof input.online === 'boolean' && input.online !== online) { online = input.online; epoch++; }
   if (input.clearRules) { defaults.clear(); queued.clear(); }
   if (input.rule) {
@@ -37,11 +39,17 @@ function control(input) {
 }
 
 function resultFor(command, args) {
+  if(command==='frontend_ready')return null;
+  if(command==='check_connectivity'){state.connectivity={checking:false,checked_at:Date.now(),status:'available',latency_ms:252,ip:'192.0.2.1',country:'JP',http_status:200,error:null};return structuredClone(state.connectivity);}
+  if(command==='install_traffic_service'){state.traffic_service={state:'stopped',version:'0.1.0',error:null};return structuredClone(state.traffic_service);}
+  if(command==='uninstall_traffic_service'){state.traffic_service={state:'not_installed',version:null,error:null};state.traffic_enabled=false;state.traffic=emptyTraffic();return structuredClone(state.traffic_service);}
+  if(command==='enable_traffic'){if(state.traffic_service.state==='not_installed')throw Error('QA 模拟：请先安装辅助服务。');state.traffic_enabled=true;state.traffic_service.state='running';state.traffic={state:'collecting',timestamp_ms:Date.now(),received_bytes:4096,sent_bytes:1024,receive_bps:512,send_bps:128,target_count:2,lost_events:0,lost_buffers:0,message:'QA 模拟，不启动真实采集器或 UAC。'};return structuredClone(state.traffic);}
+  if(command==='disable_traffic'){state.traffic_enabled=false;state.traffic={state:'disabled',timestamp_ms:Date.now(),received_bytes:null,sent_bytes:null,receive_bps:null,send_bps:null,target_count:0,lost_events:null,lost_buffers:null,message:null};return structuredClone(state.traffic);}
   if (command === 'check_updates') {state.update={checking:false,checked_at:Date.now(),status:'available',latest:'0.2.0',notes:'QA 模拟发布说明。',error:null};return { status: 'available', current: '0.1.0', latest: '0.2.0', url: 'https://github.com/OrangeZh1/CodexProxyTray/releases', notes: 'QA 模拟发布说明。' };}
   if (command === 'get_status' || command === 'refresh_status') return structuredClone(state);
   if (command === 'set_enabled') { state.enabled = !!args.enabled; state.guard_ready = state.enabled; }
   if (command === 'save_proxy') { state.proxy_url = String(args.proxyUrl); state.restart_required = state.codex_running; }
-  if (command === 'save_system') {for(const [input,field] of Object.entries({autostart:'autostart',launchTarget:'launch_target',cliWorkdir:'cli_workdir',networkEnabled:'network_enabled',autoCheckUpdates:'auto_check_updates',updateIntervalHours:'update_interval_hours'})){if(args[input]!==undefined&&args[input]!==null)state[field]=args[input];}}
+  if (command === 'save_system') {for(const [input,field] of Object.entries({autostart:'autostart',launchTarget:'launch_target',cliWorkdir:'cli_workdir',networkEnabled:'network_enabled',connectivityEnabled:'connectivity_enabled',autoCheckUpdates:'auto_check_updates',updateIntervalHours:'update_interval_hours'})){if(args[input]!==undefined&&args[input]!==null)state[field]=args[input];}}
   if (command === 'launch_codex') state.codex_running = true;
   state.revision = ++revision;
   state.logs.push({ at: Date.now(), level: 'info', message: `QA 模拟：${command}` });

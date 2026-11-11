@@ -35,9 +35,10 @@ test('fast actions update data immediately and retain only their own visible ani
 });
 
 test('independent preference replies preserve another pending switch',()=>{
-  const desired={autostart:true,launchTarget:'cli',cliWorkdir:'',networkEnabled:false,autoCheckUpdates:true,updateIntervalHours:12};
+  const desired={autostart:true,launchTarget:'cli',cliWorkdir:'',networkEnabled:false,connectivityEnabled:true,autoCheckUpdates:true,updateIntervalHours:12};
   const incoming={autostart:false,launch_target:'cli',network_enabled:false,auto_check_updates:true,update_interval_hours:12};
   assert.deepEqual(systemPreferences(desired,incoming,new Set(['autostart'])),desired);
   assert.deepEqual(systemPreferences(desired,incoming,new Set()),{...desired,autostart:false});
   assert.equal(systemPreferences(desired,{...incoming,network_enabled:true},new Set(['networkEnabled'])).networkEnabled,false);
+  assert.equal(systemPreferences(desired,{...incoming,connectivity_enabled:false},new Set(['connectivityEnabled'])).connectivityEnabled,true);
 });

@@ -24,6 +24,20 @@
 
 这套隔离检查不覆盖交互式 Ctrl+C、真实 Codex 登录或网络、ChatGPT 应用包启动/退出/升级、窗口和托盘 UI、实际登录自启。它不能代替下述真实本机验收。
 
+## GitHub Actions 辅助服务检查
+
+Windows job 还显式执行一个默认忽略的 ETW 回环检查：在隔离 runner 创建自有实时会话，先验证空目标列表不计入测试进程的回环活动，再绑定该进程身份，发送固定本机 TCP 数据并验证实际事件与字节增长，最后确认会话停止。它不访问外网或真实 ChatGPT；不能用纯解析单元测试替代这项结果。
+
+`Test-TrafficService.ps1` 仅在明确已提权、没有同名服务和专属目录的隔离 Windows runner 上，使用指定的本轮 GUI 产物测试安装入口、SCM 配置、受保护文件的哈希与权限、真实 ServiceMain 启停、同构建重复安装和卸载。它不在用户电脑自动安装，不使用桌面自动化或真实账号，也不启动目标应用的流量采集。
+
+```powershell
+./tests/Test-TrafficService.ps1 -BinaryPath "<本轮便携目录>/CodexProxyTray.exe" -EvidenceDirectory "$env:RUNNER_TEMP/CodexProxyTray-service-evidence"
+```
+
+安装器的显式命令行入口要求当前进程已提权，并且 `--owner-sid` 与当前令牌一致，不自行弹 UAC；界面安装或卸载入口才调用 Windows 授权。证据只记录检查结果、状态和程序哈希，不导出 SID、完整环境或凭据。已有同名对象、未知文件或归属不匹配会使检查停止并保留现场，不能为取得通过而清理。
+
+该检查不等于用户电脑已安装服务，也不能证明真实 ChatGPT / CLI 的实时 ETW 流量数值准确。实际采集、Windows 授权取消以及进程按路由访问外部服务仍分别报告验证范围。
+
 ## 已有基线的验收
 
 每次选择新的空证据目录，保留之前的失败与日志：

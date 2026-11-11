@@ -13,9 +13,12 @@ const LOG_LIMIT:usize=200;
     pub error:Option<String>,pub logs:Vec<Log>,pub helper_pid:u32,pub updated_at:u64,pub started_at:u64,
     pub proxy_latency_ms:Option<f64>,pub probe_history:Vec<Probe>,pub desktop_pid:Option<u32>,pub tcp_connections:Option<usize>,pub helper_memory_bytes:Option<u64>,pub log_storage_error:Option<String>,
     pub launch_target:LaunchTarget,pub cli_workdir:String,pub network_enabled:bool,pub auto_check_updates:bool,pub update_interval_hours:u32,pub update:crate::update::UpdateState,
+    pub guard_uptime_ms:u64,pub connectivity_enabled:bool,pub connectivity:crate::connectivity::Connectivity,
+    pub traffic:crate::traffic::TrafficSnapshot,
+    pub traffic_enabled:bool,pub traffic_service:crate::traffic_service::ServiceSnapshot,
 }
 impl Status {
-    fn new()->Self {Self{revision:0,enabled:true,guard_ready:false,proxy_url:core::DEFAULT_PROXY.into(),proxy_reachable:false,package_count:0,package_version:None,codex_running:false,restart_required:false,cli_detected:false,cli_ready:false,autostart:platform::autostart(),launch_desktop:false,backend_ready:true,error:None,logs:vec![],helper_pid:std::process::id(),updated_at:settings::now(),started_at:settings::now(),proxy_latency_ms:None,probe_history:vec![],desktop_pid:None,tcp_connections:None,helper_memory_bytes:None,log_storage_error:None,launch_target:LaunchTarget::None,cli_workdir:String::new(),network_enabled:true,auto_check_updates:false,update_interval_hours:6,update:crate::update::snapshot()}}
+    fn new()->Self {Self{revision:0,enabled:true,guard_ready:false,proxy_url:core::DEFAULT_PROXY.into(),proxy_reachable:false,package_count:0,package_version:None,codex_running:false,restart_required:false,cli_detected:false,cli_ready:false,autostart:platform::autostart(),launch_desktop:false,backend_ready:true,error:None,logs:vec![],helper_pid:std::process::id(),updated_at:settings::now(),started_at:settings::now(),proxy_latency_ms:None,probe_history:vec![],desktop_pid:None,tcp_connections:None,helper_memory_bytes:None,log_storage_error:None,launch_target:LaunchTarget::None,cli_workdir:String::new(),network_enabled:true,auto_check_updates:false,update_interval_hours:6,update:crate::update::snapshot(),guard_uptime_ms:0,connectivity_enabled:true,connectivity:crate::connectivity::snapshot(),traffic:crate::traffic::TrafficSnapshot::disabled(),traffic_enabled:false,traffic_service:crate::traffic_service::snapshot()}}
     fn log(&mut self,level:&str,category:&str,message:impl Into<String>,details:impl Into<String>) {
         let at=settings::now();let id=self.logs.last().map_or(at,|last|last.id.saturating_add(1).max(at));
         self.logs.push(Log{id,at,level:level.into(),category:category.into(),message:message.into(),details:details.into()});
@@ -23,12 +26,12 @@ impl Status {
     }
 }
 type Reply=Sender<Result<Status,String>>;
-#[derive(Default)]pub struct Preferences {pub autostart:Option<bool>,pub launch_target:Option<LaunchTarget>,pub cli_workdir:Option<String>,pub network_enabled:Option<bool>,pub auto_check_updates:Option<bool>,pub update_interval_hours:Option<u32>}
-pub enum Message {Enabled(bool,Option<Reply>),Proxy(String,Reply),System(Preferences,Reply),Refresh(Reply),Launch(Reply),LaunchCli(Reply),Stop}
-pub struct Controller {pub status:Arc<Mutex<Status>>,pub tx:Sender<Message>,worker:Mutex<Option<JoinHandle<()>>>}
+#[derive(Default)]pub struct Preferences {pub autostart:Option<bool>,pub launch_target:Option<LaunchTarget>,pub cli_workdir:Option<String>,pub network_enabled:Option<bool>,pub auto_check_updates:Option<bool>,pub update_interval_hours:Option<u32>,pub connectivity_enabled:Option<bool>}
+pub enum Message {Enabled(bool,Option<Reply>),TrafficEnabled(bool,Reply),ServicePause(Reply),ServiceFinished(bool,Reply),Notice(String,String,String,String),Proxy(String,Reply),System(Preferences,Reply),Refresh(Reply),Launch(Reply),LaunchCli(Reply),Stop}
+pub struct Controller {pub status:Arc<Mutex<Status>>,pub tx:Sender<Message>,pub traffic:Arc<Mutex<crate::traffic::Coordinator>>,worker:Mutex<Option<JoinHandle<()>>>}
 impl Controller {
     pub fn new(notify:impl Fn(&Status)+Send+'static)->Self {
-        let(tx,rx)=mpsc::channel();let status=Arc::new(Mutex::new(Status::new()));let shared=status.clone();
+        let(tx,rx)=mpsc::channel();let status=Arc::new(Mutex::new(Status::new()));let shared=status.clone();let traffic=Arc::new(Mutex::new(crate::traffic::Coordinator::new()));let sampler=traffic.clone();
         let worker=thread::spawn(move|| {
             let root=settings::root();let _=fs::create_dir_all(&root);
             let (mut config,mut config_error)=match settings::load(&root) {Ok(c)=>(c,None),Err(e)=>(Config::default(),Some(format!("配置读取失败：{e}")))};
@@ -39,14 +42,18 @@ impl Controller {
             if let Some(error)=&config_error {status.enabled=false;status.error=Some(error.clone());}
             let exe=std::env::current_exe().expect("executable path");
             let debug=native::DebugSettings::new();let event=platform::GuardEvent::new(&settings::event_name(&root));
-            let mut held=BTreeSet::<String>::new();let mut applied_url=String::new();let mut enabled_at=settings::now();
+            let mut held=BTreeSet::<String>::new();let mut applied_url=String::new();let mut enabled_at=settings::now();let mut guard_started=Instant::now();
             status.log("info","生命周期","守护进程已启动",format!("版本 {} · PID {}\n程序：{}\n配置：{}",env!("CARGO_PKG_VERSION"),status.helper_pid,exe.display(),root.display()));
             status.log("info","配置","已读取启动配置",format!("代理：{}\n登录自动启动：{} · 启动目标：{}",config.proxy_url,yes(status.autostart),target_name(config.launch_target)));
-            let mut cli_error=None;let mut first=true;let mut auto_desktop_pending=config.launch_target.opens_desktop()&&config_error.is_none();let mut auto_cli_pending=config.launch_target.opens_cli()&&config_error.is_none();let mut cli_checked=Instant::now();let mut update_seen=status.update.checked_at;
+            let mut cli_error=None;let mut first=true;let mut auto_desktop_pending=config.launch_target.opens_desktop()&&config_error.is_none();let mut auto_cli_pending=config.launch_target.opens_cli()&&config_error.is_none();let mut cli_checked=Instant::now();let mut update_seen=status.update.checked_at;let mut traffic_applied=false;let mut service_paused=false;
             loop {
-                let(mut pending,mut result,mut stopping,mut guard_action,mut manual)=(None,Ok(()),false,false,None);
+                let(mut pending,mut result,mut stopping,mut guard_action,mut manual)=(None,Ok(()),false,false,None);let mut traffic_requested=false;
                 if !first {match rx.recv_timeout(Duration::from_secs(2)) {
-                    Ok(Message::Enabled(enabled,reply))=>{pending=reply;if enabled&&config_error.is_some(){result=Err("请先保存有效的代理设置。".into());}else{guard_action=true;if enabled&&!status.enabled {enabled_at=settings::now();}status.enabled=enabled;status.log("info","守护",if enabled{"已启用代理守护"}else{"已暂停代理守护"},"作用于 ChatGPT 与 Windows Codex CLI；已运行进程保留启动时的环境。");}},
+                    Ok(Message::Enabled(enabled,reply))=>{pending=reply;if enabled&&config_error.is_some(){result=Err("请先保存有效的代理设置。".into());}else{guard_action=true;if enabled&&!status.enabled {enabled_at=settings::now();guard_started=Instant::now();status.guard_uptime_ms=0;}if status.enabled&&!enabled {status.guard_uptime_ms=guard_started.elapsed().as_millis()as u64;}status.enabled=enabled;status.log("info","守护",if enabled{"已启用代理守护"}else{"已暂停代理守护"},"作用于 ChatGPT 与 Windows Codex CLI；已运行进程保留启动时的环境。");}},
+                    Ok(Message::TrafficEnabled(enabled,reply))=>{pending=Some(reply);if config_error.is_some(){result=Err("配置无法读取，请先修复配置。".into());}else{let mut next=config.clone();next.traffic_enabled=enabled;match settings::save(&root,&next){Ok(())=>{config=next;traffic_requested=true;},Err(error)=>result=Err(error)}}},
+                    Ok(Message::ServicePause(reply))=>{pending=Some(reply);service_paused=true;traffic_requested=true;},
+                    Ok(Message::ServiceFinished(uninstalled,reply))=>{pending=Some(reply);service_paused=false;traffic_requested=true;if uninstalled{config.traffic_enabled=false;if config_error.is_none(){if let Err(error)=settings::save(&root,&config){status.log("warning","配置","辅助服务已卸载，但统计偏好未能保存",error);}}else{status.log("warning","配置","辅助服务已卸载，原配置文件已保留","配置原本无法读取，未覆盖它；本次运行已停止统计。");}}},
+                    Ok(Message::Notice(level,category,message,details))=>status.log(&level,&category,message,details),
                     Ok(Message::Proxy(url,reply))=>{pending=Some(reply);match core::endpoint(&url) {Err(e)=>result=Err(e),Ok(endpoint)=>{let mut next=config.clone();next.proxy_url=endpoint.url;match settings::save(&root,&next) {Err(e)=>result=Err(e),Ok(())=>{if config.proxy_url!=next.proxy_url {enabled_at=settings::now();}config=next;config_error=None;guard_action=true;status.log("info","代理","代理配置已保存",format!("地址：{}\n后续启动的目标进程使用新配置。",config.proxy_url));}}}}},
                     Ok(Message::System(patch,reply))=>{pending=Some(reply);if config_error.is_some(){result=Err("请先保存有效的代理设置。".into());}else{result=apply_preferences(&root,&exe,&mut config,&patch);if result.is_ok(){status.log("info","设置","偏好设置已保存",format!("登录自动启动：{}\n启动目标：{}\n更新联网：{} · 自动检查：{} · 间隔：{} 小时\nCLI 目录：{}",yes(platform::autostart()),target_name(config.launch_target),yes(config.network_enabled),yes(config.auto_check_updates),config.update_interval_hours,if config.cli_workdir.is_empty(){"用户目录"}else{&config.cli_workdir}));}}},
                     Ok(Message::Refresh(reply))=>{pending=Some(reply);manual=Some(Instant::now());status.log("info","检测","开始手动检测","检测本地代理、ChatGPT 安装包及进程、Windows Codex CLI 入口。");if config_error.is_none(){match install_cli(&root,&exe,&mut config){Ok(ready)=>{status.cli_ready=ready;cli_error=None;},Err(e)=>{status.cli_ready=false;cli_error=Some(format!("CLI 接入失败：{e}"));result=Err(e);}}}else{result=Err("配置无法读取，请先保存有效的代理设置。".into());}status.cli_detected=!settings::detect_cli(&root).is_empty();},
@@ -56,6 +63,7 @@ impl Controller {
                     Err(mpsc::RecvTimeoutError::Timeout)=>{},
                 }}
                 if stopping {
+                    if let Ok(mut sampler)=sampler.lock(){if let Err(error)=sampler.disable(){status.log("warning","流量","流量采样仍在收尾",error);}status.traffic=sampler.snapshot();}
                     if let Ok(e)=&event {e.set(false);}
                     if let Ok(d)=&debug {for package in &held {if let Err(error)=d.disable(package){status.log("error","守护","释放应用包设置失败",format!("{package}\n{error}"));}}}
                     drop(debug);drop(event);status.enabled=false;status.guard_ready=false;status.backend_ready=false;
@@ -63,6 +71,7 @@ impl Controller {
                     publish(&root,&shared,&mut status,&mut persisted,history_writable,&notify);break;
                 }
                 status.proxy_url=config.proxy_url.clone();status.launch_desktop=config.launch_target.opens_desktop();status.autostart=platform::autostart();status.launch_target=config.launch_target;status.cli_workdir=config.cli_workdir.clone();status.network_enabled=config.network_enabled;status.auto_check_updates=config.auto_check_updates;status.update_interval_hours=config.update_interval_hours;
+                status.connectivity_enabled=config.connectivity_enabled;if status.enabled {status.guard_uptime_ms=guard_started.elapsed().as_millis()as u64;}
                 let check_at=Instant::now();
                 let connection=core::endpoint(&config.proxy_url).ok().is_some_and(|endpoint|TcpStream::connect_timeout(&endpoint.socket,Duration::from_millis(400)).is_ok());
                 status.proxy_latency_ms=if connection {Some(check_at.elapsed().as_secs_f64()*1000.0)}else{None};
@@ -95,12 +104,24 @@ impl Controller {
                 if first||pid!=status.desktop_pid {status.log("info","ChatGPT",if pid.is_some(){"ChatGPT 正在运行"}else{"ChatGPT 当前未运行"},pid.map_or("等待应用启动；守护将持续生效。".into(),|pid|format!("主进程 PID：{pid}\n进程树数量：{}",desktop.as_ref().unwrap().pids.len())));}
                 status.desktop_pid=pid;status.codex_running=desktop.is_some();status.restart_required=status.guard_ready&&desktop.as_ref().is_some_and(|d|d.started_at<enabled_at);
                 status.tcp_connections=native::tcp_connections(desktop.as_ref().map_or(&[],|d|d.pids.as_slice()));status.helper_memory_bytes=native::memory_bytes();
+                if let Ok(mut sampler)=sampler.lock(){
+                    let mut targets_valid=true;
+                    let desired_traffic=config.traffic_enabled&&config_error.is_none()&&!service_paused;
+                    if desired_traffic{match native::traffic_targets(&root,&config){Ok(targets)=>{if let Err(error)=sampler.set_targets(targets){targets_valid=false;sampler.fail_targets(error);}},Err(error)=>{targets_valid=false;sampler.fail_targets(format!("无法验证本轮目标进程：{error}"));}}}
+                    if traffic_requested||desired_traffic!=traffic_applied{
+                        if desired_traffic&&!targets_valid{result=Err("无法验证目标进程，未开始新的流量采样。".into());}
+                        else{let action=if desired_traffic{sampler.enable(crate::traffic::EnableMode::Normal)}else{sampler.disable()};traffic_applied=desired_traffic;if let Err(error)=action{result=Err(error)}}
+                    }
+                    let next=sampler.snapshot();if next.state!=status.traffic.state{status.log(if next.state==crate::traffic::TrafficState::Unavailable{"warning"}else{"info"},"流量","流量采集状态已变化",format!("状态：{:?}\n{}",next.state,next.message.as_deref().unwrap_or("仅统计已验证的目标进程字节。")));}status.traffic=next;
+                }
+                status.traffic_enabled=config.traffic_enabled;status.traffic_service=crate::traffic_service::snapshot();
                 if status.error!=error {if let Some(e)=&error {status.log("error","守护","守护状态需要检查",e.clone());}else if status.error.is_some(){status.log("info","守护","守护状态已恢复","本轮检测未再出现此前错误。");}status.error=error;}
                 if !config.launch_target.opens_desktop() {auto_desktop_pending=false;}
                 if !config.launch_target.opens_cli() {auto_cli_pending=false;}
                 if auto_desktop_pending&&status.guard_ready {match native::open_desktop(){Ok(())=>status.log("info","ChatGPT","已按启动偏好请求打开 ChatGPT",format!("应用包：{}",core::FAMILY)),Err(e)=>status.log("error","ChatGPT","打开 ChatGPT 失败",e)}auto_desktop_pending=false;}
                 if auto_cli_pending&&status.cli_ready {match crate::launch::open_cli(&root,&config){Ok(())=>status.log("info","CLI","已按启动偏好请求打开 Codex CLI",format!("工作目录：{}",settings::cli_directory(&config).map(|p|p.display().to_string()).unwrap_or_default())),Err(e)=>status.log("error","CLI","打开 Codex CLI 失败",e)}auto_cli_pending=false;}
                 crate::update::maybe_automatic(&config);status.update=crate::update::snapshot();
+                crate::connectivity::maybe_automatic(&config);status.connectivity=crate::connectivity::snapshot();
                 if status.update.checked_at!=update_seen {update_seen=status.update.checked_at;let update=status.update.clone();status.log(if update.error.is_some(){"warning"}else{"info"},"更新","更新检查已完成",update.error.unwrap_or_else(||match update.status.as_str(){"available"=>format!("发现新版本 {}",update.latest.unwrap_or_default()),"current"=>"当前已是最新版本。".into(),"unpublished"=>"尚未发布 CodexProxyTray 正式安装包。".into(),_=>"本次检查未产生可用发布信息。".into()}));}
                 if let Some(started)=manual {status.log(if result.is_ok()&&status.error.is_none(){"info"}else{"warning"},"检测","手动检测完成",format!("耗时：{} ms\n代理端口：{} · ChatGPT 包：{} · CLI 入口：{}\nChatGPT PID：{}",started.elapsed().as_millis(),if status.proxy_reachable{"可用"}else{"不可用"},status.package_count,if status.cli_ready{"已接入"}else{"未接入"},pid.map_or("未运行".into(),|p|p.to_string())));}
                 if guard_action&&result.is_ok(){if let Some(error)=&status.error {result=Err(format!("设置已处理，但守护需要检查：{error}"));}}
@@ -114,16 +135,16 @@ impl Controller {
                 }
                 first=false;
             }
-        });Self{status,tx,worker:Mutex::new(Some(worker))}
+        });Self{status,tx,traffic,worker:Mutex::new(Some(worker))}
     }
-    pub fn snapshot(&self)->Status {let finished=self.worker.lock().unwrap_or_else(|e|e.into_inner()).as_ref().is_some_and(JoinHandle::is_finished);let mut status=self.status.lock().unwrap_or_else(|e|e.into_inner()).clone();status.update=crate::update::snapshot();if finished&&status.backend_ready {status.backend_ready=false;status.enabled=false;status.guard_ready=false;status.error=Some("守护后台已退出，请重新打开助手。".into());}status}
+    pub fn snapshot(&self)->Status {let finished=self.worker.lock().unwrap_or_else(|e|e.into_inner()).as_ref().is_some_and(JoinHandle::is_finished);let mut status=self.status.lock().unwrap_or_else(|e|e.into_inner()).clone();status.update=crate::update::snapshot();status.connectivity=crate::connectivity::snapshot();status.traffic_service=crate::traffic_service::snapshot();if let Ok(traffic)=self.traffic.lock(){status.traffic=traffic.snapshot();}if finished&&status.backend_ready {status.backend_ready=false;status.enabled=false;status.guard_ready=false;status.error=Some("守护后台已退出，请重新打开助手。".into());}status}
     pub fn stop(&self){let _=self.tx.send(Message::Stop);if let Some(worker)=self.worker.lock().unwrap_or_else(|e|e.into_inner()).take(){let _=worker.join();}}
 }
 impl Drop for Controller {fn drop(&mut self){self.stop();}}
 fn yes(value:bool)->&'static str {if value{"开启"}else{"关闭"}}
 fn target_name(target:LaunchTarget)->&'static str {match target{LaunchTarget::None=>"不打开",LaunchTarget::Chatgpt=>"ChatGPT",LaunchTarget::Cli=>"Codex CLI",LaunchTarget::Both=>"ChatGPT 与 Codex CLI"}}
 fn apply_preferences(root:&Path,exe:&Path,config:&mut Config,patch:&Preferences)->Result<(),String>{
-    let mut next=config.clone();if let Some(target)=patch.launch_target{next.launch_target=target;}if let Some(directory)=&patch.cli_workdir{settings::validate_cli_workdir(directory)?;next.cli_workdir=directory.trim().into();}if let Some(enabled)=patch.network_enabled{next.network_enabled=enabled;}if let Some(automatic)=patch.auto_check_updates{next.auto_check_updates=automatic;}if let Some(hours)=patch.update_interval_hours{settings::validate_update_interval(hours)?;next.update_interval_hours=hours;}
+    let mut next=config.clone();if let Some(target)=patch.launch_target{next.launch_target=target;}if let Some(directory)=&patch.cli_workdir{settings::validate_cli_workdir(directory)?;next.cli_workdir=directory.trim().into();}if let Some(enabled)=patch.network_enabled{next.network_enabled=enabled;}if let Some(automatic)=patch.auto_check_updates{next.auto_check_updates=automatic;}if let Some(hours)=patch.update_interval_hours{settings::validate_update_interval(hours)?;next.update_interval_hours=hours;}if let Some(enabled)=patch.connectivity_enabled{next.connectivity_enabled=enabled;}
     let old=platform::autostart();if let Some(enabled)=patch.autostart{platform::set_autostart(enabled,exe)?;}
     if let Err(error)=settings::save(root,&next){if patch.autostart.is_some(){let _=platform::set_autostart(old,exe);}return Err(error)}*config=next;Ok(())
 }

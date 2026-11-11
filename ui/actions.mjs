@@ -23,6 +23,6 @@ export function acceptSnapshot(current, next) {
 }
 
 export function systemPreferences(current, snapshot, pending) {
-  const incoming={autostart:!!snapshot.autostart,launchTarget:snapshot.launch_target||(snapshot.launch_desktop?'chatgpt':'none'),cliWorkdir:snapshot.cli_workdir||'',networkEnabled:snapshot.network_enabled!==false,autoCheckUpdates:!!snapshot.auto_check_updates,updateIntervalHours:[1,3,6,12,24].includes(snapshot.update_interval_hours)?snapshot.update_interval_hours:6};
+  const incoming={autostart:!!snapshot.autostart,launchTarget:snapshot.launch_target||(snapshot.launch_desktop?'chatgpt':'none'),cliWorkdir:snapshot.cli_workdir||'',networkEnabled:snapshot.network_enabled!==false,connectivityEnabled:snapshot.connectivity_enabled!==false,autoCheckUpdates:!!snapshot.auto_check_updates,updateIntervalHours:[1,3,6,12,24].includes(snapshot.update_interval_hours)?snapshot.update_interval_hours:6};
   return Object.fromEntries(Object.entries(incoming).map(([key,value])=>[key,pending.has(key)?current[key]:value]));
 }

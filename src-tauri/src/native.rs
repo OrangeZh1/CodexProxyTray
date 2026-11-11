@@ -31,7 +31,9 @@ fn os_error() -> String { std::io::Error::last_os_error().to_string() }
     fn Process32FirstW(snapshot: Handle, entry: *mut ProcessEntry) -> i32;
     fn Process32NextW(snapshot: Handle, entry: *mut ProcessEntry) -> i32;
     fn GetProcessTimes(process: Handle, created: *mut u64, exited: *mut u64, kernel: *mut u64, user: *mut u64) -> i32;
+    fn QueryFullProcessImageNameW(process:Handle,flags:u32,name:*mut u16,length:*mut u32)->i32;
     fn GetCurrentProcess() -> Handle;
+    fn GetSystemTimeAsFileTime(time:*mut u64);
     fn GetModuleHandleW(name:*const u16) -> Handle;
 }
 #[link(name="user32")] extern "system" {
@@ -100,6 +102,36 @@ pub fn desktop_info() -> Option<DesktopInfo> { unsafe {
     roots.sort_unstable();let &(started_at,pid)=roots.first()?;let ids=roots.iter().map(|r|r.1).collect::<Vec<_>>();
     Some(DesktopInfo{pid,started_at,pids:crate::core::descendant_pids(&rows.iter().map(|r|(r.0,r.1)).collect::<Vec<_>>(),&ids)})
 } }
+/// Attribution is based on live process identity and exact installed paths. A
+/// similarly named codex.exe/node.exe is never enough to join the target set.
+pub fn traffic_targets(root:&std::path::Path,config:&crate::settings::Config)->Result<Vec<crate::traffic_core::ProcessIdentity>,String>{unsafe{
+    let mut snapshot_started=0;GetSystemTimeAsFileTime(&mut snapshot_started);
+    let snapshot=CreateToolhelp32Snapshot(2,0);if snapshot as isize == -1{return Err(os_error())}
+    let mut entry:ProcessEntry=std::mem::zeroed();entry.size=std::mem::size_of::<ProcessEntry>()as u32;let mut rows=vec![];
+    let mut more=Process32FirstW(snapshot,&mut entry);while more!=0{rows.push((entry.pid,entry.parent,string(&entry.exe)));more=Process32NextW(snapshot,&mut entry);}CloseHandle(snapshot);
+    let allowed=crate::settings::cli_process_paths(root,config);let mut identified=std::collections::BTreeMap::new();let mut selected=std::collections::BTreeSet::new();
+    for &(pid,_,ref name) in &rows{
+        if !name.eq_ignore_ascii_case("ChatGPT.exe")&&!name.eq_ignore_ascii_case("codex.exe"){continue}
+        if let Some((identity,image,desktop))=process_identity(pid){if desktop||allowed.iter().any(|path|path==&image){selected.insert(pid);}identified.insert(pid,identity);}
+    }
+    // Only follow a still-live verified parent, and reject reused parent PIDs by
+    // comparing creation times. Captured identities are revalidated by collector.
+    loop{let mut added=false;for &(pid,parent,_)in &rows{
+        if selected.contains(&pid)||!selected.contains(&parent){continue}
+        let Some(parent_identity)=identified.get(&parent)else{continue};let parent_created=parent_identity.created_filetime;
+        if let Some((identity,_,_))=process_identity(pid){if identity.created_filetime>=parent_created&&identity.created_filetime<=snapshot_started&&process_created(parent)==Some(parent_created){identified.insert(pid,identity);selected.insert(pid);added=true;}}
+    }if !added{break}}
+    let targets=selected.into_iter().filter_map(|pid|identified.remove(&pid)).collect::<Vec<_>>();crate::traffic_core::validate_targets(&targets)?;Ok(targets)
+}}
+unsafe fn process_identity(pid:u32)->Option<(crate::traffic_core::ProcessIdentity,String,bool)>{
+    let process=OpenProcess(0x1000,0,pid);if process.is_null(){return None}
+    let mut path=vec![0u16;32768];let mut length=path.len()as u32;let(mut created,mut exited,mut kernel,mut user)=(0,0,0,0);
+    let valid=QueryFullProcessImageNameW(process,0,path.as_mut_ptr(),&mut length)!=0&&GetProcessTimes(process,&mut created,&mut exited,&mut kernel,&mut user)!=0&&created!=0&&exited==0;
+    let desktop=valid&&family_matches(process);CloseHandle(process);if !valid{return None}
+    path.truncate(length as usize);let image=crate::settings::normalized_executable(&PathBuf::from(String::from_utf16_lossy(&path)));
+    Some((crate::traffic_core::ProcessIdentity{pid,created_filetime:created},image,desktop))
+}
+unsafe fn process_created(pid:u32)->Option<u64>{let process=OpenProcess(0x1000,0,pid);if process.is_null(){return None}let(mut created,mut exited,mut kernel,mut user)=(0,0,0,0);let valid=GetProcessTimes(process,&mut created,&mut exited,&mut kernel,&mut user)!=0&&exited==0;CloseHandle(process);valid.then_some(created)}
 pub fn memory_bytes()->Option<u64>{unsafe{let mut counters:MemoryCounters=std::mem::zeroed();let size=std::mem::size_of::<MemoryCounters>()as u32;counters.size=size;if GetProcessMemoryInfo(GetCurrentProcess(),&mut counters,size)!=0{Some(counters.working as u64)}else{None}}}
 pub fn tcp_connections(pids:&[u32])->Option<usize>{unsafe{
     if pids.is_empty(){return Some(0)}let mut total=0;

@@ -19,9 +19,11 @@ pub struct Config {
     pub network_enabled:bool,
     pub auto_check_updates:bool,
     pub update_interval_hours:u32,
+    pub connectivity_enabled:bool,
+    pub traffic_enabled:bool,
     pub cli_command:Vec<String>,
 }
-impl Default for Config {fn default()->Self{Self{proxy_url:DEFAULT_PROXY.into(),launch_target:LaunchTarget::None,cli_workdir:String::new(),network_enabled:true,auto_check_updates:false,update_interval_hours:6,cli_command:vec![]}}}
+impl Default for Config {fn default()->Self{Self{proxy_url:DEFAULT_PROXY.into(),launch_target:LaunchTarget::None,cli_workdir:String::new(),network_enabled:true,auto_check_updates:false,update_interval_hours:6,connectivity_enabled:true,traffic_enabled:false,cli_command:vec![]}}}
 
 // Missing launch_target is a legacy config; an explicit null/unknown value is invalid.
 fn launch_target_field<'de,D:Deserializer<'de>>(deserializer:D)->Result<Option<LaunchTarget>,D::Error>{LaunchTarget::deserialize(deserializer).map(Some)}
@@ -36,15 +38,17 @@ struct ConfigInput {
     network_enabled:bool,
     auto_check_updates:bool,
     update_interval_hours:u32,
+    connectivity_enabled:bool,
+    traffic_enabled:bool,
     cli_command:Vec<String>,
 }
-impl Default for ConfigInput {fn default()->Self{let config=Config::default();Self{proxy_url:config.proxy_url,launch_target:None,launch_desktop:false,cli_workdir:config.cli_workdir,network_enabled:config.network_enabled,auto_check_updates:config.auto_check_updates,update_interval_hours:config.update_interval_hours,cli_command:config.cli_command}}}
+impl Default for ConfigInput {fn default()->Self{let config=Config::default();Self{proxy_url:config.proxy_url,launch_target:None,launch_desktop:false,cli_workdir:config.cli_workdir,network_enabled:config.network_enabled,auto_check_updates:config.auto_check_updates,update_interval_hours:config.update_interval_hours,connectivity_enabled:config.connectivity_enabled,traffic_enabled:config.traffic_enabled,cli_command:config.cli_command}}}
 impl TryFrom<ConfigInput> for Config {
     type Error=String;
     fn try_from(input:ConfigInput)->Result<Self,String>{
         validate_update_interval(input.update_interval_hours)?;
         cli_workdir_path(&input.cli_workdir)?;
-        Ok(Self{proxy_url:endpoint(&input.proxy_url)?.url,launch_target:input.launch_target.unwrap_or(if input.launch_desktop{LaunchTarget::Chatgpt}else{LaunchTarget::None}),cli_workdir:input.cli_workdir.trim().into(),network_enabled:input.network_enabled,auto_check_updates:input.auto_check_updates,update_interval_hours:input.update_interval_hours,cli_command:input.cli_command})
+        Ok(Self{proxy_url:endpoint(&input.proxy_url)?.url,launch_target:input.launch_target.unwrap_or(if input.launch_desktop{LaunchTarget::Chatgpt}else{LaunchTarget::None}),cli_workdir:input.cli_workdir.trim().into(),network_enabled:input.network_enabled,auto_check_updates:input.auto_check_updates,update_interval_hours:input.update_interval_hours,connectivity_enabled:input.connectivity_enabled,traffic_enabled:input.traffic_enabled,cli_command:input.cli_command})
     }
 }
 pub fn validate_update_interval(hours:u32)->Result<(),String>{if matches!(hours,1|3|6|12|24){Ok(())}else{Err("自动检查间隔只能为 1、3、6、12 或 24 小时。".into())}}
@@ -89,6 +93,27 @@ pub fn command_available(command:&[String],root:&Path)->bool{
     }
     true
 }
+pub fn normalized_executable(path:&Path)->String{path.canonicalize().unwrap_or_else(|_|path.to_path_buf()).to_string_lossy().replace('/',"\\").trim_start_matches("\\\\?\\").to_lowercase()}
+pub fn cli_process_paths(root:&Path,config:&Config)->Vec<String>{
+    let mut paths=vec![root.join("cli/codex.exe")];
+    if let Some(program)=config.cli_command.first().map(PathBuf::from){
+        if program.file_name().is_some_and(|name|name.to_string_lossy().eq_ignore_ascii_case("codex.exe")){paths.push(program);}
+        else if program.file_name().is_some_and(|name|name.to_string_lossy().eq_ignore_ascii_case("node.exe")){
+            // A verified npm entry identifies its package; node.exe itself is
+            // deliberately excluded because unrelated programs share it.
+            if let Some(script)=config.cli_command.get(1).map(PathBuf::from).filter(|p|p.is_file()&&p.file_name().is_some_and(|n|n=="codex.js")){
+                if let Some(package)=script.parent().and_then(Path::parent){
+                    for(variant,triple)in[("codex-win32-x64","x86_64-pc-windows-msvc"),("codex-win32-arm64","aarch64-pc-windows-msvc")]{
+                        paths.push(package.join("vendor").join(triple).join("bin/codex.exe"));
+                        paths.push(package.join("node_modules/@openai").join(variant).join("vendor").join(triple).join("bin/codex.exe"));
+                        if let Some(scope)=package.parent(){paths.push(scope.join(variant).join("vendor").join(triple).join("bin/codex.exe"));}
+                    }
+                }
+            }
+        }
+    }
+    let mut result=paths.into_iter().filter(|path|path.is_file()).map(|path|normalized_executable(&path)).collect::<Vec<_>>();result.sort();result.dedup();result
+}
 pub fn detect_cli(root:&Path)->Vec<String>{
     let npm=PathBuf::from(std::env::var_os("APPDATA").unwrap_or_default()).join("npm/node_modules/@openai/codex/bin/codex.js");
     let paths=std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).collect::<Vec<_>>();
@@ -111,11 +136,23 @@ mod tests {
         let old:Config=serde_json::from_str(r#"{"launch_desktop":true,"proxy_url":"http://localhost:17890/","cli_command":["node.exe","codex.js"]}"#).unwrap();
         assert_eq!(old.launch_target,LaunchTarget::Chatgpt);assert_eq!(old.proxy_url,"http://localhost:17890");assert_eq!(old.cli_command,vec!["node.exe","codex.js"]);
         assert!(old.network_enabled);assert!(!old.auto_check_updates);assert_eq!(old.update_interval_hours,6);
+        assert!(old.connectivity_enabled);
+        assert!(!old.traffic_enabled);
         let encoded=serde_json::to_value(&old).unwrap();assert!(encoded.get("launch_desktop").is_none());assert_eq!(encoded["launch_target"],"chatgpt");
         let explicit:Config=serde_json::from_str(r#"{"launch_target":"none","launch_desktop":true}"#).unwrap();assert_eq!(explicit.launch_target,LaunchTarget::None);
         for (target,desktop,cli) in [(LaunchTarget::None,false,false),(LaunchTarget::Chatgpt,true,false),(LaunchTarget::Cli,false,true),(LaunchTarget::Both,true,true)]{assert_eq!(target.opens_desktop(),desktop);assert_eq!(target.opens_cli(),cli);}
         for invalid in [r#"{"launch_target":null}"#,r#"{"launch_target":"unknown"}"#,r#"{"launch_desktop":null}"#,r#"{"update_interval_hours":2}"#,r#"{"unknown":true}"#]{assert!(serde_json::from_str::<Config>(invalid).is_err(),"{invalid}");}
         for hours in [1,3,6,12,24]{assert!(validate_update_interval(hours).is_ok());}
+    }
+    #[test]
+    fn traffic_paths_identify_installed_cli_without_claiming_shared_node_or_names(){
+        let suffix=SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();let root=std::env::temp_dir().join(format!("codex-proxy-paths-{}-{suffix}",std::process::id()));
+        let package=root.join("npm/node_modules/@openai/codex");let script=package.join("bin/codex.js");let binary=package.join("node_modules/@openai/codex-win32-x64/vendor/x86_64-pc-windows-msvc/bin/codex.exe");let shim=root.join("app/cli/codex.exe");let node=root.join("node.exe");let unrelated=root.join("other/codex.exe");
+        for path in [&script,&binary,&shim,&node,&unrelated]{fs::create_dir_all(path.parent().unwrap()).unwrap();fs::write(path,b"fixture").unwrap();}
+        let mut config=Config::default();config.cli_command=vec![node.display().to_string(),script.display().to_string()];let paths=cli_process_paths(&root.join("app"),&config);
+        assert_eq!(paths.len(),2);assert!(paths.contains(&normalized_executable(&binary)));assert!(paths.contains(&normalized_executable(&shim)));assert!(!paths.contains(&normalized_executable(&node)));assert!(!paths.contains(&normalized_executable(&unrelated)));
+        // Remove only this test's exact fresh temporary tree.
+        fs::remove_dir_all(&root).unwrap();
     }
     #[test]
     fn removed_workdir_does_not_block_unrelated_preferences_or_allow_invalid_writes(){
