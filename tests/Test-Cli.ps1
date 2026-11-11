@@ -174,6 +174,8 @@ namespace CodexProxyTray {public static class CliQaEventName {public static stri
     Run-Case 'inactive_proxy_info' {
         $result=Run-Process $cliBinary @('--proxy-info') $passThrough
         Assert-Condition ($result.exit_code -eq 0 -and $result.document.guard_active -eq $false -and $null -eq $result.document.proxy_url) 'Inactive proxy-info is incorrect.'
+        $report.lookup=$result.document.lookup
+        if(@($result.document.target).Count -ne 2){throw ('The isolated lookup did not resolve Node/mock: '+($result.document.lookup|ConvertTo-Json -Depth 5 -Compress))}
         Assert-Target $result.document.target
     }
     Run-Case 'inactive_passthrough_arguments_and_exit' {$argsForMock=$complex+@('--mock-exit=19');$document=Run-Mock $argsForMock $passThrough 19;Assert-ProxyValues $document.proxy $passThrough}

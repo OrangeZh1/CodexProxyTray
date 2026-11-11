@@ -96,6 +96,12 @@ pub fn detect_cli(root:&Path)->Vec<String>{
     for path in paths{let exe=path.join("codex.exe");if exe.is_file()&&!owned_path(&exe,root){return vec![exe.to_string_lossy().into()]}}
     vec![]
 }
+pub fn cli_lookup_info(root:&Path)->serde_json::Value {
+    let appdata=PathBuf::from(std::env::var_os("APPDATA").unwrap_or_default());
+    let script=appdata.join("npm/node_modules/@openai/codex/bin/codex.js");
+    let paths=std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).collect::<Vec<_>>();
+    serde_json::json!({"config_root":root,"config_exists":root.join("config.json").is_file(),"npm_script":script,"npm_script_exists":script.is_file(),"node_candidates":paths.iter().take(12).map(|p|{let node=p.join("node.exe");serde_json::json!({"path":node,"exists":node.is_file()})}).collect::<Vec<_>>()})
+}
 
 #[cfg(test)]
 mod tests {
