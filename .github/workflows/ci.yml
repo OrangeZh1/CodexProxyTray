@@ -127,6 +127,17 @@ jobs:
       - name: 隔离验证辅助服务安装与卸载
         shell: pwsh
         run: ./tests/Test-TrafficService.ps1 -BinaryPath "${{ github.workspace }}/package/CodexProxyTray.exe" -EvidenceDirectory "$env:RUNNER_TEMP/CodexProxyTray-service-evidence"
+      - name: 真实主窗口与托盘前端启动检查
+        shell: pwsh
+        run: ./tests/Test-DesktopStartup.ps1 -BinaryPath "${{ github.workspace }}/package/CodexProxyTray.exe" -EvidenceDirectory "$env:RUNNER_TEMP/CodexProxyTray-desktop-evidence"
+      - name: 保存真实前端启动证据
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: desktop-startup-evidence
+          path: ${{ runner.temp }}/CodexProxyTray-desktop-evidence/
+          if-no-files-found: ignore
+          retention-days: 7
       - name: 保存辅助服务验收证据
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

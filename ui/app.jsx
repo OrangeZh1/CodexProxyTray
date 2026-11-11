@@ -125,7 +125,7 @@ export function App({initialStatus=null,initialPage='dashboard',initialSettingsT
     media?.addEventListener('change',changed);
     const ready=async()=>{
       try{await syncNativeAppearance(currentThemeMode.current);}catch{failed();}
-      finally{if(appWindow&&invoke){try{const requested=await invoke('frontend_ready');if(!disposed)navigate(requested);}catch{if(!disposed)show('窗口初始化失败，请重新打开助手。','warning');}}}
+      finally{if(appWindow&&invoke){try{const requested=await invoke('frontend_ready',{rendered:document.getElementById('root')?.childElementCount>0});if(!disposed)navigate(requested);}catch{if(!disposed)show('窗口初始化失败，请重新打开助手。','warning');}}}
     };
     ready();
     return()=>{disposed=true;media?.removeEventListener('change',changed);};
@@ -229,7 +229,7 @@ export function TrayApp({initialStatus=null}={}){
     let disposed=false;mounted.current=true;let stop;
     const media=globalThis.matchMedia?.(systemThemeQuery),onMedia=event=>setSystemDark(event.matches),onStorage=()=>setMode(readThemeMode());
     media?.addEventListener('change',onMedia);globalThis.addEventListener?.('storage',onStorage);
-    const start=async()=>{try{await appWindow?.setTheme?.(mode==='system'?null:mode);if(appWindow?.onFocusChanged){const unlisten=await appWindow.onFocusChanged(({payload})=>{if(!disposed){setActive(payload);if(payload){setOnline(false);setNotice('');queueMicrotask(()=>menu.current?.querySelector('[role="menuitem"]')?.focus());}}});if(disposed)unlisten();else stop=unlisten;}await invoke?.('frontend_ready');}catch(error){if(!disposed)setNotice(errorText(error));}};
+    const start=async()=>{try{await appWindow?.setTheme?.(mode==='system'?null:mode);if(appWindow?.onFocusChanged){const unlisten=await appWindow.onFocusChanged(({payload})=>{if(!disposed){setActive(payload);if(payload){setOnline(false);setNotice('');queueMicrotask(()=>menu.current?.querySelector('[role="menuitem"]')?.focus());}}});if(disposed)unlisten();else stop=unlisten;}await invoke?.('frontend_ready',{rendered:document.getElementById('root')?.childElementCount>0});}catch(error){if(!disposed)setNotice(errorText(error));}};
     start();
     return()=>{disposed=true;mounted.current=false;stop?.();media?.removeEventListener('change',onMedia);globalThis.removeEventListener?.('storage',onStorage);};
   },[]);
