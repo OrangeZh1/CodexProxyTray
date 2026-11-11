@@ -1,0 +1,45 @@
+CodexProxyTray v0.1.0 · Windows x64
+
+用途
+为 ChatGPT 桌面端和 Windows Codex CLI 提供指定的本地 HTTP 代理环境，
+保留桌面应用包身份，并在托盘中持续守护。
+不修改 Windows 系统代理或全局代理环境变量。
+本项目为社区工具，与 OpenAI 无隶属关系，不提供代理节点。
+
+开始使用
+1. 完整解压发行 ZIP 到一个固定目录。
+   请保留 CodexProxyTray.exe、codex-proxy-cli.exe、WebView2Loader.dll、
+   LICENSE 和包内的校验、版本回执文件。
+2. 先启动本机代理客户端，确认 HTTP / mixed 端口可用。
+3. 双击 CodexProxyTray.exe，在“代理”页填写并应用地址，
+   例如 http://127.0.0.1:7890，然后确认守护已开启。
+4. 打开 ChatGPT，或新开终端运行 codex；也可从助手中打开对应应用。
+5. 关闭主窗口后，助手继续在托盘运行；退出助手请使用托盘菜单。
+
+首次接入
+已经运行的 ChatGPT 保留原来的环境，请先保存工作，方便时完整退出并重开。
+CLI 专用入口会加入当前用户 PATH，需要新开终端才能使用新入口。
+直接运行原 CLI 的绝对路径会绕过入口；WSL、远程和容器代理需单独配置。
+桌面助手需要 Microsoft Edge WebView2 Runtime，界面本身不依赖 Node.js、
+Python 或 VBScript；如果 CLI 通过 npm 安装，请保留它需要的 Node.js 环境。
+
+可选流量统计
+在“设置”中安装辅助服务，再确认“记录网络流量”已开启。
+安装、重新安装和卸载服务需要本人完成 Windows 授权。
+出现版本不匹配时，请先卸载旧辅助服务，再安装当前版本。
+软件只计算已识别目标进程的字节，不读取内容，也不保存连接地址或端口。
+
+排查连接问题
+本地 TCP 端口可连接不等于 ChatGPT 登录或对话可用。
+可查看网页连通检测，并在运行日志中按日期、级别和关键词筛选，点击查看详情。
+日志与配置保存在 %LOCALAPPDATA%\CodexProxyTray，最多保留最近 200 条日志。
+历史案例中的重连、WSL 或提示词异常并不保证都由代理启动环境引起。
+
+校验与版本
+Release 的 SHA256SUMS.txt 校验整个 ZIP；ZIP 内的校验文件校验其中各运行文件。
+package-receipt.json 记录编译来源和必要运行文件的哈希。
+Windows 数字签名状态以 Release 说明为准。
+
+项目与正式版本
+https://github.com/OrangeZh1/CodexProxyTray
+https://github.com/OrangeZh1/CodexProxyTray/releases

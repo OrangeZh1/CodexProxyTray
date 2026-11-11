@@ -130,6 +130,24 @@ jobs:
       - name: 真实主窗口与托盘前端启动检查
         shell: pwsh
         run: ./tests/Test-DesktopStartup.ps1 -BinaryPath "${{ github.workspace }}/package/CodexProxyTray.exe" -EvidenceDirectory "$env:RUNNER_TEMP/CodexProxyTray-desktop-evidence"
+      - name: 整理并校验 GitHub 正式发行附件
+        shell: pwsh
+        run: ./scripts/package-release.ps1 -PackageDirectory "${{ github.workspace }}/package" -OutputDirectory "${{ github.workspace }}/release" -EvidenceDirectory "$env:RUNNER_TEMP/CodexProxyTray-release-evidence"
+      - name: 保存正式发行附件
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: CodexProxyTray-release
+          path: release/
+          if-no-files-found: error
+          retention-days: 7
+      - name: 保存发行附件校验证据
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-evidence
+          path: ${{ runner.temp }}/CodexProxyTray-release-evidence/
+          if-no-files-found: ignore
+          retention-days: 7
       - name: 保存真实前端启动证据
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
