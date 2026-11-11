@@ -27,9 +27,9 @@ for(const view of ['main','tray'])for(const theme of ['light','dark']){
     // without changing the Animation result; actual popup animation is checked in Windows.
     const animate=window.Element.prototype.animate;
     window.Element.prototype.animate=function(...args){const animation=animate.apply(this,args);animation.finished.catch(error=>{if(error.name!=='AbortError')errors.push(String(error));});return animation;};
-    let focusChanged,hideCount=0,refreshResolve;
+    let focusChanged,navigate,hideCount=0,refreshResolve;
     const appWindow={label:view,hide:async()=>{hideCount++;},setTheme:async()=>{},setBackgroundColor:async()=>{throw Error('Do not repaint the native background after mounting.');},isMaximized:async()=>false,onResized:async()=>()=>{},onFocusChanged:async callback=>{focusChanged=callback;return()=>{};}};
-    window.__TAURI__={core:{invoke:async(command,args)=>{const firstReady=!commands.includes('frontend_ready');commands.push(command);if(command==='report_ui_error'){errors.push(args.message);return null;}if(command==='frontend_ready'){if(view==='tray'&&firstReady)focusChanged?.({payload:true});return null;}if(command==='get_status')return structuredClone(sample);if(command==='refresh_status')return new Promise(resolve=>{refreshResolve=resolve;});throw Error(`Unexpected startup command: ${command}`);}},window:{getCurrentWindow:()=>appWindow},event:{listen:async()=>()=>{}}};
+    window.__TAURI__={core:{invoke:async(command,args)=>{const firstReady=!commands.includes('frontend_ready');commands.push(command);if(command==='report_ui_error'){errors.push(args.message);return null;}if(command==='frontend_ready'){if(view==='tray'&&firstReady)focusChanged?.({payload:true});return null;}if(command==='get_status')return structuredClone(sample);if(command==='refresh_status')return new Promise(resolve=>{refreshResolve=resolve;});throw Error(`Unexpected startup command: ${command}`);}},window:{getCurrentWindow:()=>appWindow},event:{listen:async(name,callback)=>{if(name==='navigate')navigate=callback;return()=>{};}}};
     window.eval(boot);window.eval(code);
     for(let i=0;i<150&&!errors.length&&(!commands.includes('frontend_ready')||!(view==='tray'?window.document.querySelector('.tray-header')?.textContent.includes('守护已就绪'):window.document.querySelector('.sidebar-footer')?.textContent.includes('后台运行中')));i++)await delay(20);
     assert.deepEqual(errors,[],`${view}/${theme}: client render errors`);
@@ -56,6 +56,9 @@ for(const view of ['main','tray'])for(const theme of ['light','dark']){
       assert.match(window.document.querySelector('.log-detail-dialog')?.textContent||'',/客户端启动回归/);
       [...window.document.querySelectorAll('.log-detail-dialog button')].find(button=>button.textContent.trim()==='关闭').click();await delay(10);
       const closingDetail=window.document.querySelector('.log-detail-dialog');if(closingDetail)assert.match(closingDetail.textContent,/客户端启动回归/,'Closing animation must retain the selected log content.');await delay(50);
+      window.document.querySelector('section[aria-label="运行日志"] .log-open').click();await delay(50);
+      navigate({payload:'settings'});await delay(250);
+      assert.equal(window.document.querySelector('.log-detail-dialog'),null,'Native tray navigation must dismiss a modal from the previous page.');
       window.document.querySelector('[data-page="settings"]').click();await delay(30);
       window.document.querySelector('#color-theme').click();await delay(50);
       assert.ok(window.document.querySelector('[role="listbox"]'),'Theme uses the Fluent listbox.');
