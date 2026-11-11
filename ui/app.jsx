@@ -22,7 +22,11 @@ async function syncNativeAppearance(mode){
   if(!appWindow)return;
   await appWindow.setTheme?.(mode==='system'?null:mode);
 }
-function renderGeometry(){const root=document.getElementById('root'),shell=root?.querySelector('.app-shell,.tray-surface'),bounds=shell?.getBoundingClientRect(),style=shell?getComputedStyle(shell):null;return{viewport_width:innerWidth,viewport_height:innerHeight,root_width:root?.clientWidth,root_height:root?.clientHeight,shell_width:bounds?.width,shell_height:bounds?.height,display:style?.display,visibility:style?.visibility,opacity:style?.opacity,element_at_center:document.elementFromPoint?.(innerWidth/2,innerHeight/2)?.nodeName};}
+function renderGeometry(){
+  const root=document.getElementById('root'),shell=root?.querySelector('.app-shell,.tray-surface');
+  const describe=node=>{if(!node)return null;const rect=node.getBoundingClientRect(),style=getComputedStyle(node);return{tag:node.nodeName,class:node.getAttribute('class'),id:node.id,role:node.getAttribute('role'),x:rect.x,y:rect.y,width:rect.width,height:rect.height,scroll_height:node.scrollHeight,display:style.display,visibility:style.visibility,opacity:style.opacity,position:style.position,z_index:style.zIndex,transform:style.transform,content_visibility:style.contentVisibility,background:style.backgroundColor,color:style.color,grid_columns:style.gridTemplateColumns,grid_rows:style.gridTemplateRows};};
+  return{viewport_width:innerWidth,viewport_height:innerHeight,root:describe(root),shell:describe(shell),tray_height:Math.ceil((shell?.scrollHeight||0)+14),nodes:['.sidebar','.brand','.sidebar nav','.main-scroll','.main-content','.page-header','h1','.window-controls','.dashboard-grid','.metric-card'].map(selector=>({selector,...describe(root?.querySelector(selector))})),body_children:[...document.body.children].slice(0,8).map(describe),layers:[[100,100],[innerWidth/2,innerHeight/2],[innerWidth-40,20]].map(([x,y])=>({x,y,nodes:(document.elementsFromPoint?.(x,y)||[]).slice(0,5).map(describe)}))};
+}
 const errorText=error=>error?.name==='AbortError'?'操作已取消。':String(error?.message||error||'操作失败，请重试。');
 const time=at=>new Date(at).toLocaleTimeString('zh-CN',{timeZone:'Asia/Shanghai',hour12:false});
 function Row({icon,title,description,children,className=''}){return <div className={`setting-row ${className}`}><Symbol name={icon}/><div className="row-copy"><div className="row-title">{title}</div>{description&&<div className="row-description">{description}</div>}</div><div className="row-control">{children}</div></div>;}
@@ -108,7 +112,7 @@ export function App({initialStatus=null,initialPage='dashboard',initialSettingsT
   const proxyEdit=useRef({dirty:false,version:0}),systemPending=useRef(new Set());
   const [system,setSystem]=useState(()=>systemPreferences({},initialStatus||{},new Set()));
   const [directory,setDirectory]=useState(initialStatus?.cli_workdir||''),directoryEdit=useRef({dirty:false,version:0});
-  const [logFilter,setLogFilter]=useState('all'),reads=useRef(0);
+  const [logFilter,setLogFilter]=useState('all'),reads=useRef(0),layoutReported=useRef(false);
   const busy=name=>actions.current.has(name);
   const writable=!!invoke&&online&&status?.backend_ready&&!status?.read_only;
   const observed=online&&!!status&&status.revision>0;
@@ -136,6 +140,7 @@ export function App({initialStatus=null,initialPage='dashboard',initialSettingsT
     if(!proxyEdit.current.dirty)setProxy(next.proxy_url);
     setSystem(value=>systemPreferences(value,next,systemPending.current));
     if(!directoryEdit.current.dirty)setDirectory(next.cli_workdir||'');
+    if(!layoutReported.current){layoutReported.current=true;requestAnimationFrame(()=>invoke?.('frontend_ready',{rendered:true,geometry:renderGeometry()}).catch(()=>{}));}
     return next;
   }
   useEffect(()=>{
@@ -233,6 +238,7 @@ export function TrayApp({initialStatus=null}={}){
     return()=>{disposed=true;mounted.current=false;stop?.();media?.removeEventListener('change',onMedia);globalThis.removeEventListener?.('storage',onStorage);};
   },[]);
   useEffect(()=>{appWindow?.setTheme?.(mode==='system'?null:mode).catch(()=>{});},[mode]);
+  useEffect(()=>{const surface=document.querySelector('.tray-surface');if(!surface||!globalThis.ResizeObserver||!invoke)return;let lastHeight=0;const observer=new ResizeObserver(()=>{const geometry=renderGeometry();if(geometry.tray_height===lastHeight)return;lastHeight=geometry.tray_height;invoke('frontend_ready',{rendered:true,geometry}).catch(()=>{});});observer.observe(surface);return()=>observer.disconnect();},[]);
   useEffect(()=>{
     if(!active||!invoke)return;let disposed=false,pending=false;
     const poll=async()=>{if(pending)return;pending=true;try{const next=await invoke('get_status');if(!disposed){setStatus(current=>acceptSnapshot(current,next));setOnline(true);}}catch{if(!disposed)setOnline(false);}finally{pending=false;}};
