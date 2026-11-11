@@ -91,7 +91,12 @@ function Run-Process([string]$Program,[AllowEmptyCollection()][AllowEmptyString(
         $stdout=$process.StandardOutput.ReadToEndAsync();$stderr=$process.StandardError.ReadToEndAsync()
         if(-not $process.WaitForExit($ProcessTimeoutSeconds*1000)){Stop-OwnedProcess $process;throw 'The owned CLI check process timed out.'}
         $output=$stdout.GetAwaiter().GetResult();$errorOutput=$stderr.GetAwaiter().GetResult()
-        Assert-Condition ([string]::IsNullOrWhiteSpace($errorOutput)) 'The CLI wrote unexpected standard error; raw output is not retained.'
+        if(-not [string]::IsNullOrWhiteSpace($errorOutput)){
+            # This child has only the fixed QA environment/mock inputs; keep a bounded diagnostic, never its full environment.
+            $diagnostic=$errorOutput.Replace($qaTempRoot,'<QA_TEMP>').Replace($sourceRoot,'<SOURCE>').Replace($nodeProgram,'<NODE>')
+            if($diagnostic.Length -gt 2000){$diagnostic=$diagnostic.Substring(0,2000)}
+            throw ('The isolated CLI wrote stderr (exit '+$process.ExitCode+'): '+$diagnostic)
+        }
         try {$document=ConvertFrom-Json -InputObject $output -ErrorAction Stop} catch {throw 'The CLI did not return the expected QA JSON; raw output is not retained.'}
         return [pscustomobject]@{exit_code=$process.ExitCode;document=$document}
     } finally {try {if($started){Stop-OwnedProcess $process}} finally {$process.Dispose()}}

@@ -34,6 +34,11 @@ function Write-NewJson([string]$Path, $Value, [int]$Depth=8) {
     $writer=[IO.StreamWriter]::new($stream,[Text.UTF8Encoding]::new($false))
     try { $writer.Write(($Value | ConvertTo-Json -Depth $Depth)) } finally { $writer.Dispose() }
 }
+function Write-NewText([string]$Path,[string]$Text) {
+    $stream=[IO.File]::Open($Path,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None)
+    $writer=[IO.StreamWriter]::new($stream,[Text.UTF8Encoding]::new($false))
+    try {$writer.Write($Text)} finally {$writer.Dispose()}
+}
 function Fingerprint($Value) {
     $sha = [Security.Cryptography.SHA256]::Create()
     try {
@@ -69,10 +74,19 @@ function Stop-CheckProcess([Diagnostics.Process]$Process) {
     if (-not $Process.WaitForExit(5000)) { throw 'The owned check process has not exited after termination.' }
 }
 function Run-HiddenShell([string]$Arguments, [string]$LogPrefix) {
-    $process = Start-Process -FilePath $shell -ArgumentList $Arguments -WindowStyle Hidden -PassThru -RedirectStandardOutput ($LogPrefix + '.stdout.log') -RedirectStandardError ($LogPrefix + '.stderr.log')
+    $start=New-Object Diagnostics.ProcessStartInfo
+    $start.FileName=$shell; $start.Arguments=$Arguments; $start.UseShellExecute=$false; $start.CreateNoWindow=$true; $start.WindowStyle=[Diagnostics.ProcessWindowStyle]::Hidden
+    $start.RedirectStandardOutput=$true; $start.RedirectStandardError=$true
+    $process=New-Object Diagnostics.Process
     try {
+        $process.StartInfo=$start
+        if(-not $process.Start()){throw 'Unable to start the owned check launcher.'}
+        # Keep this Process/handle from Start through ExitCode; Start-Process on PS 5.1 can lose the exit code.
+        $stdout=$process.StandardOutput.ReadToEndAsync();$stderr=$process.StandardError.ReadToEndAsync()
         if (-not $process.WaitForExit(10000)) { Stop-CheckProcess $process; throw 'The check launcher timed out.' }
-        if ($process.ExitCode -ne 0) { throw ('Check launcher failed; see ' + $LogPrefix + '.stderr.log') }
+        Write-NewText ($LogPrefix+'.stdout.log') ($stdout.GetAwaiter().GetResult())
+        Write-NewText ($LogPrefix+'.stderr.log') ($stderr.GetAwaiter().GetResult())
+        if ($process.ExitCode -ne 0) { throw ('Check launcher exit '+$process.ExitCode+'; see ' + $LogPrefix + '.stderr.log') }
     } finally {
         if (-not $process.HasExited) { Stop-CheckProcess $process }
         $process.Dispose()
