@@ -10,10 +10,16 @@ struct BoundProcess{identity:ProcessIdentity,handle:OwnedHandle,active:bool,exit
 struct State{owner_sid:String,bindings:RwLock<HashMap<u32,Vec<BoundProcess>>>,sent:AtomicU64,received:AtomicU64,seen:AtomicBool,had_targets:AtomicBool,incomplete:AtomicBool,unsupported:AtomicBool,overflow:AtomicBool,consumer_error:AtomicU32,binding_error:AtomicU32}
 impl State{fn new(owner_sid:String)->Self{Self{owner_sid,bindings:RwLock::new(HashMap::new()),sent:AtomicU64::new(0),received:AtomicU64::new(0),seen:AtomicBool::new(false),had_targets:AtomicBool::new(false),incomplete:AtomicBool::new(false),unsupported:AtomicBool::new(false),overflow:AtomicBool::new(false),consumer_error:AtomicU32::new(0),binding_error:AtomicU32::new(0)}}}
 pub struct EngineSample{pub sent:u64,pub received:u64,pub seen:bool,pub had_targets:bool,pub target_count:u32,pub lost_events:Option<u64>,pub lost_buffers:Option<u64>,pub error:Option<EngineError>}
-unsafe fn stop_owned(control:CONTROLTRACE_HANDLE,properties:*mut EVENT_TRACE_PROPERTIES){
+const NAME_UNITS:usize=1025;
+fn output_properties(storage:&mut [u64])->*mut EVENT_TRACE_PROPERTIES{unsafe{
+    let guid=(*(storage.as_ptr()as *const EVENT_TRACE_PROPERTIES)).Wnode.Guid;storage.fill(0);let props=storage.as_mut_ptr()as *mut EVENT_TRACE_PROPERTIES;
+    (*props).Wnode.BufferSize=(storage.len()*8)as u32;(*props).Wnode.Guid=guid;(*props).Wnode.Flags=WNODE_FLAG_TRACED_GUID;
+    (*props).LoggerNameOffset=size_of::<EVENT_TRACE_PROPERTIES>()as u32;(*props).LogFileNameOffset=(size_of::<EVENT_TRACE_PROPERTIES>()+NAME_UNITS*2)as u32;props
+}}
+unsafe fn stop_owned(control:CONTROLTRACE_HANDLE,properties:&mut [u64]){
     // A controller process exiting does not stop a system logger. Keep the dedicated owner alive
     // until its own STOP succeeds; the GUI reports stopping/unavailable instead of claiming disabled.
-    loop{let code=unsafe{ControlTraceW(control,PCWSTR::null(),properties,EVENT_TRACE_CONTROL_STOP)};if code.0==0||code.0==4201{return}thread::sleep(std::time::Duration::from_secs(1));}
+    loop{let code=unsafe{ControlTraceW(control,PCWSTR::null(),output_properties(properties),EVENT_TRACE_CONTROL_STOP)};if matches!(code.0,0|4201|234){return}thread::sleep(std::time::Duration::from_secs(1));}
 }
 fn exited_at(process:&BoundProcess)->Option<u64>{unsafe{
     let cached=process.exited.load(Ordering::Relaxed);if cached!=0{return Some(cached)}
@@ -67,7 +73,9 @@ pub struct EtwSession{
 impl EtwSession{
     pub fn start(name:&str,guid:GUID,targets:&[ProcessIdentity],owner_sid:String)->Result<Self,EngineError>{unsafe{
         let mut wide=name.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
-        let bytes=size_of::<EVENT_TRACE_PROPERTIES>()+wide.len()*2;
+        if wide.len()>NAME_UNITS{return Err(EngineError{code:87,message:"采样会话名称过长。"})}
+        // ControlTrace returns both the logger name and log filename, even for a realtime logger.
+        let bytes=size_of::<EVENT_TRACE_PROPERTIES>()+NAME_UNITS*4;
         // u64 alignment is sufficient for the generated SDK struct on supported Windows x64.
         let mut properties=vec![0u64;bytes.div_ceil(8)];let props=properties.as_mut_ptr()as *mut EVENT_TRACE_PROPERTIES;
         *props=EVENT_TRACE_PROPERTIES::default();(*props).Wnode.BufferSize=(properties.len()*8)as u32;(*props).Wnode.Flags=WNODE_FLAG_TRACED_GUID;(*props).Wnode.Guid=guid;(*props).Wnode.ClientContext=1;
@@ -81,7 +89,7 @@ impl EtwSession{
         let state=Arc::new(State::new(owner_sid));let context=Arc::into_raw(state.clone());let mut logfile=Box::new(EVENT_TRACE_LOGFILEW::default());
         logfile.LoggerName=PWSTR(wide.as_mut_ptr());logfile.Context=context as *mut _;logfile.Anonymous1.ProcessTraceMode=PROCESS_TRACE_MODE_EVENT_RECORD|PROCESS_TRACE_MODE_REAL_TIME;logfile.Anonymous2.EventRecordCallback=Some(record_callback);
         let consumer=OpenTraceW(&mut *logfile);
-        if consumer.Value==0||consumer.Value==u64::MAX{let error=GetLastError().0;stop_owned(control,props);drop(Arc::from_raw(context));return Err(EngineError{code:error,message:"Windows 网络事件消费者未能启动。"})}
+        if consumer.Value==0||consumer.Value==u64::MAX{let error=GetLastError().0;stop_owned(control,&mut properties);drop(Arc::from_raw(context));return Err(EngineError{code:error,message:"Windows 网络事件消费者未能启动。"})}
         let mut session=Self{control,consumer,properties,_name:wide,_logfile:logfile,state,context,thread:None,_privilege:privilege};
         // Install the initial whitelist before ProcessTrace can deliver buffered transfer events.
         if session.set_targets(targets).is_err(){let _=session.stop();return Err(EngineError{code:87,message:"网络统计目标身份无效。"})}
@@ -104,7 +112,7 @@ impl EtwSession{
         self.state.binding_error.store(fault,Ordering::Relaxed);Ok(())
     }
     pub fn sample(&mut self)->EngineSample{unsafe{
-        let props=self.properties.as_mut_ptr()as *mut EVENT_TRACE_PROPERTIES;let code=ControlTraceW(self.control,PCWSTR::null(),props,EVENT_TRACE_CONTROL_QUERY);
+        let props=output_properties(&mut self.properties);let code=ControlTraceW(self.control,PCWSTR::null(),props,EVENT_TRACE_CONTROL_QUERY);
         let(lost_events,lost_buffers)=if code.0==0{(Some((*props).EventsLost as u64),Some((*props).LogBuffersLost as u64+(*props).RealTimeBuffersLost as u64))}else{(None,None)};
         let binding_error=self.state.binding_error.load(Ordering::Relaxed);
         let error=if code.0!=0{Some(EngineError{code:code.0,message:"无法读取本次采样的丢失事件统计。"})}else if lost_events!=Some(0)||lost_buffers!=Some(0){Some(EngineError{code:234,message:"系统网络事件发生丢失，当前流量不完整。"})}else if binding_error!=0{Some(EngineError{code:binding_error,message:"部分目标进程身份无法验证，未显示不完整流量。"})}else if self.state.incomplete.load(Ordering::Relaxed){Some(EngineError{code:1168,message:"部分目标进程未能及时绑定，当前统计段不完整。"})}else if self.state.unsupported.load(Ordering::Relaxed){Some(EngineError{code:50,message:"当前 Windows 网络事件格式不受支持。"})}else if self.state.overflow.load(Ordering::Relaxed){Some(EngineError{code:534,message:"网络统计计数超出范围。"})}else{let code=self.state.consumer_error.load(Ordering::Relaxed);if code!=0{Some(EngineError{code,message:"网络事件消费者已退出。"})}else{None}};
@@ -112,7 +120,7 @@ impl EtwSession{
         EngineSample{sent:self.state.sent.load(Ordering::Relaxed),received:self.state.received.load(Ordering::Relaxed),seen:self.state.seen.load(Ordering::Relaxed),had_targets:self.state.had_targets.load(Ordering::Relaxed),target_count:count,lost_events,lost_buffers,error}
     }}
     pub fn stop(&mut self)->Result<(),EngineError>{unsafe{
-        if self.control.Value!=0{stop_owned(self.control,self.properties.as_mut_ptr()as *mut _);self.control.Value=0;}
+        if self.control.Value!=0{stop_owned(self.control,&mut self.properties);self.control.Value=0;}
         if self.consumer.Value!=0&&self.consumer.Value!=u64::MAX{let _=CloseTrace(self.consumer);self.consumer.Value=u64::MAX;}
         // CloseTrace can return ERROR_CTX_CLOSE_PENDING: do not free names/Context until the consumer really returns.
         if let Some(thread)=self.thread.take(){let _=thread.join();}

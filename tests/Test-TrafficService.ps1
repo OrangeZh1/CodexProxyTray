@@ -64,10 +64,13 @@ function Remove-Diagnostics {
     if(-not $diagnosticOwned){return}
     Require (Same-Path ((Get-Item -LiteralPath $diagnosticRoot -Force).FullName) $diagnosticRoot) 'diagnostic_directory_changed'
     No-Reparse $diagnosticRoot
+    $pipeline=Join-Path $diagnosticRoot 'pipeline-data'
+    if(Test-Path -LiteralPath $pipeline){No-Reparse $pipeline;Require ($report.status -eq 'failed') 'pipeline_directory_after_success';return 'retained_for_debugging'}
     $entries=@(Get-ChildItem -LiteralPath $diagnosticRoot -Force)
     foreach($entry in $entries){Require (-not $entry.PSIsContainer -and $diagnosticFiles.Contains($entry.FullName)) 'unknown_diagnostic_file_preserved';No-Reparse $entry.FullName}
     foreach($entry in $entries){[IO.File]::Delete($entry.FullName)}
     [IO.Directory]::Delete($diagnosticRoot,$false)
+    return 'passed'
 }
 
 if(-not ('CodexProxyTray.ServiceQaNative' -as [type])) {Add-Type -TypeDefinition @'
@@ -277,7 +280,8 @@ function Run-ServicePipeline {
         $until=[DateTime]::UtcNow.AddSeconds(12)
         do{$collectors=@(Get-CimInstance Win32_Process -Filter "Name = 'CodexProxyTrayTrafficService.exe'"|Where-Object {$_.CommandLine -like '*--traffic-collector*' -and (Same-Path $_.ExecutablePath $serviceImage)});if($collectors.Count){Start-Sleep -Milliseconds 100}}while($collectors.Count -and [DateTime]::UtcNow -lt $until)
         if($collectors.Count -and -not $pipelineFailure){$pipelineFailure='pipeline_collectors_remain'}
-        try{No-Reparse $sandbox;Require (Is-Within (Full-Path $sandbox) $diagnosticRoot) 'pipeline_cleanup_boundary';Start-Sleep -Seconds 2;Remove-Item -LiteralPath $sandbox -Recurse -Force}catch{if(-not $pipelineFailure){$pipelineFailure=$_}}
+        $report['pipeline_stop_state']=$final.traffic.state
+        if(-not $pipelineFailure){try{No-Reparse $sandbox;Require (Is-Within (Full-Path $sandbox) $diagnosticRoot) 'pipeline_cleanup_boundary';Start-Sleep -Seconds 2;Remove-Item -LiteralPath $sandbox -Recurse -Force}catch{$pipelineFailure=$_}}
     }
     if($pipelineFailure){throw $pipelineFailure}
     Require ($final.helper_pid -gt 0 -and -not $final.backend_ready -and $final.traffic.state -eq 'disabled') 'pipeline_stop_ack_not_confirmed'
@@ -356,7 +360,7 @@ finally {
             }
         }
     } catch {$report.cleanup='blocked';$report.cleanup_code=Failure-Code $_;$failure=$true;$report.status='failed'}
-    try {Remove-Diagnostics;$report.diagnostic_cleanup='passed'}catch{$report.diagnostic_cleanup='blocked';$report.diagnostic_cleanup_code=Failure-Code $_;$failure=$true;$report.status='failed'}
+    try {$report.diagnostic_cleanup=Remove-Diagnostics}catch{$report.diagnostic_cleanup='blocked';$report.diagnostic_cleanup_code=Failure-Code $_;$failure=$true;$report.status='failed'}
     if($failure){try{$state=Inspect-Service;if($state){$report.retained_service_state=$state.State;$report.retained_service_win32_exit=$state.Win32Exit;$report.retained_service_specific_exit=$state.SpecificExit}}catch{}}
     if($serviceProcess){$serviceProcess.Dispose()}
     $report.tests=[ordered]@{pass=@($cases|Where-Object status -eq 'passed').Count;fail=@($cases|Where-Object status -eq 'failed').Count}
