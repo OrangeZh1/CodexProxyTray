@@ -27,6 +27,11 @@ try{
     Start-Sleep -Seconds 3
     if($process.HasExited -or (Test-Path -LiteralPath (Join-Path $root 'ui-error.json'))){throw 'The frontend failed after receiving backend state.'}
     foreach($view in @('main','tray')){Copy-Item -LiteralPath (Join-Path $root ('ui-ready-'+$view+'.json')) -Destination (Join-Path $EvidenceDirectory ('layout-'+$view+'.json'))}
+    $layout=Get-Content -LiteralPath (Join-Path $root 'ui-ready-main.json') -Raw|ConvertFrom-Json
+    if(@($layout.geometry.body_children|Where-Object {$_.class -match '(^|\s)app-shell(\s|$)'}).Count){throw 'Fluent portal copied the page layout and can cover the real interface.'}
+    if(-not $layout.geometry.layers[0].nodes.Count -or $layout.geometry.layers[0].nodes[0].class -match '(^|\s)app-shell(\s|$)'){throw 'A full-page layer covers the sidebar navigation.'}
+    foreach($selector in @('.sidebar','h1','.main-scroll')){$node=@($layout.geometry.nodes|Where-Object selector -eq $selector);if($node.Count -ne 1 -or $node[0].width -le 0 -or $node[0].height -le 0 -or $node[0].visibility -ne 'visible'){throw "Core page element is not visible: $selector"}}
+    $report['page_occlusion_check']='passed'
     $quitter=Start-Owned '--quit';try{if(-not $quitter.WaitForExit(10000) -or $quitter.ExitCode -ne 0){throw 'Quit request failed.'}}finally{$quitter.Dispose()}
     if(-not $process.WaitForExit(15000) -or $process.ExitCode -ne 0){throw 'Desktop did not exit cleanly.'}
     $report.status='passed'
