@@ -218,4 +218,4 @@ export function App({initialStatus=null,initialPage='dashboard',initialSettingsT
     {page==='dashboard'&&<GuardButton status={status} observed={observed} writable={writable&&!busy('save')} busy={busy('toggle')} onToggle={()=>run('toggle','set_enabled',{enabled:!status?.enabled})}/>}
   </FluentProvider>;
 }
-if(typeof document!=='undefined')createRoot(document.getElementById('root')).render(<App/>);
+if(typeof document!=='undefined')createRoot(document.getElementById('root'),{onUncaughtError:error=>window.reportUiError?.(error)}).render(<App/>);

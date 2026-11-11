@@ -66,6 +66,10 @@
 html, body, #root { width: 100%; height: 100%; margin: 0; overflow: hidden; }
 button, input, select { font: inherit; }
 [hidden] { display: none !important; }
+.startup-error { padding: 32px; color: var(--text-primary); overflow: auto; height: 100%; }
+.startup-error h1 { font-size: 20px; }
+.startup-error p { overflow-wrap: anywhere; color: var(--text-secondary); }
+.startup-error button { padding: 8px 14px; border: 1px solid var(--panel-stroke); border-radius: 6px; background: var(--panel-bg); color: var(--text-primary); }
 .app-shell {
   --sidebar-width: 224px;
   --caption-height: 32px;
