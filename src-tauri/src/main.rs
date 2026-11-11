@@ -32,7 +32,7 @@ mod core;
         let app=tauri::Builder::default().plugin(tauri_plugin_single_instance::init(|app,args,_|{if args.iter().any(|arg|arg=="--quit"){app.exit(0);}else if args.iter().any(|arg|arg=="--refresh"){let(tx,_)=std::sync::mpsc::channel();let _=app.state::<Controller>().tx.send(Message::Refresh(tx));}else if !args.iter().any(|arg|arg=="--background"){show(app);}}))
             .invoke_handler(tauri::generate_handler![get_status,set_enabled,save_proxy,save_system,refresh_status,launch_codex,launch_cli,check_updates,open_release,open_source,open_logs])
             .setup(move|app|{
-                if quitting {app.exit(0);return Ok(());}
+                if quitting {app.handle().exit(0);return Ok(());}
                 let status_item=MenuItem::with_id(app,"status","CodexProxyTray · 正在检测",false,None::<&str>)?;
                 let proxy_item=MenuItem::with_id(app,"proxy-status","本地代理 · 正在检测",false,None::<&str>)?;
                 let show_item=MenuItem::with_id(app,"show","打开仪表盘",true,None::<&str>)?;
