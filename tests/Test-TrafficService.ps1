@@ -234,6 +234,53 @@ function Run-Case([string]$Name,[scriptblock]$Check) {
     try {$null=&$Check;$cases.Add([ordered]@{name=$Name;status='passed';milliseconds=$clock.ElapsedMilliseconds})}
     catch {$cases.Add([ordered]@{name=$Name;status='failed';milliseconds=$clock.ElapsedMilliseconds;code=(Failure-Code $_)});throw}
 }
+function Run-ServicePipeline {
+    $sandbox=Join-Path $diagnosticRoot 'pipeline-data'
+    Require (-not (Test-Path -LiteralPath $sandbox)) 'pipeline_sandbox_exists'
+    [void][IO.Directory]::CreateDirectory((Join-Path $sandbox 'CodexProxyTray'))
+    [IO.File]::WriteAllText((Join-Path $sandbox 'CodexProxyTray/config.json'),'{"launch_target":"none","network_enabled":false,"connectivity_enabled":false,"traffic_enabled":true,"auto_check_updates":false}')
+    $start={param([string]$Arguments)
+        $info=[Diagnostics.ProcessStartInfo]::new();$info.FileName=$binary;$info.Arguments=$Arguments;$info.WorkingDirectory=[IO.Path]::GetDirectoryName($binary);$info.UseShellExecute=$false;$info.CreateNoWindow=$true;$info.WindowStyle='Hidden'
+        $info.EnvironmentVariables['LOCALAPPDATA']=$sandbox;$info.EnvironmentVariables['WEBVIEW2_USER_DATA_FOLDER']=Join-Path $sandbox 'webview-data'
+        return [Diagnostics.Process]::Start($info)
+    }
+    $gui=$null;$pipelineFailure=$null;$final=$null
+    try{
+        Require (@(Get-Process -Name CodexProxyTray -ErrorAction SilentlyContinue).Count -eq 0) 'pipeline_other_gui_preserved'
+        $gui=&$start '--background';$guiStarted=$gui.StartTime.ToUniversalTime();$deadline=[DateTime]::UtcNow.AddSeconds(40);$seen=[Collections.Generic.HashSet[long]]::new()
+        while([DateTime]::UtcNow -lt $deadline){
+            Require (-not $gui.HasExited) 'pipeline_gui_exited'
+            $path=Join-Path $sandbox 'CodexProxyTray/status.json'
+            if(Test-Path -LiteralPath $path){
+                try{$value=Get-Content -LiteralPath $path -Raw|ConvertFrom-Json}catch{Start-Sleep -Milliseconds 100;continue}
+                if($value.helper_pid -eq $gui.Id){
+                    if($value.traffic.state -in @('unavailable','needs_permission')){$report['pipeline_error_message']=[string]$value.traffic.message;throw 'service_pipeline_unavailable'}
+                    if($value.traffic.state -eq 'collecting' -and $null -ne $value.traffic.received_bytes -and $null -ne $value.traffic.sent_bytes){[void]$seen.Add([long]$value.traffic.timestamp_ms)}
+                    if($seen.Count -ge 2){break}
+                }
+            }
+            Start-Sleep -Milliseconds 150
+        }
+        Require ($seen.Count -ge 2) 'service_pipeline_samples_missing'
+        $report['service_pipeline_samples']=$seen.Count
+    }catch{$pipelineFailure=$_}
+    finally{
+        if($gui){
+            try{
+                if(-not $gui.HasExited){Require ($gui.StartTime.ToUniversalTime() -eq $guiStarted -and (Same-Path $gui.Path $binary)) 'pipeline_gui_identity_changed';$quitter=&$start '--quit';try{Require ($quitter.WaitForExit(10000)) 'pipeline_quit_request_timeout'}finally{$quitter.Dispose()};Require ($gui.WaitForExit(15000)) 'pipeline_gui_stop_timeout'}
+                $statusPath=Join-Path $sandbox 'CodexProxyTray/status.json';if(Test-Path -LiteralPath $statusPath){$final=Get-Content -LiteralPath $statusPath -Raw|ConvertFrom-Json}
+            }catch{if(-not $gui.HasExited -and $gui.StartTime.ToUniversalTime() -eq $guiStarted -and (Same-Path $gui.Path $binary)){$gui.Kill($true);[void]$gui.WaitForExit(10000)};if(-not $pipelineFailure){$pipelineFailure=$_}}
+            finally{$gui.Dispose()}
+        }
+        $until=[DateTime]::UtcNow.AddSeconds(12)
+        do{$collectors=@(Get-CimInstance Win32_Process -Filter "Name = 'CodexProxyTrayTrafficService.exe'"|Where-Object {$_.CommandLine -like '*--traffic-collector*' -and (Same-Path $_.ExecutablePath $serviceImage)});if($collectors.Count){Start-Sleep -Milliseconds 100}}while($collectors.Count -and [DateTime]::UtcNow -lt $until)
+        if($collectors.Count -and -not $pipelineFailure){$pipelineFailure='pipeline_collectors_remain'}
+        try{No-Reparse $sandbox;Require (Is-Within (Full-Path $sandbox) $diagnosticRoot) 'pipeline_cleanup_boundary';Start-Sleep -Seconds 2;Remove-Item -LiteralPath $sandbox -Recurse -Force}catch{if(-not $pipelineFailure){$pipelineFailure=$_}}
+    }
+    if($pipelineFailure){throw $pipelineFailure}
+    Require ($final.helper_pid -gt 0 -and -not $final.backend_ready -and $final.traffic.state -eq 'disabled') 'pipeline_stop_ack_not_confirmed'
+    $report['service_pipeline_stop_ack']=$true;$report['service_pipeline_collectors_exited']=$true
+}
 
 $evidenceRoot=Check-EvidencePath $EvidenceDirectory
 [void][IO.Directory]::CreateDirectory($evidenceRoot)
@@ -241,7 +288,7 @@ $diagnosticRoot=Check-EvidencePath ($evidenceRoot+'-work-'+[Guid]::NewGuid().ToS
 [void][IO.Directory]::CreateDirectory($diagnosticRoot)
 $diagnosticOwned=$true;$diagnosticSequence=0;$diagnosticFiles=[Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
 $cases=[Collections.Generic.List[object]]::new();$failure=$false;$currentCase='preflight';$installAttempted=$false;$uninstallAttempted=$false;$writeUncertain=$false;$stopSent=$false;$serviceProcess=$null
-$report=[ordered]@{format='codex-proxy-tray-traffic-service-qa-v1';status='running';started_at=[DateTime]::UtcNow.ToString('o');scope='Fresh GitHub-hosted runner; installer and real SCM ServiceMain only; no GUI, ETW collection, network or real application accounts';installer_exit_codes=[Collections.Generic.List[int]]::new();installer_diagnostics=[Collections.Generic.List[object]]::new();cases=$cases;cleanup='not_needed';failure_case=$null;failure_code=$null;tests=$null}
+$report=[ordered]@{format='codex-proxy-tray-traffic-service-qa-v1';status='running';started_at=[DateTime]::UtcNow.ToString('o');scope='Fresh GitHub-hosted runner; protected install, SCM broker, real service-backed ETW samples and STOP acknowledgement; no UI automation, screenshots, external probes or real accounts';installer_exit_codes=[Collections.Generic.List[int]]::new();installer_diagnostics=[Collections.Generic.List[object]]::new();cases=$cases;cleanup='not_needed';failure_case=$null;failure_code=$null;tests=$null}
 try {
     Run-Case 'isolated_elevated_preflight' {
         Require ([Environment]::Is64BitProcess -and [CodexProxyTray.ServiceQaNative]::Elevated()) 'elevated_x64_process_required'
@@ -286,6 +333,7 @@ try {
         $report.process_acl_verified=$true
         $report.real_service_main_running=$true
     }
+    Run-Case 'service_backed_sampling_roundtrip_and_stop_ack' {Run-ServicePipeline}
     Run-Case 'stop_only_owned_service' {Stop-OwnedService;$report.service_stop_verified=$true}
     Run-Case 'uninstall_removes_registration_and_owned_directory' {
         $null=Assert-OwnedInstall;$script:uninstallAttempted=$true;Run-Installer '--uninstall-traffic-service';Assert-Removed;$report.uninstall_verified=$true
