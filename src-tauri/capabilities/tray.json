@@ -1,0 +1,1 @@
+{ "identifier": "tray", "description": "Local tray popup and its theme, focus and dismissal controls.", "windows": ["tray"], "permissions": ["core:default", "core:window:allow-hide", "core:window:allow-set-theme", "core:window:allow-set-background-color"] }

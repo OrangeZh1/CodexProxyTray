@@ -169,11 +169,11 @@ try {
   assert.ok(initial.indexOf('src="theme-init.js"')<initial.indexOf('rel="stylesheet"'));
   for(const [saved,dark,resolved] of [[null,false,'light'],[null,true,'dark'],['light',true,'light'],['dark',false,'dark'],['system',true,'dark'],['invalid',true,'dark']]) {
     const element={dataset:{},style:{}};
-    runInNewContext(boot,{document:{documentElement:element},window:{matchMedia:()=>({matches:dark})},localStorage:{getItem:()=>saved}});
+    runInNewContext(boot,{document:{documentElement:element},window:{addEventListener(){},matchMedia:()=>({matches:dark})},localStorage:{getItem:()=>saved}});
     assert.equal(element.dataset.theme,resolved);assert.equal(element.style.colorScheme,resolved);
   }
   const denied={dataset:{},style:{}};
-  runInNewContext(boot,{document:{documentElement:denied},window:{matchMedia:()=>({matches:true})},localStorage:{getItem:()=>{throw Error('unavailable');}}});
+  runInNewContext(boot,{document:{documentElement:denied},window:{addEventListener(){},matchMedia:()=>({matches:true})},localStorage:{getItem:()=>{throw Error('unavailable');}}});
   assert.equal(denied.dataset.theme,'dark');
   checks++;
 

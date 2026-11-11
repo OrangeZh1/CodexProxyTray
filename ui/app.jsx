@@ -218,4 +218,34 @@ export function App({initialStatus=null,initialPage='dashboard',initialSettingsT
     {page==='dashboard'&&<GuardButton status={status} observed={observed} writable={writable&&!busy('save')} busy={busy('toggle')} onToggle={()=>run('toggle','set_enabled',{enabled:!status?.enabled})}/>}
   </FluentProvider>;
 }
-if(typeof document!=='undefined')createRoot(document.getElementById('root'),{onUncaughtError:error=>window.reportUiError?.(error)}).render(<App/>);
+export function TrayApp({initialStatus=null}={}){
+  const [status,setStatus]=useState(initialStatus),[online,setOnline]=useState(!!initialStatus),[active,setActive]=useState(false),[notice,setNotice]=useState('');
+  const [mode,setMode]=useState(readThemeMode),[systemDark,setSystemDark]=useState(prefersDark),[,changed]=useState(0);
+  const actions=useRef(null);if(!actions.current)actions.current=createActions(()=>changed(v=>v+1),{minimumVisibleMs:650});
+  const busy=name=>actions.current.has(name),resolved=resolveTheme(mode,systemDark);
+  const mounted=useRef(true),menu=useRef(null);
+  useThemeLayoutEffect(()=>applyDocumentTheme(resolved),[resolved]);
+  useEffect(()=>{
+    let disposed=false;mounted.current=true;let stop;
+    const media=globalThis.matchMedia?.(systemThemeQuery),onMedia=event=>setSystemDark(event.matches),onStorage=()=>setMode(readThemeMode());
+    media?.addEventListener('change',onMedia);globalThis.addEventListener?.('storage',onStorage);
+    const start=async()=>{try{await appWindow?.setTheme?.(mode==='system'?null:mode);if(appWindow?.onFocusChanged){const unlisten=await appWindow.onFocusChanged(({payload})=>{if(!disposed){setActive(payload);if(payload){setOnline(false);setNotice('');queueMicrotask(()=>menu.current?.querySelector('[role="menuitem"]')?.focus());}}});if(disposed)unlisten();else stop=unlisten;}await invoke?.('frontend_ready');}catch(error){if(!disposed)setNotice(errorText(error));}};
+    start();
+    return()=>{disposed=true;mounted.current=false;stop?.();media?.removeEventListener('change',onMedia);globalThis.removeEventListener?.('storage',onStorage);};
+  },[]);
+  useEffect(()=>{appWindow?.setTheme?.(mode==='system'?null:mode).catch(()=>{});},[mode]);
+  useEffect(()=>{
+    if(!active||!invoke)return;let disposed=false,pending=false;
+    const poll=async()=>{if(pending)return;pending=true;try{const next=await invoke('get_status');if(!disposed){setStatus(current=>acceptSnapshot(current,next));setOnline(true);}}catch{if(!disposed)setOnline(false);}finally{pending=false;}};
+    poll();const timer=setInterval(poll,2500);return()=>{disposed=true;clearInterval(timer);};
+  },[active]);
+  async function action(name,command,args){let succeeded=false;await actions.current.run(name,async()=>{try{const result=await invoke(command,args);if(result&&mounted.current)setStatus(current=>acceptSnapshot(current,result));succeeded=true;}catch(error){if(mounted.current)setNotice(errorText(error));}});if(succeeded)await appWindow?.hide?.();}
+  const pending=['dashboard','logs','settings','launch','launch-cli','refresh','toggle','quit'].some(busy);
+  const writable=!!invoke&&online&&status?.backend_ready;
+  const ready=writable&&status?.enabled&&!status?.error&&(status?.guard_ready||status?.cli_ready)&&status?.proxy_reachable;
+  const summary=!online?'正在读取状态':!status?.backend_ready?'后台未就绪':!status.enabled?'守护已暂停':status.error?'守护需要检查':ready?'守护已就绪':'等待应用接入';
+  const item=(id,label,icon,command,args,disabled=false)=><Button role="menuitem" id={`tray-${id}`} className={`tray-item ${id==='quit'?'tray-quit':''}`} appearance="subtle" aria-busy={busy(id)} disabled={!invoke||pending||disabled} icon={<Symbol name={busy(id)?'refresh':icon} spin={busy(id)}/>} onClick={()=>action(id,command,args)}><span>{label}</span>{['dashboard','logs','settings'].includes(id)&&<Icon className="tray-chevron" icon={icons['chevron-right-20-regular']} aria-hidden="true"/>}</Button>;
+  function keys(event){if(event.key==='Escape'){event.preventDefault();appWindow?.hide?.();return;}if(!['ArrowDown','ArrowUp','Home','End'].includes(event.key))return;const items=[...menu.current.querySelectorAll('[role="menuitem"]:not(:disabled)')];if(!items.length)return;const current=items.indexOf(document.activeElement),index=event.key==='Home'?0:event.key==='End'?items.length-1:event.key==='ArrowDown'?(current+1)%items.length:(current-1+items.length)%items.length;event.preventDefault();items[index].focus();}
+  return <FluentProvider theme={themes[resolved]} data-theme={resolved} className="tray-surface"><header className="tray-header"><img src="icon.svg" alt=""/><div><strong>CodexProxyTray</strong><StatusLabel color={ready?'success':status?.error?'danger':'subtle'}>{summary}</StatusLabel></div><span className="tray-version">v{version}</span></header><div className="tray-proxy"><span className={`status-indicator ${online&&status?.proxy_reachable?'active':''}`}/><span>{status?.proxy_url||'等待本地代理'}</span></div>{notice&&<div className="tray-notice" role="alert">{notice}</div>}<nav role="menu" aria-label="托盘菜单" ref={menu} onKeyDown={keys}><div className="tray-group">{item('dashboard','打开仪表盘','dashboard','navigate_main',{page:'dashboard'})}{item('logs','运行日志','logs','navigate_main',{page:'logs'})}{item('settings','设置','settings','navigate_main',{page:'settings'})}</div><div className="tray-group">{item('launch','打开 ChatGPT','desktop','launch_codex',undefined,!writable||!status?.package_count)}{item('launch-cli','打开 Codex CLI','terminal','launch_cli',undefined,!writable||!status?.cli_ready)}</div><div className="tray-group">{item('refresh','重新检测','refresh','refresh_status',undefined,!writable)}{item('toggle',status?.enabled?'暂停守护':'恢复守护',status?.enabled?'pause':'play','set_enabled',{enabled:!status?.enabled},!writable)}</div><div className="tray-group tray-last">{item('quit','退出 CodexProxyTray','power','quit_helper')}</div></nav></FluentProvider>;
+}
+if(typeof document!=='undefined')createRoot(document.getElementById('root'),{onUncaughtError:error=>window.reportUiError?.(error)}).render(document.documentElement.dataset.view==='tray'?<TrayApp/>:<App/>);

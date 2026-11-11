@@ -13,19 +13,27 @@ mod core;
 #[cfg(windows)] mod traffic_service;
 
 #[cfg(windows)] mod desktop {
-    use tauri::{Manager,State,Emitter,menu::{Menu,MenuItem,PredefinedMenuItem},tray::{TrayIconBuilder,TrayIconEvent,MouseButton,MouseButtonState}};
+    use tauri::{Manager,State,Emitter,tray::{TrayIconBuilder,TrayIconEvent,MouseButton,MouseButtonState}};
     use crate::worker::{Controller,Message,Status,Preferences};
     use std::sync::atomic::{AtomicBool,Ordering};
     static SERVICE_OPERATION:AtomicBool=AtomicBool::new(false);
     struct ServiceOperation;
     impl Drop for ServiceOperation{fn drop(&mut self){SERVICE_OPERATION.store(false,Ordering::Release);}}
-    struct UiStartup{ready:AtomicBool,show_requested:AtomicBool,page:std::sync::Mutex<Option<String>>}
+    struct UiStartup{ready:AtomicBool,show_requested:AtomicBool,page:std::sync::Mutex<Option<String>>,tray_ready:AtomicBool,tray_requested:AtomicBool}
     fn show(app:&tauri::AppHandle){if let Some(startup)=app.try_state::<UiStartup>(){startup.show_requested.store(true,Ordering::Release);if !startup.ready.load(Ordering::Acquire){return;}}if let Some(window)=app.get_webview_window("main"){let _=window.show();let _=window.unminimize();let _=window.set_focus();}}
     fn show_page(app:&tauri::AppHandle,page:&str){if let Some(startup)=app.try_state::<UiStartup>(){let mut pending=startup.page.lock().unwrap_or_else(|e|e.into_inner());if !startup.ready.load(Ordering::Acquire){*pending=Some(page.into());drop(pending);show(app);return}}show(app);let _=app.emit("navigate",page);}
+    fn show_tray(app:&tauri::AppHandle){if let Some(startup)=app.try_state::<UiStartup>(){startup.tray_requested.store(true,Ordering::Release);if !startup.tray_ready.load(Ordering::Acquire){return}}if let Some(window)=app.get_webview_window("tray"){let _=window.show();let _=window.set_focus();}}
+    fn toggle_tray(app:&tauri::AppHandle,point:tauri::PhysicalPosition<f64>){if let Some(window)=app.get_webview_window("tray"){
+        if window.is_visible().unwrap_or(false){let _=window.hide();return}
+        if let Ok(Some(monitor))=window.monitor_from_point(point.x,point.y){let area=monitor.work_area();let scale=monitor.scale_factor();let(x,y,width,height)=crate::core::popup_bounds((point.x.round()as i32,point.y.round()as i32),(area.position.x,area.position.y,area.size.width,area.size.height),((320.0*scale).round()as u32,(464.0*scale).round()as u32),(8.0*scale).round()as i32);let _=window.set_size(tauri::PhysicalSize::new(width,height));let _=window.set_position(tauri::PhysicalPosition::new(x,y));}
+        show_tray(app);
+    }}
     fn tray_image()->tauri::image::Image<'static>{match crate::native::small_icon_size(){0..=16=>tauri::include_image!("icons/icon-16.png"),17..=20=>tauri::include_image!("icons/icon-20.png"),21..=24=>tauri::include_image!("icons/icon-24.png"),25..=32=>tauri::include_image!("icons/icon-32.png"),33..=40=>tauri::include_image!("icons/icon-40.png"),41..=48=>tauri::include_image!("icons/icon-48.png"),_=>tauri::include_image!("icons/icon-64.png")}}
     #[tauri::command] async fn get_status(state:State<'_,Controller>)->Result<Status,String>{Ok(state.snapshot())}
     #[tauri::command]fn report_ui_error(message:String,window:tauri::WebviewWindow,state:State<'_,Controller>)->Result<(),String>{let message=message.chars().take(2000).collect::<String>();let _=state.tx.send(Message::Notice("error".into(),"界面".into(),"界面加载失败".into(),message.clone()));crate::settings::write_json(&crate::settings::root().join("ui-error.json"),&serde_json::json!({"at":crate::settings::now(),"window":window.label(),"message":message}))}
-    #[tauri::command]fn frontend_ready(app:tauri::AppHandle,state:State<'_,UiStartup>)->Option<String>{let mut pending=state.page.lock().unwrap_or_else(|e|e.into_inner());if !state.ready.swap(true,Ordering::AcqRel){if state.show_requested.load(Ordering::Acquire){show(&app);}return pending.take()}None}
+    #[tauri::command]fn frontend_ready(app:tauri::AppHandle,window:tauri::WebviewWindow,state:State<'_,UiStartup>)->Option<String>{if window.label()=="tray"{state.tray_ready.store(true,Ordering::Release);if state.tray_requested.load(Ordering::Acquire){show_tray(&app)}return None}let mut pending=state.page.lock().unwrap_or_else(|e|e.into_inner());if !state.ready.swap(true,Ordering::AcqRel){if state.show_requested.load(Ordering::Acquire){show(&app);}return pending.take()}None}
+    #[tauri::command]fn navigate_main(page:String,app:tauri::AppHandle)->Result<(),String>{if !matches!(page.as_str(),"dashboard"|"proxy"|"logs"|"settings"){return Err("未知页面。".into())}if let Some(window)=app.get_webview_window("tray"){let _=window.hide();}show_page(&app,&page);Ok(())}
+    #[tauri::command]fn quit_helper(app:tauri::AppHandle){app.exit(0);}
     async fn request(state:State<'_,Controller>,make:impl FnOnce(std::sync::mpsc::Sender<Result<Status,String>>)->Message+Send+'static)->Result<Status,String>{request_to(state.tx.clone(),make).await}
     async fn request_to(tx:std::sync::mpsc::Sender<Message>,make:impl FnOnce(std::sync::mpsc::Sender<Result<Status,String>>)->Message+Send+'static)->Result<Status,String>{tauri::async_runtime::spawn_blocking(move||{let(reply,rx)=std::sync::mpsc::channel();tx.send(make(reply)).map_err(|_|"后台已退出".to_owned())?;rx.recv_timeout(std::time::Duration::from_secs(8)).map_err(|_|"操作仍在处理中，请查看当前状态。".to_owned())?}).await.map_err(|e|e.to_string())?}
     #[tauri::command] async fn set_enabled(enabled:bool,state:State<'_,Controller>)->Result<Status,String>{request(state,move|r|Message::Enabled(enabled,Some(r))).await}
@@ -54,37 +62,23 @@ mod core;
         let quitting=std::env::args().any(|s|s=="--quit");
         let refreshing=std::env::args().any(|s|s=="--refresh");
         let background=quitting||refreshing||std::env::args().any(|s|s=="--background");
-        let app=tauri::Builder::default().manage(UiStartup{ready:AtomicBool::new(false),show_requested:AtomicBool::new(!background),page:std::sync::Mutex::new(None)}).plugin(tauri_plugin_single_instance::init(|app,args,_|{if args.iter().any(|arg|arg=="--quit"){app.exit(0);}else if args.iter().any(|arg|arg=="--refresh"){let(tx,_)=std::sync::mpsc::channel();let _=app.state::<Controller>().tx.send(Message::Refresh(tx));}else if !args.iter().any(|arg|arg=="--background"){show(app);}}))
-            .invoke_handler(tauri::generate_handler![get_status,report_ui_error,frontend_ready,set_enabled,save_proxy,save_system,refresh_status,launch_codex,launch_cli,check_updates,check_connectivity,enable_traffic,disable_traffic,install_traffic_service,uninstall_traffic_service,open_release,open_source,open_logs])
+        let app=tauri::Builder::default().manage(UiStartup{ready:AtomicBool::new(false),show_requested:AtomicBool::new(!background),page:std::sync::Mutex::new(None),tray_ready:AtomicBool::new(false),tray_requested:AtomicBool::new(false)}).plugin(tauri_plugin_single_instance::init(|app,args,_|{if args.iter().any(|arg|arg=="--quit"){app.exit(0);}else if args.iter().any(|arg|arg=="--refresh"){let(tx,_)=std::sync::mpsc::channel();let _=app.state::<Controller>().tx.send(Message::Refresh(tx));}else if !args.iter().any(|arg|arg=="--background"){show(app);}}))
+            .invoke_handler(tauri::generate_handler![get_status,report_ui_error,frontend_ready,navigate_main,quit_helper,set_enabled,save_proxy,save_system,refresh_status,launch_codex,launch_cli,check_updates,check_connectivity,enable_traffic,disable_traffic,install_traffic_service,uninstall_traffic_service,open_release,open_source,open_logs])
             .setup(move|app|{
                 if quitting {app.handle().exit(0);return Ok(());}
-                let status_item=MenuItem::with_id(app,"status","CodexProxyTray · 正在检测",false,None::<&str>)?;
-                let proxy_item=MenuItem::with_id(app,"proxy-status","本地代理 · 正在检测",false,None::<&str>)?;
-                let show_item=MenuItem::with_id(app,"show","打开仪表盘",true,None::<&str>)?;
-                let settings_item=MenuItem::with_id(app,"settings","设置",true,None::<&str>)?;
-                let logs_item=MenuItem::with_id(app,"logs","运行日志",true,None::<&str>)?;
-                let launch_item=MenuItem::with_id(app,"launch","打开 ChatGPT",true,None::<&str>)?;
-                let cli_item=MenuItem::with_id(app,"launch-cli","打开 Codex CLI",true,None::<&str>)?;
-                let refresh_item=MenuItem::with_id(app,"refresh","重新检测",true,None::<&str>)?;
-                let toggle_item=MenuItem::with_id(app,"toggle","暂停守护",true,None::<&str>)?;
-                let quit_item=MenuItem::with_id(app,"quit","退出 CodexProxyTray",true,None::<&str>)?;
-                let separator1=PredefinedMenuItem::separator(app)?;let separator2=PredefinedMenuItem::separator(app)?;let separator3=PredefinedMenuItem::separator(app)?;
-                let menu=Menu::with_items(app,&[&status_item,&proxy_item,&separator1,&show_item,&logs_item,&settings_item,&separator2,&launch_item,&cli_item,&refresh_item,&toggle_item,&separator3,&quit_item])?;
-                TrayIconBuilder::with_id("main-tray").icon(tray_image()).tooltip("CodexProxyTray").menu(&menu).show_menu_on_left_click(false)
-                    .on_menu_event(|app,event|{match event.id().as_ref(){"show"=>show_page(app,"dashboard"),"settings"=>show_page(app,"settings"),"logs"=>show_page(app,"logs"),"launch"=>{let(tx,_)=std::sync::mpsc::channel();let _=app.state::<Controller>().tx.send(Message::Launch(tx));},"launch-cli"=>{let(tx,_)=std::sync::mpsc::channel();let _=app.state::<Controller>().tx.send(Message::LaunchCli(tx));},"refresh"=>{let(tx,_)=std::sync::mpsc::channel();let _=app.state::<Controller>().tx.send(Message::Refresh(tx));},"toggle"=>{let state=app.state::<Controller>();let _=state.tx.send(Message::Enabled(!state.snapshot().enabled,None));},"quit"=>app.exit(0),_=>{}}})
-                    .on_tray_icon_event(|tray,event|{if let TrayIconEvent::Click{button:MouseButton::Left,button_state:MouseButtonState::Up,..}=event{show_page(tray.app_handle(),"dashboard")}}).build(app)?;
+                TrayIconBuilder::with_id("main-tray").icon(tray_image()).tooltip("CodexProxyTray").show_menu_on_left_click(false)
+                    .on_tray_icon_event(|tray,event|{if let TrayIconEvent::Click{button,button_state:MouseButtonState::Up,position,..}=event{match button{MouseButton::Left=>show_page(tray.app_handle(),"dashboard"),MouseButton::Right=>toggle_tray(tray.app_handle(),position),_=>{}}}}).build(app)?;
                 let handle=app.handle().clone();
                 app.manage(Controller::new(move|status|{
                     let label=if !status.enabled{"守护已暂停"}else if status.error.is_some(){"守护需要检查"}else if !status.proxy_reachable{"等待本地代理"}else if status.guard_ready||status.cli_ready{"守护已就绪"}else{"等待应用接入"};
-                    let title=format!("CodexProxyTray · {label}");let proxy=format!("代理：{} · {}",status.proxy_url,if status.proxy_reachable{"可连接"}else{"未连接"});let toggle=if status.enabled{"暂停守护"}else{"启用守护"};let can_launch=status.package_count>0;let can_cli=status.cli_ready;
-                    let (status_item,proxy_item,toggle_item,launch_item,cli_item,app)=(status_item.clone(),proxy_item.clone(),toggle_item.clone(),launch_item.clone(),cli_item.clone(),handle.clone());
-                    let _=handle.run_on_main_thread(move||{let _=status_item.set_text(&title);let _=proxy_item.set_text(&proxy);let _=toggle_item.set_text(toggle);let _=launch_item.set_enabled(can_launch);let _=cli_item.set_enabled(can_cli);if let Some(tray)=app.tray_by_id("main-tray"){let _=tray.set_tooltip(Some(&title));}});
+                    let title=format!("CodexProxyTray · {label}");let app=handle.clone();
+                    let _=handle.run_on_main_thread(move||{if let Some(tray)=app.tray_by_id("main-tray"){let _=tray.set_tooltip(Some(&title));}});
                 }));
                 if refreshing {let(tx,_)=std::sync::mpsc::channel();let _=app.state::<Controller>().tx.send(Message::Refresh(tx));}
                 if let Some(window)=app.get_webview_window("main"){if let Ok(hwnd)=window.hwnd(){crate::native::set_window_icons(hwnd.0 as *mut std::ffi::c_void);}}
                 Ok(())
             })
-            .on_window_event(|window,event|{match event{tauri::WindowEvent::CloseRequested{api,..}=>{api.prevent_close();let _=window.hide();},tauri::WindowEvent::ScaleFactorChanged{..}=>{if let Ok(hwnd)=window.hwnd(){crate::native::set_window_icons(hwnd.0 as *mut std::ffi::c_void);}if let Some(tray)=window.app_handle().tray_by_id("main-tray"){let _=tray.set_icon(Some(tray_image()));}},_=>{}}})
+            .on_window_event(|window,event|{match event{tauri::WindowEvent::Focused(false)if window.label()=="tray"=>{let _=window.hide();},tauri::WindowEvent::CloseRequested{api,..}=>{api.prevent_close();let _=window.hide();},tauri::WindowEvent::ScaleFactorChanged{..}if window.label()=="main"=>{if let Ok(hwnd)=window.hwnd(){crate::native::set_window_icons(hwnd.0 as *mut std::ffi::c_void);}if let Some(tray)=window.app_handle().tray_by_id("main-tray"){let _=tray.set_icon(Some(tray_image()));}},_=>{}}})
             .build(tauri::generate_context!()).expect("CodexProxyTray 启动失败");
         app.run(|handle,event|{if let tauri::RunEvent::Exit=event{if let Some(state)=handle.try_state::<Controller>(){state.stop();}}});
     }

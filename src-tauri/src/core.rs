@@ -78,6 +78,10 @@ pub fn count_tcp_rows(bytes:&[u8], row_size:usize, state_offset:usize, pid_offse
     Some(established)
 }
 pub fn valid_log_position(id:u64,at:u64)->bool { id>0&&id<=9_007_199_254_740_991&&at<=8_640_000_000_000_000 }
+pub fn popup_bounds(point:(i32,i32),area:(i32,i32,u32,u32),requested:(u32,u32),padding:i32)->(i32,i32,u32,u32){
+    let padding=padding.max(0).min((area.2.min(area.3)/4)as i32);let width=requested.0.min(area.2.saturating_sub(2*padding as u32));let height=requested.1.min(area.3.saturating_sub(2*padding as u32));
+    let x=point.0.saturating_sub(width as i32).clamp(area.0+padding,area.0+area.2 as i32-width as i32-padding);let y=point.1.saturating_sub(height as i32).saturating_sub(padding).clamp(area.1+padding,area.1+area.3 as i32-height as i32-padding);(x,y,width,height)
+}
 pub fn network_trace(text:&str)->(Option<String>,Option<String>){
     let mut ip=None;let mut country=None;
     for line in text.lines(){if let Some(value)=line.strip_prefix("ip="){if let Ok(address)=value.trim().parse::<IpAddr>(){ip=Some(address.to_string());}}if let Some(value)=line.strip_prefix("loc="){let value=value.trim();if value.len()==2&&value.bytes().all(|b|b.is_ascii_uppercase()){country=Some(value.into());}}}
@@ -114,5 +118,9 @@ mod tests {
         assert_eq!(descendant_pids(&[(2,1),(3,2),(4,99),(1,3)],&[1]),vec![1,2,3]);
     }
     #[test] fn history_rejects_overflowing_ids_and_unrenderable_dates(){assert!(valid_log_position(1,0));assert!(!valid_log_position(u64::MAX,1));assert!(!valid_log_position(1,u64::MAX));}
+    #[test] fn popup_stays_inside_work_area_on_negative_and_small_monitors(){
+        assert_eq!(popup_bounds((-10,1040),(-1920,0,1920,1040),(400,580),10),(-410,450,400,580));
+        assert_eq!(popup_bounds((0,0),(0,40,240,260),(320,464),8),(8,48,224,244));
+    }
     #[test] fn connectivity_trace_accepts_only_ip_and_country_metadata(){assert_eq!(network_trace("fl=ignored\nip=203.0.113.4\nloc=JP\n"),(Some("203.0.113.4".into()),Some("JP".into())));assert_eq!(network_trace("ip=<script>\nloc=long-value"),(None,None));}
 }
