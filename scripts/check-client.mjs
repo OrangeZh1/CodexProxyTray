@@ -20,7 +20,7 @@ for(const view of ['main','tray'])for(const theme of ['light','dark']){
     window.console.error=(...args)=>errors.push(args.map(String).join(' '));
     window.addEventListener('error',event=>errors.push(String(event.error||event.message)));
     let focusChanged,hideCount=0,refreshResolve;
-    const appWindow={label:view,hide:async()=>{hideCount++;},setTheme:async()=>{},setBackgroundColor:async()=>{},isMaximized:async()=>false,onResized:async()=>()=>{},onFocusChanged:async callback=>{focusChanged=callback;return()=>{};}};
+    const appWindow={label:view,hide:async()=>{hideCount++;},setTheme:async()=>{},setBackgroundColor:async()=>{throw Error('Do not repaint the native background after mounting.');},isMaximized:async()=>false,onResized:async()=>()=>{},onFocusChanged:async callback=>{focusChanged=callback;return()=>{};}};
     window.__TAURI__={core:{invoke:async(command)=>{commands.push(command);if(command==='frontend_ready'){if(view==='tray')focusChanged?.({payload:true});return null;}if(command==='get_status')return structuredClone(sample);if(command==='refresh_status')return new Promise(resolve=>{refreshResolve=resolve;});throw Error(`Unexpected startup command: ${command}`);}},window:{getCurrentWindow:()=>appWindow},event:{listen:async()=>()=>{}}};
     window.eval(boot);window.eval(code);
     for(let i=0;i<150&&!errors.length&&(!commands.includes('frontend_ready')||!(view==='tray'?window.document.querySelector('.tray-header')?.textContent.includes('守护已就绪'):window.document.querySelector('.sidebar-footer')?.textContent.includes('后台运行中')));i++)await delay(20);
@@ -33,6 +33,7 @@ for(const view of ['main','tray'])for(const theme of ['light','dark']){
       assert.match(window.document.querySelector('#root').textContent,/网页可达/);
     }else{
       assert.equal(window.document.querySelectorAll('[role="menuitem"]').length,8);
+      assert.equal(window.document.activeElement?.getAttribute('role'),'menu');
       const refresh=window.document.querySelector('#tray-refresh'),toggle=window.document.querySelector('#tray-toggle');
       refresh.click();await delay(50);
       assert.equal(refresh.getAttribute('aria-busy'),'true');assert.equal(toggle.getAttribute('aria-busy'),'false');assert.equal(hideCount,0);

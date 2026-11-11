@@ -24,6 +24,8 @@ try{
         if([DateTime]::UtcNow -ge $deadline){throw 'Real main/tray frontend readiness timed out.'}
         Start-Sleep -Milliseconds 200
     }
+    Start-Sleep -Seconds 3
+    if($process.HasExited -or (Test-Path -LiteralPath (Join-Path $root 'ui-error.json'))){throw 'The frontend failed after receiving backend state.'}
     $quitter=Start-Owned '--quit';try{if(-not $quitter.WaitForExit(10000) -or $quitter.ExitCode -ne 0){throw 'Quit request failed.'}}finally{$quitter.Dispose()}
     if(-not $process.WaitForExit(15000) -or $process.ExitCode -ne 0){throw 'Desktop did not exit cleanly.'}
     $report.status='passed'
