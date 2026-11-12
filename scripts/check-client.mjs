@@ -5,6 +5,16 @@ import {setTimeout as delay} from 'node:timers/promises';
 import {transform} from 'esbuild';
 import {Window} from 'happy-dom';
 import {logDate} from '../ui/logs.mjs';
+import {spawnSync} from 'node:child_process';
+import {fileURLToPath} from 'node:url';
+
+const cases=['main/light','main/dark','tray/light','tray/dark'],clientCase=process.env.CODEX_PROXY_CLIENT_CHECK_CASE;
+if(!clientCase){
+  // Each application startup owns its DOM, focus manager and animation clock.
+  for(const value of cases){const child=spawnSync(process.execPath,[fileURLToPath(import.meta.url)],{env:{...process.env,CODEX_PROXY_CLIENT_CHECK_CASE:value},stdio:'inherit',windowsHide:true});if(child.error)throw child.error;if(child.status!==0)process.exit(child.status||1);}
+  process.exit(0);
+}
+assert.ok(cases.includes(clientCase),'Unknown client startup scenario');
 
 const script=await readFile(new URL('../dist/app.js',import.meta.url),'utf8');
 const {code}=await transform(script,{format:'iife',target:'chrome109'});
@@ -27,6 +37,7 @@ function usageSnapshot(args={},count=55){
   return {source_available:true,partial:false,scan_pending:false,start_ms,end_ms,updated_at:Date.now(),summary:tokenRow(count),models,providers:usageProviders(records),records,series:[{start_ms,end_ms,...tokenRow(count),models:structuredClone(models)}],files_scanned:2,duplicate_records:1,skipped_records:0,partial_tail_files:0,records_truncated:false,notes:['仅提取本机用量元数据，不保存或显示对话内容。']};
 }
 for(const view of ['main','tray'])for(const theme of ['light','dark']){
+  if(clientCase!==`${view}/${theme}`)continue;
   const window=new Window({url:'http://tauri.localhost/',settings:{enableJavaScriptEvaluation:true,disableJavaScriptFileLoading:true,disableCSSFileLoading:true,suppressInsecureJavaScriptEnvironmentWarning:true}});
   const errors=[],commands=[],invocations=[],plans=new Map(),usageTimers=new Map(),rowAnimations=[];
   // Do not stringify a whole DOM tree when an identity assertion fails.
