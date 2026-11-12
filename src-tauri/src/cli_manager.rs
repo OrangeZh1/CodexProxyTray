@@ -90,6 +90,9 @@ fn new_install_target()->Result<Install,String>{
     if !settings::detect_cli(&settings::root()).is_empty(){return Err("已有 Codex CLI，未创建重复安装。".into())}
     let prefix=PathBuf::from(std::env::var_os("APPDATA").filter(|v|!v.is_empty()).ok_or("无法确定当前用户目录。")?).join("npm");
     let paths=std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).collect::<Vec<_>>();let node=paths.into_iter().map(|p|p.join("node.exe")).find(|p|p.is_file()).ok_or("请先安装带 npm 的 Node.js，再安装 Codex CLI。")?;
+    inspect_new_target(node,prefix)
+}
+fn inspect_new_target(node:PathBuf,prefix:PathBuf)->Result<Install,String>{
     let directory=node.parent().ok_or("Node.js 路径无效。")?;let npm=directory.join("node_modules/npm/bin/npm-cli.js");let package=directory.join("node_modules/npm/package.json");let(metadata,bytes)=package_metadata(&package,"npm")?;
     if metadata["bin"]["npm"].as_str()!=Some("bin/npm-cli.js")||!regular_tree(&npm,directory){return Err("无法验证与 Node.js 配套的 npm，请检查 Node.js 安装。".into())}
     for name in ["codex","codex.cmd","codex.ps1","node_modules/@openai/codex"]{if prefix.join(name).exists(){return Err("npm 目录仍有 CLI 安装材料，请先检查原安装，未覆盖它。".into())}}
@@ -248,6 +251,11 @@ pub fn install(target_token:String)->Result<CliState,String>{
         fs::write(&command[1],b"changed entry").unwrap();assert_ne!(first.token,inspect_install(&command,&prefix).unwrap().token);
         fs::write(prefix.join("node_modules/.modules.yaml"),b"pnpm").unwrap();assert!(inspect_install(&command,&prefix).is_err());fs::remove_file(prefix.join("node_modules/.modules.yaml")).unwrap();
         fs::write(prefix.join("node_modules/@openai/codex/package.json"),br#"{"name":"other","version":"1.0.0","bin":{"codex":"bin/codex.js"}}"#).unwrap();assert!(inspect_install(&command,&prefix).is_err());fs::remove_dir_all(root).unwrap();}
+    #[test]fn first_install_requires_absent_cli_and_verified_npm_without_overwriting_partial_installs(){
+        let root=sandbox();let(command,prefix)=fixture(&root);let node=PathBuf::from(&command[0]);assert!(inspect_new_target(node.clone(),prefix.clone()).is_err());
+        fs::remove_file(prefix.join("codex.cmd")).unwrap();fs::remove_dir_all(prefix.join("node_modules/@openai/codex")).unwrap();let target=inspect_new_target(node.clone(),prefix.clone()).unwrap();assert!(!target.token.is_empty());assert!(!target.package.exists());
+        fs::write(prefix.join("codex.ps1"),b"unknown partial entry").unwrap();assert!(inspect_new_target(node,prefix.clone()).is_err());assert_eq!(fs::read(prefix.join("codex.ps1")).unwrap(),b"unknown partial entry");fs::remove_dir_all(root).unwrap();
+    }
     #[test]fn npm_arguments_are_pinned_scoped_and_do_not_remove_configuration(){let root=sandbox();let(command,prefix)=fixture(&root);let install=inspect_install(&command,&prefix).unwrap();let update=mutation_args(&install,Mutation::Update,Some("0.168.0"),&root).unwrap();
         assert_eq!(&update[1..3],&["install","@openai/codex@0.168.0"]);assert!(update.windows(2).any(|args|args==["--prefix",prefix.to_str().unwrap()]));assert!(update.contains(&"--global".into()));assert!(update.contains(&"--ignore-scripts".into()));assert!(update.contains(&REGISTRY.into()));
         let first=mutation_args(&install,Mutation::Install,Some("0.168.0"),&root).unwrap();assert_eq!(&first[1..3],&["install","@openai/codex@0.168.0"]);assert!(mutation_args(&install,Mutation::Update,Some("latest && erase"),&root).is_err());let uninstall=mutation_args(&install,Mutation::Uninstall,None,&root).unwrap();assert_eq!(&uninstall[1..3],&["uninstall",PACKAGE]);assert!(!uninstall.iter().any(|arg|arg.contains(".codex")||arg.contains("ChatGPT")));fs::remove_dir_all(root).unwrap();}
