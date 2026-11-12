@@ -52,7 +52,7 @@ try {
     # A validly hashed synthetic package whose executable exits without readiness
     # exercises the actual rollback; no production-only test bypass is added.
     $bad=Case 'rollback';$cases+=$bad;$fake=Join-Path $bad.directory 'fake';[void](New-Item -ItemType Directory -Path $fake);[IO.Compression.ZipFile]::ExtractToDirectory($zip,$fake)
-    $code=Join-Path $bad.directory 'NoReadiness.cs';[IO.File]::WriteAllText($code,('[assembly:System.Reflection.AssemblyFileVersion("'+$manifest.version+'.0")][assembly:System.Reflection.AssemblyInformationalVersion("'+$manifest.version+'")]class Program{static void Main(){}}'))
+    $code=Join-Path $bad.directory 'NoReadiness.cs';[IO.File]::WriteAllText($code,('[assembly:System.Reflection.AssemblyFileVersion("'+$manifest.version+'.0")][assembly:System.Reflection.AssemblyInformationalVersion("'+$manifest.version+'")]class Program{static void Main(){System.IO.File.Delete(System.IO.Path.Combine(System.Environment.GetEnvironmentVariable("LOCALAPPDATA"),"CodexProxyTray","config.json"));}}'))
     & (Join-Path $env:SystemRoot 'Microsoft.NET\Framework64\v4.0.30319\csc.exe') /nologo /target:winexe ("/out:"+(Join-Path $fake 'CodexProxyTray.exe')) $code
     if($LASTEXITCODE -ne 0){throw 'Synthetic executable did not compile'}
     $receiptPath=Join-Path $fake 'package-receipt.json';$receipt=Get-Content -LiteralPath $receiptPath -Raw|ConvertFrom-Json;foreach($file in $receipt.files){$file.sha256=Hash (Join-Path $fake $file.name)};WriteJson $receiptPath $receipt
@@ -63,6 +63,7 @@ try {
     Require ($installer.WaitForExit(60000) -and $installer.ExitCode -ne 0) 'unready_candidate_does_not_report_success'
     $result=Get-Content -LiteralPath (Join-Path $job 'result.json') -Raw|ConvertFrom-Json;Require ($result.phase -eq 'rolled_back') 'normal_failure_restores_previous_code'
     Require ((Hash $bad.exe) -eq (Hash (Join-Path $good.target 'CodexProxyTray.exe'))) 'rollback_restores_exact_original_binary'
+    Require ((Hash (Join-Path $bad.data 'config.json')) -eq (Hash (Join-Path $job 'config.json'))) 'rollback_restores_missing_configuration_exactly'
     Copy-Item -LiteralPath (Join-Path $job 'result.json') -Destination (Join-Path $EvidenceDirectory 'rollback-result.json');StopCase $bad
     $traversal=Case 'traversal';$cases+=$traversal;$hostile=Join-Path $traversal.directory 'traversal.zip';Copy-Item -LiteralPath $zip -Destination $hostile;$archive=[IO.Compression.ZipFile]::Open($hostile,[IO.Compression.ZipArchiveMode]::Update);try{$entry=$archive.CreateEntry('../escape.txt');$writer=[IO.StreamWriter]::new($entry.Open());try{$writer.Write('must not escape')}finally{$writer.Dispose()}}finally{$archive.Dispose()};$job=Job $traversal $hostile;$check=Installer $traversal 'Prepare';Require ($check.WaitForExit(45000) -and $check.ExitCode -ne 0 -and -not (Test-Path -LiteralPath (Join-Path $traversal.directory 'app\escape.txt')) -and -not $traversal.parent.HasExited) 'zip_traversal_rejected_without_replacing_original';StopCase $traversal
     $report.status='passed'
