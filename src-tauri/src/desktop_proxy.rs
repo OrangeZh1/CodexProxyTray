@@ -34,7 +34,7 @@ impl SelectedEnvironment{
         }
         self.previous_zero=false;
         if !self.separator{
-            if unit==b'='as u16{self.separator=true;self.key=String::from_utf16(&self.name).ok().and_then(|name|KEYS.iter().copied().find(|key|name.eq_ignore_ascii_case(key)));self.name.clear();}
+            if unit==b'=' as u16{self.separator=true;self.key=String::from_utf16(&self.name).ok().and_then(|name|KEYS.iter().copied().find(|key|name.eq_ignore_ascii_case(key)));self.name.clear();}
             else if self.name.len()<64{self.name.push(unit)}else{self.name.clear();self.separator=true;}
         }else if self.key.is_some(){if self.value.len()>=4096{return Err("目标代理变量长度超出检查范围。".into())}self.value.push(unit);}
         Ok(false)

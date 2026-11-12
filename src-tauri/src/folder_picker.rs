@@ -20,7 +20,7 @@ fn show(initial:Option<String>,owner:usize)->Result<Option<String>,String>{unsaf
     if let Some(path)=hint(initial){if let Ok(folder)=SHCreateItemFromParsingName::<_,_,IShellItem>(PCWSTR(path.as_ptr()),None){let _=dialog.SetFolder(&folder);}}
     if cancelled(dialog.Show(Some(owner)))?{return Ok(None)}
     let selected=dialog.GetResult().map_err(|value|error("无法取得所选文件夹",value))?;let raw=selected.GetDisplayName(SIGDN_FILESYSPATH).map_err(|value|error("无法取得所选文件夹路径",value))?;
-    let path=raw.to_string();CoTaskMemFree(Some(raw.0.cast()));let path=path.map_err(|value|error("所选文件夹路径无法识别",value))?;
+    let path=raw.to_string();CoTaskMemFree(Some(raw.0.cast()));let path=path.map_err(|value|error("所选文件夹路径无法识别",value.into()))?;
     if hint(Some(path.clone())).is_none(){return Err("所选项目没有有效的文件系统路径。".into())}Ok(Some(path))
 }}
 pub fn choose(initial:Option<String>,owner:usize)->Result<Option<String>,String>{
