@@ -71,7 +71,7 @@ pub fn prepare(expected:String)->Result<Prepared,String>{
     if !version(&expected)||!crate::core::newer_version(&expected,env!("CARGO_PKG_VERSION")){return Err("请先检查并选择可用的新版本。".into())}
     let checked=crate::update::snapshot();if checked.status!="available"||checked.latest.as_deref()!=Some(&expected){return Err("更新信息已变化，请重新检查。".into())}
     let lease=begin(&expected,"download")?;
-    let result=(||{
+    let result:Result<PathBuf,String>=(||{
         let root=settings::root();let config=settings::load(&root).map_err(|_|"无法读取现有配置，未下载更新。")?;let client=client(&config)?;
         let job=root.join("updates").join(format!("{}-{}",std::process::id(),settings::now()));fs::create_dir_all(job.parent().unwrap()).and_then(|_|fs::create_dir(&job)).map_err(|_|"无法创建更新工作目录。")?;
         fs::write(job.join("installer.ps1"),format!("\u{feff}{SCRIPT}")).map_err(|_|"无法准备安装程序。")?;
