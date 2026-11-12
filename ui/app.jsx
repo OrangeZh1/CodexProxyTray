@@ -147,7 +147,7 @@ export function App({initialStatus=null,initialPage=globalThis.__QA_NAV__?.page|
   const [logTab,setLogTab]=useState('events');
   const [logFilter,setLogFilter]=useState('all'),[logPeriod,setLogPeriod]=useState('all'),[customStart,setCustomStart]=useState(''),[customEnd,setCustomEnd]=useState(''),[logQuery,setLogQuery]=useState(''),reads=useRef(0),layoutReported=useRef(false);
   const busy=name=>actions.current.has(name);
-  const writable=!!invoke&&online&&status?.backend_ready&&!status?.read_only&&!status?.app_update?.busy;
+  const writable=!!invoke&&online&&status?.backend_ready&&!status?.read_only&&!(status?.app_update?.busy&&status.app_update.operation==='install');
   const observed=online&&!!status&&status.revision>0;
   const updateOutcomeSeen=useRef(null);
   useEffect(()=>{const result=status?.app_update;if(!result?.completed_at||result.completed_at<status.started_at||result.completed_at===updateOutcomeSeen.current)return;if(!['installed','rolled_back','installed_cleanup_pending','error'].includes(result.phase))return;updateOutcomeSeen.current=result.completed_at;setNotice({text:result.phase==='installed'?`助手已更新至 ${result.version}。`:result.error||'助手更新未完成，请查看更新设置。',intent:result.phase==='installed'?'success':'error'});},[status?.app_update?.completed_at,status?.started_at]);

@@ -9,8 +9,8 @@ const SCRIPT:&str=include_str!("install_update.ps1");
 const MAX_ZIP:u64=128*1024*1024;
 #[derive(Clone,Default,Serialize,Deserialize)]#[serde(default)]
 pub struct Progress{pub started_at:u64,pub completed_at:u64,pub operation:String,pub busy:bool,pub phase:String,pub version:Option<String>,pub downloaded:u64,pub total:Option<u64>,pub error:Option<String>}
-#[derive(Default)]struct Gate{updating:bool,management:u32}
-static GATE:Mutex<Gate>=Mutex::new(Gate{updating:false,management:0});
+#[derive(Default)]struct Gate{updating:bool,downloading:bool,management:u32}
+static GATE:Mutex<Gate>=Mutex::new(Gate{updating:false,downloading:false,management:0});
 static VIEW:OnceLock<Mutex<Progress>>=OnceLock::new();
 static READY:OnceLock<Mutex<Option<Prepared>>>=OnceLock::new();
 #[derive(Serialize,Deserialize)]struct ReadyReceipt{schema:u32,job:String,version:String}
@@ -29,10 +29,11 @@ pub fn snapshot()->Progress{
 }
 
 pub fn busy()->bool{GATE.lock().unwrap_or_else(|e|e.into_inner()).updating}
-pub struct Lease{update:bool}
-impl Drop for Lease{fn drop(&mut self){let mut gate=GATE.lock().unwrap_or_else(|e|e.into_inner());if self.update{gate.updating=false;view().lock().unwrap_or_else(|e|e.into_inner()).busy=false;}else{gate.management=gate.management.saturating_sub(1);}}}
-pub fn management()->Result<Lease,String>{let mut gate=GATE.lock().map_err(|_|"操作状态暂不可用。")?;if gate.updating{return Err("助手正在准备更新，请等待完成。".into())}gate.management+=1;Ok(Lease{update:false})}
-fn begin(version:&str,operation:&str)->Result<Lease,String>{let mut gate=GATE.lock().map_err(|_|"操作状态暂不可用。")?;if gate.updating||gate.management!=0{return Err("另一项管理操作仍在进行，请稍后更新助手。".into())}gate.updating=true;*view().lock().unwrap_or_else(|e|e.into_inner())=Progress{started_at:settings::now(),operation:operation.into(),busy:true,phase:if operation=="download"{"downloading"}else{"verifying"}.into(),version:Some(version.into()),..Progress::default()};Ok(Lease{update:true})}
+enum LeaseKind{Management,Download,Install}
+pub struct Lease{kind:LeaseKind}
+impl Drop for Lease{fn drop(&mut self){let mut gate=GATE.lock().unwrap_or_else(|e|e.into_inner());match self.kind{LeaseKind::Management=>gate.management=gate.management.saturating_sub(1),LeaseKind::Download=>{gate.downloading=false;view().lock().unwrap_or_else(|e|e.into_inner()).busy=false;},LeaseKind::Install=>{gate.updating=false;view().lock().unwrap_or_else(|e|e.into_inner()).busy=false;}}}}
+pub fn management()->Result<Lease,String>{let mut gate=GATE.lock().map_err(|_|"操作状态暂不可用。")?;if gate.updating{return Err("助手正在交接安装，请等待重启完成。".into())}gate.management+=1;Ok(Lease{kind:LeaseKind::Management})}
+fn begin(version:&str,operation:&str)->Result<Lease,String>{let mut gate=GATE.lock().map_err(|_|"操作状态暂不可用。")?;if gate.updating||gate.downloading||operation=="install"&&gate.management!=0{return Err("另一项管理操作仍在进行，请稍后更新助手。".into())}let kind=if operation=="download"{gate.downloading=true;LeaseKind::Download}else{gate.updating=true;LeaseKind::Install};*view().lock().unwrap_or_else(|e|e.into_inner())=Progress{started_at:settings::now(),operation:operation.into(),busy:true,phase:if operation=="download"{"downloading"}else{"verifying"}.into(),version:Some(version.into()),..Progress::default()};Ok(Lease{kind})}
 fn phase(value:&str){view().lock().unwrap_or_else(|e|e.into_inner()).phase=value.into();}
 fn version(value:&str)->bool{!value.starts_with('v')&&crate::core::version_parts(value).is_some()}
 fn checksum(text:&str,name:&str)->Result<String,String>{
@@ -45,11 +46,12 @@ fn client(config:&settings::Config)->Result<reqwest::blocking::Client,String>{
         .redirect(reqwest::redirect::Policy::custom(|attempt|{let url=attempt.url();if attempt.previous().len()<5&&url.scheme()=="https"&&matches!(url.host_str(),Some("github.com"|"release-assets.githubusercontent.com")){attempt.follow()}else{attempt.error("Unexpected update redirect")}})).build().map_err(|_|"更新下载暂不可用。".into())
 }
 fn download(client:&reqwest::blocking::Client,url:&str,path:&Path,limit:u64,report:bool)->Result<(),String>{
+    if !settings::load(&settings::root()).is_ok_and(|config|config.network_enabled){return Err("联网检测已关闭，更新下载已停止。".into())}
     let mut response=client.get(url).send().map_err(|_|"无法连接 GitHub，请检查本地代理。")?.error_for_status().map_err(|_|"官方更新附件暂不可用，请稍后重试。")?;
     if response.content_length().is_some_and(|n|n>limit){return Err("更新附件超过允许大小。".into())}
     let mut file=fs::OpenOptions::new().write(true).create_new(true).open(path).map_err(|_|"无法创建下载文件。")?;
     if report{view().lock().unwrap_or_else(|e|e.into_inner()).total=response.content_length();}
-    let mut bytes=0u64;let mut buffer=[0u8;65536];loop{let n=response.read(&mut buffer).map_err(|_|"更新下载中断，尚未替换程序。")?;if n==0{break}bytes+=n as u64;if bytes>limit{return Err("更新附件超过允许大小。".into())}file.write_all(&buffer[..n]).map_err(|_|"更新下载无法写入磁盘。")?;if report{view().lock().unwrap_or_else(|e|e.into_inner()).downloaded=bytes;}}
+    let mut checked=Instant::now();let mut bytes=0u64;let mut buffer=[0u8;65536];loop{if checked.elapsed()>=Duration::from_millis(250){if !settings::load(&settings::root()).is_ok_and(|config|config.network_enabled){return Err("联网检测已关闭，更新下载已取消。".into())}checked=Instant::now();}let n=response.read(&mut buffer).map_err(|_|"更新下载中断，尚未替换程序。")?;if n==0{break}bytes+=n as u64;if bytes>limit{return Err("更新附件超过允许大小。".into())}file.write_all(&buffer[..n]).map_err(|_|"更新下载无法写入磁盘。")?;if report{view().lock().unwrap_or_else(|e|e.into_inner()).downloaded=bytes;}}
     if response.content_length().is_some_and(|n|n!=bytes){return Err("更新附件下载不完整。".into())}file.sync_all().map_err(|_|"更新附件未能完整保存。".into())
 }
 fn powershell()->PathBuf{PathBuf::from(std::env::var_os("SystemRoot").unwrap_or_else(||"C:\\Windows".into())).join("System32/WindowsPowerShell/v1.0/powershell.exe")}
