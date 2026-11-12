@@ -199,11 +199,11 @@ namespace CodexProxyTray {
 $ErrorActionPreference='Stop'
 [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false)
 $command=Get-Command codex -ErrorAction Stop | Select-Object -First 1
-$info=& codex --proxy-info | ConvertFrom-Json
+$info=& $env:CODEX_PROXY_CHECK_SHIM --proxy-info | ConvertFrom-Json
 if($LASTEXITCODE -ne 0){throw 'CLI proxy-info failed'}
-$version=(& codex --version | Out-String).Trim()
+$version=(& $env:CODEX_PROXY_CHECK_SHIM --version | Out-String).Trim()
 if($LASTEXITCODE -ne 0 -or -not $version){throw 'CLI version failed'}
-[ordered]@{resolved_path=$command.Source;command_type=[string]$command.CommandType;guard_active=[bool]$info.guard_active;proxy_url=$info.proxy_url;cli_version=$version}|ConvertTo-Json -Compress
+[ordered]@{resolved_path=$command.Source;command_type=[string]$command.CommandType;guard_active=[bool]$info.guard_active;proxy_url=$info.proxy_url;target=$info.target;cli_version=$version}|ConvertTo-Json -Compress
 '@
     $fresh = [CodexProxyTray.NativeCheckEnvironment]::Read()
     $start = New-Object Diagnostics.ProcessStartInfo
@@ -215,6 +215,7 @@ if($LASTEXITCODE -ne 0 -or -not $version){throw 'CLI version failed'}
     $start.StandardErrorEncoding=[Text.UTF8Encoding]::new($false)
     $start.EnvironmentVariables.Clear()
     foreach ($key in $fresh.Keys) { $start.EnvironmentVariables[$key] = $fresh[$key] }
+    $start.EnvironmentVariables['CODEX_PROXY_CHECK_SHIM']=Join-Path $runtime 'cli\codex-proxy-cli.exe'
     $child = New-Object Diagnostics.Process
     $childStarted=$false
     try {
@@ -227,8 +228,11 @@ if($LASTEXITCODE -ne 0 -or -not $version){throw 'CLI version failed'}
         if ($child.ExitCode -ne 0) { throw ('Fresh-environment CLI check failed: ' + $errorOutput) }
         $cli = $output | ConvertFrom-Json
     } finally { try {if ($childStarted -and -not $child.HasExited) { Stop-CheckProcess $child }} finally {$child.Dispose()} }
-    $expectedShim = [IO.Path]::GetFullPath((Join-Path $runtime 'cli\codex.exe'))
-    if ($cli.command_type -ne 'Application' -or -not [string]::Equals([IO.Path]::GetFullPath($cli.resolved_path), $expectedShim, [StringComparison]::OrdinalIgnoreCase)) { throw 'A new user environment does not resolve codex to the installed shim.' }
+    $expectedShim=[IO.Path]::GetFullPath((Join-Path $runtime 'cli\codex-proxy-cli.exe'))
+    $allowed=@([string]$cli.target[0])
+    if(@($cli.target).Count -eq 2 -and [IO.Path]::GetFileName([string]$cli.target[0]) -ieq 'node.exe'){$prefix=[string]$cli.target[1];for($index=0;$index -lt 5;$index++){$prefix=[IO.Path]::GetDirectoryName($prefix)};$allowed=@('codex.cmd','codex.ps1','codex.exe','codex'|ForEach-Object {Join-Path $prefix $_})}
+    if($cli.command_type -notin @('Application','ExternalScript') -or -not @($allowed|Where-Object {[string]::Equals([IO.Path]::GetFullPath($_),[IO.Path]::GetFullPath($cli.resolved_path),[StringComparison]::OrdinalIgnoreCase)}).Count){throw 'The user codex command does not resolve to the original installation.'}
+    if([IO.Path]::GetFullPath($cli.resolved_path).StartsWith($runtime+'\',[StringComparison]::OrdinalIgnoreCase)){throw 'The internal proxy entry must not shadow the official user codex command.'}
     if (-not $cli.guard_active -or $cli.proxy_url -ne $status.proxy_url) { throw 'The CLI resolved from the new user environment is not guarded.' }
     $report.fresh_user_environment_cli_resolution = [ordered]@{ resolved_path = $cli.resolved_path; guard_active = $cli.guard_active; cli_version = $cli.cli_version }
     $after = Helper-Status

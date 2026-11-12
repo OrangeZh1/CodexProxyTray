@@ -225,7 +225,7 @@ Windows 原生检查先在助手未启动时捕获代理环境基线，再启动
 .\tests\Start-Independent.ps1 -CheckScript .\tests\Test-Native.ps1 -EvidenceDirectory "$env:TEMP\CodexProxyTray-native-new-run" -BaselinePath "$env:TEMP\CodexProxyTray-proxy-baseline.json"
 ```
 
-基线和证据路径每次使用新名称，脚本拒绝覆盖旧记录。只保存代理变量指纹，不导出完整环境或凭据。检查包括连续两次包内启动、普通子进程环境隔离，以及通过 `CreateEnvironmentBlock` 获取新用户环境，确认 `Get-Command codex` 解析到专用入口并实际执行版本命令。旧终端的 PATH 不会被这些检查修改。
+基线和证据路径每次使用新名称，脚本拒绝覆盖旧记录。只保存代理变量指纹，不导出完整环境或凭据。检查包括连续两次包内启动、普通子进程环境隔离，以及通过 `CreateEnvironmentBlock` 获取新用户环境，确认 `Get-Command codex` 保留官方安装入口，同时通过助手内部入口核验代理守护并实际执行版本命令。旧终端的 PATH 不会被这些检查修改。
 
 原生脚本必须运行在独立桌面环境，避免 MSIX 宿主的 AppData 虚拟化导致读到旧状态；细节见 [Windows 原生检查](tests/native-checks.md)。托盘、窗口关闭后常驻、真实交互与退出恢复分别验证。SSR 检查不能替代视觉或真实点击验收，脚本也不会关闭当前 ChatGPT。
 

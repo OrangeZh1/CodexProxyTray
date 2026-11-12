@@ -193,7 +193,7 @@ try {
   assert.equal(denied.dataset.theme,'dark');
   checks++;
 
-  assert.match(html,/<main\b[^>]*class="main-scroll"[^>]*>\s*<div\b[^>]*class="main-content"/);
+  assert.match(html,/<main\b[^>]*class="main-scroll"[^>]*>\s*<div\b[^>]*class="main-content(?: [^"]*)?"/);
   assert.match(render('logs',sample),/id="log-level-choice"/);assert.match(render('logs',sample),/id="log-period-choice"/);assert.match(render('logs',sample),/aria-label="日志筛选"/);
   assert.doesNotMatch(render('logs',sample),/id="log-start-date"|id="log-end-date"|aria-labelledby="log-filter-/);
   assert.equal((html.match(/\bid="toggle"/g)||[]).length,1);
