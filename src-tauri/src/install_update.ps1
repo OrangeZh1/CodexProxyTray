@@ -83,8 +83,8 @@ try {
     Durable (Join-Path $Job 'receipt-lifecycle.json') @{schema=1;state='superseded-after-durable-readiness';active_receipt=$activePath;active_receipt_sha256=Hash $activePath;historical_receipts=$active.historical_receipts;retained_rollback=$previous;retired_previous=@{path=$obsolete;files=$verified.old_previous;recovery_status='not-a-rollback-target'};protected_recovery_references=$verified.old_active.recovery_references}
     $journal.state='installed';$journal.obsolete=$null;$journal.candidate=$null;Durable $journalPath $journal
     if($movedPrevious){RemoveCode $obsolete $verified.old_previous}
+    foreach($name in @('package.zip','release-sums.txt','manifest.json')){$download=Join-Path $Job $name;if(Test-Path -LiteralPath $download){Plain $download;Remove-Item -LiteralPath $download}}
     Result 'installed' $null
-    foreach($name in @('package.zip','release-sums.txt','manifest.json')){Remove-Item -LiteralPath (Join-Path $Job $name)}
 } catch {
     $failure=$_.Exception.Message
     if($committed){$journal.state='cleanup-blocked';$journal.obsolete=if(Test-Path -LiteralPath $obsolete){$obsolete}else{$null};Durable $journalPath $journal;Result 'installed_cleanup_pending' ($failure+' 新版本运行正常，安装收尾未完成；恢复材料已保留。')}elseif($switched){
