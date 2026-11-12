@@ -135,6 +135,17 @@ jobs:
       - name: 整理并校验 GitHub 正式发行附件
         shell: pwsh
         run: ./scripts/package-release.ps1 -PackageDirectory "${{ github.workspace }}/package" -OutputDirectory "${{ github.workspace }}/release" -EvidenceDirectory "$env:RUNNER_TEMP/CodexProxyTray-release-evidence"
+      - name: 隔离验证助手安装更新与失败回退
+        shell: pwsh
+        run: ./tests/Test-AppUpdate.ps1 -ReleaseDirectory "${{ github.workspace }}/release" -EvidenceDirectory "$env:RUNNER_TEMP/CodexProxyTray-updater-evidence"
+      - name: 保存助手更新验收证据
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: updater-evidence
+          path: ${{ runner.temp }}/CodexProxyTray-updater-evidence/
+          if-no-files-found: ignore
+          retention-days: 7
       - name: 保存正式发行附件
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:

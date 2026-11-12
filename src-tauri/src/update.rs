@@ -3,8 +3,8 @@ use std::{fs,io::Read,sync::{Mutex,OnceLock,atomic::{AtomicBool,Ordering}},threa
 use crate::settings::{self,Config};
 
 pub const SOURCE:&str="https://github.com/OrangeZh1/CodexProxyTray";
-pub const RELEASES:&str="https://github.com/OrangeZh1/chatgpt-proxy-launcher/releases";
-const MANIFEST:&str="https://github.com/OrangeZh1/chatgpt-proxy-launcher/releases/latest/download/CodexProxyTray-update.json";
+pub const RELEASES:&str="https://github.com/OrangeZh1/CodexProxyTray/releases";
+const MANIFEST:&str="https://github.com/OrangeZh1/CodexProxyTray/releases/latest/download/CodexProxyTray-update.json";
 const VERSION:&str=env!("CARGO_PKG_VERSION");
 #[derive(Clone,Serialize)] pub struct Update {pub status:String,pub current:String,pub latest:Option<String>,pub url:String,pub notes:String,pub checked_at:u64}
 #[derive(Deserialize)] struct Manifest {schema:u32,product:String,version:String,notes:String}

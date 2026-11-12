@@ -30,9 +30,10 @@ impl Summary{fn add(&mut self,value:Tokens)->bool{if !self.tokens.add(value){ret
 #[derive(Clone,Copy,Debug,Default,Serialize)]pub struct Timing{pub duration_ms:Option<u64>,pub ttft_ms:Option<u64>,pub output_tokens_per_second:Option<f64>,pub timing_estimated:bool,pub timing_source:Option<&'static str>,pub http_status:Option<u16>}
 #[derive(Clone,Debug,Serialize)]pub struct UsageRecord{pub at:u64,pub model:String,pub provider:Option<String>,pub source_kind:String,#[serde(flatten)]pub tokens:Tokens,#[serde(flatten)]pub timing:Timing,pub estimated_cost_usd:Option<f64>,pub missing_price:bool}
 #[derive(Clone,Debug,Serialize)]pub struct ProviderUsage{pub provider:Option<String>,#[serde(flatten)]pub summary:Summary,pub models:Vec<ModelUsage>}
+#[derive(Clone,Debug,Default,Serialize)]pub struct ScanProgress{pub files_total:usize,pub files_complete:usize,pub bytes_total:u64,pub bytes_read:u64,pub total_known:bool}
 #[derive(Clone,Debug,Serialize)]pub struct UsageSnapshot{
     pub start_ms:u64,pub end_ms:u64,pub updated_at:u64,pub source_available:bool,pub scan_pending:bool,pub partial:bool,
-    pub files_scanned:usize,pub unreadable_files:usize,pub skipped_records:u64,pub duplicate_records:u64,pub partial_tail_files:usize,
+    pub files_scanned:usize,pub unreadable_files:usize,pub skipped_records:u64,pub duplicate_records:u64,pub partial_tail_files:usize,pub scan_progress:ScanProgress,
     pub summary:Summary,pub series:Vec<Bucket>,pub models:Vec<ModelUsage>,pub providers:Vec<ProviderUsage>,pub records:Vec<UsageRecord>,pub records_truncated:bool,
     pub request_count_kind:String,pub scope:String,pub notes:Vec<String>,
 }
@@ -248,7 +249,7 @@ fn aggregate(cache:&Cache,start_ms:u64,end_ms:u64,pending:bool,unreadable:usize,
     let mut notes=vec!["仅统计本机现存 Codex 会话中的用量元数据，不代表官方账单、真实付款或订阅剩余额度。".into(),"输入已包含缓存输入，输出已包含推理输出；合计只计算输入与输出。".into(),"记录数表示去重后的有效用量记录，不包含无用量记录的失败请求。".into(),"费用由界面结合公开参考价或本机自定义单价估算；缺少完整单价时保持未知。".into()];
     let history_limited=cache.evicted_through.is_some_and(|at|at>=start_ms);
     if pending{notes.push("正在增量扫描本机记录，当前结果尚未完整。".into());}if partial_tail_files>0{notes.push("部分会话尾部尚未写入完成，完成后将继续读取。".into());}if history_limited{notes.push(format!("仅保留最近 {MAX_EVENTS} 条用量元数据，更早记录未计入当前结果。"));}if cache.limited{notes.push("部分目录为链接、超出扫描范围，或记录使用了未支持的压缩格式。".into());}if model_limited||provider_limited{notes.push("模型或提供方种类超过显示范围，其余用量已合并展示。".into());}if skipped>0||unreadable>0{notes.push("存在损坏、无法读取或无法可靠归属的记录，已跳过。".into());}if !available{notes.push("未找到可读取的本机 Codex 会话记录。".into());}
-    UsageSnapshot{start_ms,end_ms,updated_at:crate::settings::now(),source_available:available,scan_pending:pending,partial:pending||partial_tail_files>0||history_limited||cache.limited||model_limited||provider_limited||skipped>0||unreadable>0,files_scanned:cache.files.values().filter(|file|file.opened).count(),unreadable_files:unreadable,skipped_records:skipped,duplicate_records:duplicate,partial_tail_files,summary,series,models,providers,records,records_truncated,request_count_kind:"deduplicated_usage_records".into(),scope:"existing_local_codex_session_metadata".into(),notes}
+    UsageSnapshot{start_ms,end_ms,updated_at:crate::settings::now(),source_available:available,scan_pending:pending,partial:pending||partial_tail_files>0||history_limited||cache.limited||model_limited||provider_limited||skipped>0||unreadable>0,files_scanned:cache.files.values().filter(|file|file.opened).count(),unreadable_files:unreadable,skipped_records:skipped,duplicate_records:duplicate,partial_tail_files,scan_progress:ScanProgress::default(),summary,series,models,providers,records,records_truncated,request_count_kind:"deduplicated_usage_records".into(),scope:"existing_local_codex_session_metadata".into(),notes}
 }
 fn read_at(root:&Path,start_ms:u64,end_ms:u64,cache:&mut Cache)->Result<UsageSnapshot,String>{
     read_at_bounded(root,start_ms,end_ms,cache,MAX_EVENTS)
@@ -262,15 +263,16 @@ fn retain_recent(cache:&mut Cache,limit:usize){
 }
 fn read_at_bounded(root:&Path,start_ms:u64,end_ms:u64,cache:&mut Cache,event_limit:usize)->Result<UsageSnapshot,String>{
     if end_ms<=start_ms||end_ms>8_640_000_000_000_000{return Err("用量统计时间范围无效。".into())}
-    let floor=start_ms;if cache.root!=root||start_ms<cache.floor{*cache=Cache{root:root.to_path_buf(),floor,..Cache::default()};}else if floor>cache.floor{
-        cache.floor=floor;
-        for file in cache.files.values_mut(){let mut baseline=file.baseline.take();file.events.retain(|event|{if event.at<floor{if baseline.as_ref().is_none_or(|previous|previous.at<=event.at){baseline=Some(event.clone());}false}else{true}});file.baseline=baseline;}
-    }
+    let floor=start_ms;if cache.root!=root||start_ms<cache.floor{*cache=Cache{root:root.to_path_buf(),floor,..Cache::default()};}
+    // Keep the broadest loaded scope when narrowing dates; expanding beyond it
+    // resets once above, while 30d -> 7d -> 24h reuses parsed metadata.
     let(files,mut unreadable,limited)=list_files(root)?;let available=!files.is_empty();cache.limited=limited;let active=files.iter().map(|(path,_)|path.clone()).collect::<HashSet<_>>();cache.files.retain(|path,_|active.contains(path));
     let mut budget=READ_BUDGET;let mut pending=false;let mut count=cache.files.values().map(|file|file.events.len()).sum::<usize>();
     // At most one bounded batch beyond the retained limit exists during a scan.
-    for(path,metadata)in files{let file=cache.files.entry(path.clone()).or_default();let previous=file.events.len();if budget==0{pending|=file.offset<metadata.len()&&!file.waiting;continue}match scan_file(&path,&metadata,file,cache.floor,&mut budget,event_limit.clamp(1,4096)){Ok(more)=>pending|=more,Err(())=>unreadable+=1}count=count.saturating_sub(previous)+file.events.len();if count>event_limit{retain_recent(cache,event_limit);count=event_limit;}}
-    Ok(aggregate(cache,start_ms,end_ms,pending,unreadable,available))
+    for(path,metadata)in &files{let file=cache.files.entry(path.clone()).or_default();let previous=file.events.len();if budget==0{pending|=file.offset<metadata.len()&&!file.waiting;continue}match scan_file(path,metadata,file,cache.floor,&mut budget,event_limit.clamp(1,4096)){Ok(more)=>pending|=more,Err(())=>unreadable+=1}count=count.saturating_sub(previous)+file.events.len();if count>event_limit{retain_recent(cache,event_limit);count=event_limit;}}
+    let mut progress=ScanProgress{files_total:files.len(),total_known:!limited&&unreadable==0,..ScanProgress::default()};
+    for(path,metadata)in &files{progress.bytes_total=progress.bytes_total.saturating_add(metadata.len());if let Some(file)=cache.files.get(path){progress.bytes_read=progress.bytes_read.saturating_add(file.offset.min(metadata.len()));if file.opened&&file.offset>=metadata.len(){progress.files_complete+=1;}}}
+    let mut snapshot=aggregate(cache,start_ms,end_ms,pending,unreadable,available);snapshot.scan_progress=progress;Ok(snapshot)
 }
 /// Call through spawn_blocking. All caches are in-memory metadata and file cursors.
 pub fn read(start_ms:u64,end_ms:u64)->Result<UsageSnapshot,String>{let root=local_home()?;let mut cache=CACHE.get_or_init(||Mutex::new(Cache::default())).lock().map_err(|_|"用量统计缓存暂不可用。")?;read_at(&root,start_ms,end_ms,&mut cache)}
@@ -355,6 +357,14 @@ fn timestamp(value:&str)->Option<u64>{
         let mut fork=FileCache::default();add(&mut fork,serde_json::json!({"timestamp":"2026-11-12T01:00:00Z","type":"session_meta","payload":{"id":"child-timing","forked_from_id":"parent","timestamp":"2026-11-12T01:00:00Z"}}));
         add(&mut fork,serde_json::json!({"timestamp":"2026-11-12T00:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"copied-turn"}}));assert!(fork.timing.turn.is_none(),"Copied history must not seed the child's timer");
         add(&mut fork,serde_json::json!({"timestamp":"2026-11-12T01:00:01Z","type":"token_usage_record","payload":{"thread_id":"child-timing","turn_id":"copied-turn","response_id":"fresh","usage":{"input_tokens":10,"cached_input_tokens":0,"output_tokens":2}}}));assert!(fork.events.last().unwrap().timing.duration_ms.is_none());
+    }
+    #[test]fn narrower_dates_keep_the_broad_cache_and_report_real_scan_progress(){
+        let root=std::env::temp_dir().join(format!("codex-usage-date-cache-{}-{}",std::process::id(),crate::settings::now()));fs::create_dir_all(root.join("sessions")).unwrap();let path=root.join("sessions/a.jsonl");
+        fs::write(&path,format!("{}\n{}\n{}\n",meta("range-cache"),token("2026-11-11T23:30:00Z",100,20,10,Some((100,20,10))),token("2026-11-12T01:00:00Z",150,30,15,Some((50,10,5))))).unwrap();
+        let(start,end)=range();let mut cache=Cache::default();let broad=read_at(&root,start-DAY,end,&mut cache).unwrap();let bytes=broad.scan_progress.bytes_read;
+        assert_eq!(broad.summary.request_count,2);assert_eq!(broad.scan_progress.files_complete,1);assert_eq!(bytes,broad.scan_progress.bytes_total);
+        let narrow=read_at(&root,start,end,&mut cache).unwrap();assert_eq!(narrow.summary.request_count,1);assert_eq!(cache.floor,start-DAY);assert_eq!(cache.files[&path].events.len(),2);assert_eq!(narrow.scan_progress.bytes_read,bytes);
+        assert_eq!(read_at(&root,start-DAY,end,&mut cache).unwrap().summary.request_count,2);assert!(!narrow.scan_pending);fs::remove_dir_all(root).unwrap();
     }
     #[test]fn incremental_reader_handles_partial_tail_truncation_and_oversized_content(){use std::io::Write;let root=std::env::temp_dir().join(format!("codex-usage-fixture-{}-{}",std::process::id(),std::time::SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));fs::create_dir_all(root.join("sessions")).unwrap();let path=root.join("sessions/a.jsonl");let mut file=File::create(&path).unwrap();writeln!(file,"{}",meta("reader")).unwrap();writeln!(file,"{{\"type\":\"response_item\",\"payload\":{{\"content\":\"{}\"}}}}","x".repeat(MAX_LINE*2)).unwrap();let usage=serde_json::to_vec(&token("2026-11-12T01:00:00Z",100,80,10,Some((100,80,10)))).unwrap();file.write_all(&usage[..usage.len()/2]).unwrap();file.flush().unwrap();let(start,end)=range();let mut cache=Cache::default();let first=read_at(&root,start,end,&mut cache).unwrap();assert_eq!(first.summary.request_count,0);assert_eq!(first.partial_tail_files,1);assert!(first.partial);assert!(first.notes.iter().any(|note|note.contains("尚未写入完成")));file.write_all(&usage[usage.len()/2..]).unwrap();file.write_all(b"\n").unwrap();file.flush().unwrap();let second=read_at(&root,start,end,&mut cache).unwrap();assert_eq!(second.summary.tokens.total_tokens,110);assert_eq!(second.skipped_records,0);assert!(!second.partial);assert_eq!(read_at(&root,start,end,&mut cache).unwrap().summary.request_count,1);drop(file);fs::write(&path,format!("{}\n{}\n",meta("reader"),token("2026-11-12T02:00:00Z",20,10,2,Some((20,10,2))))).unwrap();assert_eq!(read_at(&root,start,end,&mut cache).unwrap().summary.tokens.total_tokens,22);assert!(root.starts_with(std::env::temp_dir()));fs::remove_dir_all(root).unwrap();}
 }

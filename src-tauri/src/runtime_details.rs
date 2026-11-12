@@ -6,7 +6,7 @@ use crate::{native,settings,traffic::{OwnedHandle,open_identity},traffic_core::P
 
 const ROW_LIMIT:usize=200;
 const MAX_TABLE_BYTES:u32=16*1024*1024;
-#[derive(Serialize)]pub struct ConnectionRow{pub pid:u32,pub process_label:String,pub local:String,pub remote:String,pub state:&'static str}
+#[derive(Serialize)]pub struct ConnectionRow{pub pid:u32,pub process_created:String,pub process_label:String,pub local:String,pub remote:String,pub state:&'static str}
 #[derive(Serialize)]pub struct ConnectionSnapshot{
     pub sampled_at:u64,pub read_started_at:u64,pub rows:Vec<ConnectionRow>,pub target_count:usize,
     pub matched_total:usize,pub row_limit:usize,pub truncated:bool,pub scope_note:&'static str,
@@ -65,7 +65,7 @@ fn parse_tcp(bytes:&[u8],ipv6:bool,targets:&BTreeMap<u32,String>,rows:&mut Vec<C
             let address=|offset,scope_offset,port_offset|{let ip=Ipv6Addr::from(<[u8;16]>::try_from(&row[offset..offset+16]).unwrap());let scope=u32::from_be_bytes(row[scope_offset..scope_offset+4].try_into().unwrap());SocketAddrV6::new(ip,port(row,port_offset),0,scope).to_string()};
             (address(0,16,20),address(24,40,44))
         }else{(format!("{}:{}",Ipv4Addr::from(<[u8;4]>::try_from(&row[4..8]).unwrap()),port(row,8)),format!("{}:{}",Ipv4Addr::from(<[u8;4]>::try_from(&row[12..16]).unwrap()),port(row,16)))};
-        rows.push(ConnectionRow{pid,process_label:process_label.clone(),local,remote,state:"established"});
+        rows.push(ConnectionRow{pid,process_created:String::new(),process_label:process_label.clone(),local,remote,state:"established"});
     }Ok(matched)
 }
 pub fn connections()->Result<ConnectionSnapshot,String>{
@@ -76,7 +76,8 @@ pub fn connections()->Result<ConnectionSnapshot,String>{
     // Holding the process handles also prevents the old process object disappearing.
     let verified=before.iter().filter(|process|unchanged(process)).map(|process|(process.identity.pid,label(&process.image))).collect::<BTreeMap<_,_>>();
     let mut rows=vec![];let matched_total=parse_tcp(&ipv4,false,&verified,&mut rows)?+parse_tcp(&ipv6,true,&verified,&mut rows)?;
-    Ok(ConnectionSnapshot{sampled_at:settings::now(),read_started_at,target_count:verified.len(),truncated:matched_total>rows.len(),rows,matched_total,row_limit:ROW_LIMIT,scope_note:"仅显示已验证的 ChatGPT / Codex CLI 目标进程当前已建立的 TCP 连接；不包含 UDP、DNS 域名、规则或历史连接。地址只按需显示，不写入日志或保存。"})
+    for row in &mut rows{if let Some(process)=before.iter().find(|process|process.identity.pid==row.pid){row.process_created=process.identity.created_filetime.to_string();}}
+    Ok(ConnectionSnapshot{sampled_at:settings::now(),read_started_at,target_count:verified.len(),truncated:matched_total>rows.len(),rows,matched_total,row_limit:ROW_LIMIT,scope_note:"仅显示已验证的 ChatGPT / Codex CLI 目标进程当前已建立的 TCP 连接；不包含 UDP、DNS 域名、规则或历史连接。实时详情本身不持久保存；只有开启连接历史后才由独立的本机记录器保存。"})
 }
 struct ProcessRow{pid:u32,parent:u32,webview:bool}
 fn process_rows()->Result<Vec<ProcessRow>,String>{unsafe{

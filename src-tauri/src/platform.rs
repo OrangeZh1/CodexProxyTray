@@ -23,12 +23,11 @@ fn reg_write(key:&str,name:&str,value:Option<&str>,kind:u32)->Result<(),String>{
 fn autostart_command(exe:&Path)->String{format!("\"{}\" --background",exe.display())}
 pub fn autostart()->bool{std::env::current_exe().ok().and_then(|exe|reg_read(RUN,"CodexProxyTray").ok().flatten().map(|(value,_)|value.eq_ignore_ascii_case(&autostart_command(&exe)))).unwrap_or(false)}
 pub fn set_autostart(enabled:bool,exe:&Path)->Result<(),String>{let command=enabled.then(||autostart_command(exe));reg_write(RUN,"CodexProxyTray",command.as_deref(),1)}
-pub fn install_cli_path(dir:&Path)->Result<bool,String>{
+pub fn remove_legacy_cli_path(dir:&Path)->Result<bool,String>{
     let (original,kind)=reg_read("Environment","Path")?.unwrap_or((String::new(),2));let directory=dir.to_string_lossy();
-    if original.split(';').any(|p|p.trim_end_matches('\\').eq_ignore_ascii_case(directory.trim_end_matches('\\'))){return Ok(false)}
-    let updated=if original.is_empty(){directory.into_owned()}else{format!("{directory};{original}")};reg_write("Environment","Path",Some(&updated),kind)?;
-    // A broadcast can wait once per desktop window. Do not stall package guarding or IPC.
-    std::thread::spawn(||unsafe{let env=wide("Environment");let mut result=0;SendMessageTimeoutW(0xffffusize as Handle,0x001A,0,env.as_ptr() as isize,2,1000,&mut result);});Ok(true)
+    let updated=original.split(';').filter(|entry|!entry.trim().trim_matches('"').trim_end_matches('\\').eq_ignore_ascii_case(directory.trim_end_matches('\\'))).collect::<Vec<_>>().join(";");
+    if updated==original{return Ok(false)}reg_write("Environment","Path",Some(&updated),kind)?;
+    std::thread::spawn(||unsafe{let env=wide("Environment");let mut result=0;SendMessageTimeoutW(0xffffusize as Handle,0x001A,0,env.as_ptr()as isize,2,1000,&mut result);});Ok(true)
 }
 pub fn wait_for_console_child(){
     // This handler belongs only to the shim; unlike the ignore flag it is not inherited.

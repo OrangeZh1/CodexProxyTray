@@ -35,7 +35,7 @@ impl Price{fn valid(&self)->bool{[self.input,self.cached,self.output].iter().all
 #[derive(Clone,Debug,Default,Serialize,Deserialize)]pub struct CatalogPrice{pub name:String,pub input:Option<f64>,pub cached:Option<f64>,pub output:Option<f64>,pub status:Option<String>}
 impl CatalogPrice{fn valid(&self)->bool{!self.name.is_empty()&&self.name.len()<=160&&!self.name.chars().any(char::is_control)&&self.status.as_ref().is_none_or(|value|value.len()<=32&&!value.chars().any(char::is_control))&&[self.input,self.cached,self.output].iter().flatten().all(|value|value.is_finite()&&*value>=0.0)}}
 #[derive(Clone,Debug,Serialize)]pub struct Snapshot{
-    pub source:String,pub fetched_at:Option<u64>,pub models:BTreeMap<String,Price>,pub catalog:BTreeMap<String,CatalogPrice>,pub error:Option<String>,pub stale:bool,pub network_enabled:bool,pub auto_sync_enabled:bool,pub next_retry_at:Option<u64>,
+    pub source:String,pub fetched_at:Option<u64>,pub models:BTreeMap<String,Price>,pub catalog:BTreeMap<String,CatalogPrice>,pub error:Option<String>,pub stale:bool,pub network_enabled:bool,pub auto_sync_enabled:bool,pub next_retry_at:Option<u64>,pub throttled:bool,
 }
 #[derive(Serialize,Deserialize)]struct Saved{schema:u8,source:String,fetched_at:u64,models:BTreeMap<String,Price>,#[serde(default)]catalog:BTreeMap<String,CatalogPrice>}
 #[derive(Default)]struct Cache{loaded:bool,fetched_at:Option<u64>,models:BTreeMap<String,Price>,catalog:BTreeMap<String,CatalogPrice>,last_attempt:Option<u64>,last_completed:Option<u64>,error:Option<String>,writable:bool}
@@ -95,9 +95,12 @@ fn fetch(config:&crate::settings::Config)->Result<ReferenceData,String>{
 fn view(cache:&Cache,network_enabled:bool,force:bool,throttled:Option<u64>)->Snapshot{
     let now=crate::settings::now();let preferences=sync_preferences().lock().unwrap_or_else(|error|error.into_inner());
     let stale=cache.catalog.is_empty()||cache.fetched_at.is_none_or(|at|now<at||now-at>=TTL);
-    let next_retry_at=if !network_enabled||!preferences.enabled&&!force{None}else{throttled.or_else(||cache.error.as_ref().and_then(|_|if force{cache.last_completed.map(|at|at.saturating_add(FORCE_INTERVAL))}else{cache.last_attempt.map(|at|at.saturating_add(RETRY_INTERVAL))}).filter(|at|*at>now))};
-    let error=preferences.error.clone().or_else(||if !network_enabled{Some("联网已关闭，价格同步已暂停。".into())}else if throttled.is_some(){Some("价格同步操作过于频繁，请稍后重试。".into())}else{cache.error.clone()});
-    Snapshot{source:SOURCE.into(),fetched_at:cache.fetched_at,models:cache.models.clone(),catalog:cache.catalog.clone(),error,stale,network_enabled,auto_sync_enabled:preferences.enabled,next_retry_at}
+    // This is the manual action's cooldown, including after an automatic fetch.
+    // Reusing a valid catalog during the cooldown is not a synchronization error.
+    let _=force;
+    let next_retry_at=network_enabled.then(||throttled.or_else(||cache.last_completed.or(cache.last_attempt).map(|at|at.saturating_add(FORCE_INTERVAL)))).flatten().filter(|at|*at>now);
+    let error=preferences.error.clone().or_else(||if !network_enabled{Some("联网已关闭，价格同步已暂停。".into())}else{cache.error.clone()});
+    Snapshot{source:SOURCE.into(),fetched_at:cache.fetched_at,models:cache.models.clone(),catalog:cache.catalog.clone(),error,stale,network_enabled,auto_sync_enabled:preferences.enabled,next_retry_at,throttled:throttled.is_some()}
 }
 /// Call via spawn_blocking. Failures preserve the last successful public catalog.
 pub fn read(force:bool)->Result<Snapshot,String>{

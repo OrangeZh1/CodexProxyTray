@@ -95,7 +95,7 @@ pub fn command_available(command:&[String],root:&Path)->bool{
 }
 pub fn normalized_executable(path:&Path)->String{path.canonicalize().unwrap_or_else(|_|path.to_path_buf()).to_string_lossy().replace('/',"\\").trim_start_matches("\\\\?\\").to_lowercase()}
 pub fn cli_process_paths(root:&Path,config:&Config)->Vec<String>{
-    let mut paths=vec![root.join("cli/codex.exe")];
+    let mut paths=vec![root.join("cli/codex-proxy-cli.exe"),root.join("cli/codex.exe")];
     if let Some(program)=config.cli_command.first().map(PathBuf::from){
         if program.file_name().is_some_and(|name|name.to_string_lossy().eq_ignore_ascii_case("codex.exe")){paths.push(program);}
         else if program.file_name().is_some_and(|name|name.to_string_lossy().eq_ignore_ascii_case("node.exe")){

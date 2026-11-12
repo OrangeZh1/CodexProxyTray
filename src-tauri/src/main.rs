@@ -15,6 +15,8 @@ mod core;
 #[cfg(windows)] mod platform;
 #[cfg(windows)] mod worker;
 #[cfg(windows)] mod update;
+#[cfg(windows)] mod app_update;
+#[cfg(windows)] mod flow_log;
 #[cfg(windows)] mod launch;
 #[cfg(windows)] mod connectivity;
 #[cfg(windows)] mod traffic_core;
@@ -42,13 +44,14 @@ mod core;
     #[tauri::command]fn frontend_ready(rendered:Option<bool>,geometry:Option<serde_json::Value>,app:tauri::AppHandle,window:tauri::WebviewWindow,state:State<'_,UiStartup>)->Option<String>{if window.label()=="tray"{if let Some(height)=geometry.as_ref().and_then(|value|value.get("tray_height")).and_then(serde_json::Value::as_u64){state.tray_height.store(height.clamp(200,600)as u32,Ordering::Release);position_tray(&app);}}let _=crate::settings::write_json(&crate::settings::root().join(format!("ui-ready-{}.json",window.label())),&serde_json::json!({"at":crate::settings::now(),"window":window.label(),"rendered":rendered.unwrap_or(false),"helper_pid":std::process::id(),"geometry":geometry.filter(|value|value.to_string().len()<=32768)}));if window.label()=="tray"{state.tray_ready.store(true,Ordering::Release);if state.tray_requested.load(Ordering::Acquire){show_tray(&app)}return None}let mut pending=state.page.lock().unwrap_or_else(|e|e.into_inner());if !state.ready.swap(true,Ordering::AcqRel){if state.show_requested.load(Ordering::Acquire){show(&app);}return pending.take()}None}
     #[tauri::command]fn navigate_main(page:String,app:tauri::AppHandle)->Result<(),String>{if !matches!(page.as_str(),"dashboard"|"proxy"|"logs"|"settings"){return Err("未知页面。".into())}if let Some(window)=app.get_webview_window("tray"){let _=window.hide();}show_page(&app,&page);Ok(())}
     fn request_quit(app:&tauri::AppHandle)->Result<(),String>{
+        if crate::app_update::busy(){return Err("助手正在交接更新，请等待重启完成。".into())}
         if crate::cli_manager::is_mutating(){return Err("Codex CLI 正在更新或卸载，请等待操作完成后退出助手。".into())}
         if crate::desktop_lifecycle::in_progress(){return Err("ChatGPT 关闭或重启操作仍在进行，请等待完成后退出助手。".into())}
         app.exit(0);Ok(())
     }
     #[tauri::command]fn quit_helper(app:tauri::AppHandle)->Result<(),String>{request_quit(&app)}
     async fn request(state:State<'_,Controller>,make:impl FnOnce(std::sync::mpsc::Sender<Result<Status,String>>)->Message+Send+'static)->Result<Status,String>{request_to(state.tx.clone(),make).await}
-    async fn request_to(tx:std::sync::mpsc::Sender<Message>,make:impl FnOnce(std::sync::mpsc::Sender<Result<Status,String>>)->Message+Send+'static)->Result<Status,String>{tauri::async_runtime::spawn_blocking(move||{let(reply,rx)=std::sync::mpsc::channel();tx.send(make(reply)).map_err(|_|"后台已退出".to_owned())?;rx.recv_timeout(std::time::Duration::from_secs(8)).map_err(|_|"操作仍在处理中，请查看当前状态。".to_owned())?}).await.map_err(|e|e.to_string())?}
+    async fn request_to(tx:std::sync::mpsc::Sender<Message>,make:impl FnOnce(std::sync::mpsc::Sender<Result<Status,String>>)->Message+Send+'static)->Result<Status,String>{let _lease=crate::app_update::management()?;tauri::async_runtime::spawn_blocking(move||{let(reply,rx)=std::sync::mpsc::channel();tx.send(make(reply)).map_err(|_|"后台已退出".to_owned())?;rx.recv_timeout(std::time::Duration::from_secs(8)).map_err(|_|"操作仍在处理中，请查看当前状态。".to_owned())?}).await.map_err(|e|e.to_string())?}
     #[tauri::command] async fn set_enabled(enabled:bool,state:State<'_,Controller>)->Result<Status,String>{request(state,move|r|Message::Enabled(enabled,Some(r))).await}
     #[tauri::command] async fn save_proxy(proxy_url:String,state:State<'_,Controller>)->Result<Status,String>{request(state,move|r|Message::Proxy(proxy_url,r)).await}
     #[tauri::command] async fn save_system(autostart:Option<bool>,launch_target:Option<crate::settings::LaunchTarget>,cli_workdir:Option<String>,network_enabled:Option<bool>,auto_check_updates:Option<bool>,update_interval_hours:Option<u32>,connectivity_enabled:Option<bool>,state:State<'_,Controller>)->Result<Status,String>{request(state,move|r|Message::System(Preferences{autostart,launch_target,cli_workdir,network_enabled,auto_check_updates,update_interval_hours,connectivity_enabled},r)).await}
@@ -65,6 +68,7 @@ mod core;
         crate::event_log::read_state(&state.tx,crate::event_log::ReadState::DesktopTarget,result.is_err(),"ChatGPT","ChatGPT 目标核验未完成","ChatGPT 目标核验已恢复");result
     }
     #[tauri::command]async fn manage_desktop(target:crate::desktop_lifecycle::Target,restart:bool,state:State<'_,Controller>)->Result<crate::desktop_lifecycle::Outcome,String>{
+        let _lease=crate::app_update::management()?;
         let _=crate::event_log::note(&state.tx,"info","ChatGPT",if restart{"收到 ChatGPT 正常重启请求"}else{"收到 ChatGPT 正常关闭请求"},"");
         let result=tauri::async_runtime::spawn_blocking(move||crate::desktop_lifecycle::perform(target,restart)).await.unwrap_or_else(|_|Err("ChatGPT 操作未能完成，请查看当前状态；助手未强制结束应用。".into()));
         let _=crate::event_log::note(&state.tx,if result.is_ok(){"info"}else{"warning"},"ChatGPT",if result.is_err(){"ChatGPT 正常关闭或重启未完成"}else if restart{"已请求重新打开 ChatGPT"}else{"目标 ChatGPT 已正常退出"},"助手使用正常关闭请求；未强制结束进程。");result
@@ -101,11 +105,22 @@ mod core;
         let result=tauri::async_runtime::spawn_blocking(crate::exchange_rate::read).await.unwrap_or_else(|_|Err("参考汇率查询暂不可用。".into()));
         if !result.as_ref().is_ok_and(|view|!view.network_enabled){crate::event_log::read_state(&state.tx,crate::event_log::ReadState::Exchange,result.as_ref().map_or(true,|view|view.error.is_some()||view.rate.is_none()),"汇率","USD/CNY 参考汇率自动获取未完成","USD/CNY 参考汇率当前可读取");}result
     }
+    #[tauri::command]async fn install_app_update(expected_version:String,window:tauri::WebviewWindow,app:tauri::AppHandle)->Result<(),String>{
+        if window.label()!="main"{return Err("请从主窗口更新助手。".into())}
+        let result=tauri::async_runtime::spawn_blocking(move||crate::app_update::prepare(expected_version)?.handoff()).await.map_err(|_|"助手更新未能完成。".to_owned())??;
+        std::mem::forget(result);app.exit(0);Ok(())
+    }
+    #[tauri::command]async fn install_cli(target_token:String,state:State<'_,Controller>)->Result<crate::cli_manager::CliState,String>{
+        let result=tauri::async_runtime::spawn_blocking(move||crate::cli_manager::install(target_token)).await.unwrap_or_else(|_|Err("CLI 安装未能完成，请查看当前状态。".into()));log_cli_result(&state.tx,&result,"Codex CLI 安装已完成");result
+    }
+    #[tauri::command]async fn get_flow_logs()->Result<crate::flow_log::Snapshot,String>{tauri::async_runtime::spawn_blocking(||Ok(crate::flow_log::snapshot())).await.map_err(|_|"连接日志读取失败。".to_owned())?}
+    #[tauri::command]async fn set_flow_logging(enabled:bool)->Result<crate::flow_log::Snapshot,String>{let _lease=crate::app_update::management()?;tauri::async_runtime::spawn_blocking(move||crate::flow_log::set_enabled(enabled)).await.map_err(|_|"连接日志设置未能保存。".to_owned())?}
     #[tauri::command] async fn check_updates()->Result<crate::update::Update,String>{tauri::async_runtime::spawn_blocking(crate::update::check).await.map_err(|_|"更新检查暂不可用。".to_owned())?}
     #[tauri::command] async fn check_connectivity(state:State<'_,Controller>)->Result<crate::connectivity::Connectivity,String>{let result=tauri::async_runtime::spawn_blocking(crate::connectivity::check).await.unwrap_or_else(|_|Err("连通检测暂不可用。".into()));crate::event_log::read_state(&state.tx,crate::event_log::ReadState::Connectivity,result.as_ref().map_or(true,|view|view.error.is_some()||matches!(view.status.as_str(),"blocked"|"error")),"连通","连通检测暂未取得可用结果","连通检测现可读取有效结果");result}
     #[tauri::command] async fn enable_traffic(state:State<'_,Controller>)->Result<Status,String>{request(state,|reply|Message::TrafficEnabled(true,reply)).await}
     #[tauri::command] async fn disable_traffic(state:State<'_,Controller>)->Result<Status,String>{request(state,|reply|Message::TrafficEnabled(false,reply)).await}
     async fn service_action(state:State<'_,Controller>,install:bool)->Result<crate::traffic_service::ServiceSnapshot,String>{
+        let _lease=crate::app_update::management()?;
         if SERVICE_OPERATION.swap(true,Ordering::AcqRel){return Err("另一个辅助服务操作仍在进行。".into())}let _operation=ServiceOperation;let tx=state.tx.clone();
         if let Err(error)=request_to(tx.clone(),Message::ServicePause).await{let _=request_to(tx.clone(),|reply|Message::ServiceFinished(false,reply)).await;return Err(error)}
         let mut result=tauri::async_runtime::spawn_blocking(move||if install{crate::traffic_service::install()}else{crate::traffic_service::uninstall()}).await.unwrap_or_else(|_|Err("辅助服务操作未能完成。".into()));
@@ -123,7 +138,7 @@ mod core;
         let refreshing=std::env::args().any(|s|s=="--refresh");
         let background=quitting||refreshing||std::env::args().any(|s|s=="--background");
         let app=tauri::Builder::default().manage(UiStartup{ready:AtomicBool::new(false),show_requested:AtomicBool::new(!background),page:std::sync::Mutex::new(None),tray_ready:AtomicBool::new(false),tray_requested:AtomicBool::new(false),tray_height:AtomicU32::new(380),tray_point:std::sync::Mutex::new(None)}).plugin(tauri_plugin_single_instance::init(|app,args,_|{if args.iter().any(|arg|arg=="--quit"){if let Err(error)=request_quit(app){let _=app.state::<Controller>().tx.send(Message::Notice("warning".into(),"生命周期".into(),"退出助手已暂缓".into(),error));}}else if args.iter().any(|arg|arg=="--refresh"){let(tx,_)=std::sync::mpsc::channel();let _=app.state::<Controller>().tx.send(Message::Refresh(tx));}else if !args.iter().any(|arg|arg=="--background"){show(app);}}))
-            .invoke_handler(tauri::generate_handler![get_status,report_ui_error,record_ui_event,frontend_ready,navigate_main,quit_helper,set_enabled,save_proxy,save_system,choose_cli_workdir,refresh_status,launch_codex,launch_cli,capture_desktop_target,manage_desktop,check_cli_updates,update_cli,uninstall_cli,get_runtime_connections,get_runtime_memory,get_usage,get_usage_prices,set_usage_price_sync,reload_usage_prices,open_usage_prices_dir,get_usage_exchange_rate,check_updates,check_connectivity,enable_traffic,disable_traffic,install_traffic_service,uninstall_traffic_service,open_release,open_source,open_logs])
+            .invoke_handler(tauri::generate_handler![get_status,report_ui_error,record_ui_event,frontend_ready,navigate_main,quit_helper,set_enabled,save_proxy,save_system,choose_cli_workdir,refresh_status,launch_codex,launch_cli,capture_desktop_target,manage_desktop,check_cli_updates,install_cli,update_cli,uninstall_cli,get_runtime_connections,get_runtime_memory,get_usage,get_usage_prices,set_usage_price_sync,reload_usage_prices,open_usage_prices_dir,get_usage_exchange_rate,check_updates,install_app_update,get_flow_logs,set_flow_logging,check_connectivity,enable_traffic,disable_traffic,install_traffic_service,uninstall_traffic_service,open_release,open_source,open_logs])
             .setup(move|app|{
                 if quitting {app.handle().exit(0);return Ok(());}
                 TrayIconBuilder::with_id("main-tray").icon(tray_image()).tooltip("CodexProxyTray").show_menu_on_left_click(false)

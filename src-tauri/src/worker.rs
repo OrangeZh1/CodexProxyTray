@@ -18,12 +18,12 @@ const LOG_LIMIT:usize=200;
     pub traffic:crate::traffic::TrafficSnapshot,
     pub traffic_history:Vec<TrafficSample>,
     pub desktop_operation:crate::desktop_lifecycle::OperationState,pub cli_management:crate::cli_manager::CliState,
-    pub update_notice:crate::update_notice::NoticeSnapshot,
+    pub update_notice:crate::update_notice::NoticeSnapshot,pub app_update:crate::app_update::Progress,
     pub desktop_proxy:crate::desktop_proxy::ProxyState,
     pub traffic_enabled:bool,pub traffic_service:crate::traffic_service::ServiceSnapshot,
 }
 impl Status {
-    fn new()->Self {Self{revision:0,enabled:true,guard_ready:false,proxy_url:core::DEFAULT_PROXY.into(),proxy_reachable:false,package_count:0,package_version:None,codex_running:false,restart_required:false,cli_detected:false,cli_ready:false,autostart:platform::autostart(),launch_desktop:false,backend_ready:true,error:None,logs:vec![],helper_pid:std::process::id(),updated_at:settings::now(),started_at:settings::now(),proxy_latency_ms:None,probe_history:vec![],desktop_pid:None,tcp_connections:None,helper_memory_bytes:None,log_storage_error:None,launch_target:LaunchTarget::None,cli_workdir:String::new(),network_enabled:true,auto_check_updates:false,update_interval_hours:6,update:crate::update::snapshot(),guard_uptime_ms:0,connectivity_enabled:true,connectivity:crate::connectivity::snapshot(),traffic:crate::traffic::TrafficSnapshot::disabled(),traffic_history:vec![],desktop_operation:crate::desktop_lifecycle::snapshot(),cli_management:crate::cli_manager::snapshot(),update_notice:crate::update_notice::snapshot(),desktop_proxy:crate::desktop_proxy::state(None,core::DEFAULT_PROXY,false),traffic_enabled:false,traffic_service:crate::traffic_service::snapshot()}}
+    fn new()->Self {Self{revision:0,enabled:true,guard_ready:false,proxy_url:core::DEFAULT_PROXY.into(),proxy_reachable:false,package_count:0,package_version:None,codex_running:false,restart_required:false,cli_detected:false,cli_ready:false,autostart:platform::autostart(),launch_desktop:false,backend_ready:true,error:None,logs:vec![],helper_pid:std::process::id(),updated_at:settings::now(),started_at:settings::now(),proxy_latency_ms:None,probe_history:vec![],desktop_pid:None,tcp_connections:None,helper_memory_bytes:None,log_storage_error:None,launch_target:LaunchTarget::None,cli_workdir:String::new(),network_enabled:true,auto_check_updates:false,update_interval_hours:6,update:crate::update::snapshot(),guard_uptime_ms:0,connectivity_enabled:true,connectivity:crate::connectivity::snapshot(),traffic:crate::traffic::TrafficSnapshot::disabled(),traffic_history:vec![],desktop_operation:crate::desktop_lifecycle::snapshot(),cli_management:crate::cli_manager::snapshot(),update_notice:crate::update_notice::snapshot(),app_update:crate::app_update::snapshot(),desktop_proxy:crate::desktop_proxy::state(None,core::DEFAULT_PROXY,false),traffic_enabled:false,traffic_service:crate::traffic_service::snapshot()}}
     fn sample_traffic(&mut self){
         use crate::traffic::TrafficState;
         let sample=&self.traffic;
@@ -63,7 +63,8 @@ impl Controller {
             let mut held=BTreeSet::<String>::new();let mut applied_url=String::new();let mut guard_started=Instant::now();
             status.log("info","生命周期","守护进程已启动",format!("版本 {} · PID {}\n程序：{}\n配置：{}",env!("CARGO_PKG_VERSION"),status.helper_pid,exe.display(),root.display()));
             status.log("info","配置","已读取启动配置",format!("代理：{}\n登录自动启动：{} · 启动目标：{}",config.proxy_url,yes(status.autostart),target_name(config.launch_target)));
-            let mut cli_error=None;let mut first=true;let mut auto_desktop_pending=config.launch_target.opens_desktop()&&config_error.is_none();let mut auto_cli_pending=config.launch_target.opens_cli()&&config_error.is_none();let mut cli_checked=Instant::now();let mut update_seen=status.update.checked_at;let mut traffic_applied=false;let mut service_paused=false;
+            if let Err(error)=platform::remove_legacy_cli_path(&root.join("cli")){status.log("warning","CLI","旧版命令入口的 PATH 项未能移除",error);}
+            let mut cli_error=None;let mut first=true;let restarting=std::env::args().any(|arg|arg=="--after-update");let mut auto_desktop_pending=!restarting&&config.launch_target.opens_desktop()&&config_error.is_none();let mut auto_cli_pending=!restarting&&config.launch_target.opens_cli()&&config_error.is_none();let mut cli_checked=Instant::now();let mut update_seen=status.update.checked_at;let mut traffic_applied=false;let mut service_paused=false;
             loop {
                 let(mut pending,mut result,mut stopping,mut guard_action,mut manual)=(None,Ok(()),false,false,None);let mut traffic_requested=false;
                 if !first {match rx.recv_timeout(Duration::from_secs(2)) {
@@ -76,11 +77,12 @@ impl Controller {
                     Ok(Message::System(patch,reply))=>{pending=Some(reply);if config_error.is_some(){result=Err("请先保存有效的代理设置。".into());}else{result=apply_preferences(&root,&exe,&mut config,&patch);if result.is_ok(){status.log("info","设置","偏好设置已保存",format!("登录自动启动：{}\n启动目标：{}\n更新联网：{} · 自动检查：{} · 间隔：{} 小时\nCLI 目录：{}",yes(platform::autostart()),target_name(config.launch_target),yes(config.network_enabled),yes(config.auto_check_updates),config.update_interval_hours,if config.cli_workdir.is_empty(){"用户目录"}else{"已配置"}));}}},
                     Ok(Message::Refresh(reply))=>{pending=Some(reply);manual=Some(Instant::now());status.log("info","检测","开始手动检测","检测本地代理、ChatGPT 安装包及进程、Windows Codex CLI 入口。");if crate::cli_manager::is_mutating(){result=Err("Codex CLI 正在更新或卸载，入口将在操作结束后自动检测。".into());}else if config_error.is_none(){match install_cli(&root,&exe,&mut config){Ok(ready)=>{status.cli_ready=ready;cli_error=None;},Err(e)=>{status.cli_ready=false;cli_error=Some(format!("CLI 接入失败：{e}"));result=Err(e);}}}else{result=Err("配置无法读取，请先保存有效的代理设置。".into());}status.cli_detected=!settings::detect_cli(&root).is_empty();},
                     Ok(Message::Launch(reply))=>{pending=Some(reply);result=native::open_desktop();if result.is_ok(){status.log("info","ChatGPT","已请求打开 ChatGPT",format!("目标应用包：{}\n代理守护：{}",core::FAMILY,yes(status.guard_ready)));}},
-                    Ok(Message::LaunchCli(reply))=>{pending=Some(reply);result=if crate::cli_manager::is_mutating(){Err("Codex CLI 正在更新或卸载，完成后再打开新 CLI。".into())}else{crate::launch::open_cli(&root,&config)};if result.is_ok(){status.log("info","CLI","已请求在终端打开 Codex CLI",format!("专用入口：{}\n工作目录：{}\n代理守护：{}",root.join("cli/codex.exe").display(),if config.cli_workdir.is_empty(){"用户目录"}else{"已配置"},yes(status.enabled&&status.cli_ready)));}},
+                    Ok(Message::LaunchCli(reply))=>{pending=Some(reply);result=if crate::cli_manager::is_mutating(){Err("Codex CLI 正在更新或卸载，完成后再打开新 CLI。".into())}else{crate::launch::open_cli(&root,&config)};if result.is_ok(){status.log("info","CLI","已请求在终端打开 Codex CLI",format!("专用入口：{}\n工作目录：{}\n代理守护：{}",root.join("cli/codex-proxy-cli.exe").display(),if config.cli_workdir.is_empty(){"用户目录"}else{"已配置"},yes(status.enabled&&status.cli_ready)));}},
                     Ok(Message::Stop)|Err(mpsc::RecvTimeoutError::Disconnected)=>stopping=true,
                     Err(mpsc::RecvTimeoutError::Timeout)=>{},
                 }}
                 if stopping {
+                    crate::flow_log::flush();
                     if let Ok(mut sampler)=sampler.lock(){if let Err(error)=sampler.disable(){status.log("warning","流量","流量采样仍在收尾",error);}status.traffic=sampler.snapshot();}
                     if let Ok(e)=&event {e.set(false);}
                     if let Ok(d)=&debug {for package in &held {if let Err(error)=d.disable(package){status.log("error","守护","释放应用包设置失败",format!("{package}\n{error}"));}}}
@@ -102,7 +104,7 @@ impl Controller {
                     if !detected {cli_error=None;}
                     if !detected&&status.cli_detected {status.cli_ready=false;status.log("warning","CLI","Windows Codex CLI 已不可用","将继续检测；重新安装后自动准备专用入口。");}
                     status.cli_detected=detected;
-                    if detected&&!status.cli_ready {match install_cli(&root,&exe,&mut config){Ok(ready)=>{status.cli_ready=ready;cli_error=None;if ready{status.log("info","CLI","CLI 专用入口已恢复",format!("入口：{}\n代理守护：{}",root.join("cli/codex.exe").display(),yes(status.enabled)));}},Err(error)=>{let message=format!("CLI 接入失败：{error}");if cli_error.as_ref()!=Some(&message){status.log("warning","CLI","CLI 入口稍后重试",message.clone());}cli_error=Some(message);}}}
+                    if detected&&!status.cli_ready {match install_cli(&root,&exe,&mut config){Ok(ready)=>{status.cli_ready=ready;cli_error=None;if ready{status.log("info","CLI","CLI 专用入口已恢复",format!("入口：{}\n代理守护：{}",root.join("cli/codex-proxy-cli.exe").display(),yes(status.enabled)));}},Err(error)=>{let message=format!("CLI 接入失败：{error}");if cli_error.as_ref()!=Some(&message){status.log("warning","CLI","CLI 入口稍后重试",message.clone());}cli_error=Some(message);}}}
                 }
                 let mut error=config_error.clone().or_else(||cli_error.clone());status.guard_ready=false;
                 if !status.enabled {if let Ok(d)=&debug {for package in held.iter().cloned().collect::<Vec<_>>() {match d.disable(&package){Ok(())=>{held.remove(&package);},Err(e)=>error=Some(e)}}}}
@@ -134,13 +136,13 @@ impl Controller {
                     }
                     let next=sampler.snapshot();if next.state!=status.traffic.state{status.log(if next.state==crate::traffic::TrafficState::Unavailable{"warning"}else{"info"},"流量","流量采集状态已变化",format!("状态：{:?}\n{}",next.state,next.message.as_deref().unwrap_or("仅统计已验证的目标进程字节。")));}status.traffic=next;
                 }
-                status.traffic_enabled=config.traffic_enabled;status.traffic_service=crate::traffic_service::snapshot();
+                crate::flow_log::maybe_sample(&status.traffic);status.traffic_enabled=config.traffic_enabled;status.traffic_service=crate::traffic_service::snapshot();
                 if status.error!=error {if let Some(e)=&error {status.log("error","守护","守护状态需要检查",e.clone());}else if status.error.is_some(){status.log("info","守护","守护状态已恢复","本轮检测未再出现此前错误。");}status.error=error;}
                 if !config.launch_target.opens_desktop() {auto_desktop_pending=false;}
                 if !config.launch_target.opens_cli() {auto_cli_pending=false;}
                 if auto_desktop_pending&&status.guard_ready {match native::open_desktop(){Ok(())=>status.log("info","ChatGPT","已按启动偏好请求打开 ChatGPT",format!("应用包：{}",core::FAMILY)),Err(e)=>status.log("error","ChatGPT","打开 ChatGPT 失败",e)}auto_desktop_pending=false;}
                 if auto_cli_pending&&status.cli_ready&&!crate::cli_manager::is_mutating() {match crate::launch::open_cli(&root,&config){Ok(())=>status.log("info","CLI","已按启动偏好请求打开 Codex CLI",format!("工作目录：{}",if config.cli_workdir.is_empty(){"用户目录"}else{"已配置"})),Err(e)=>status.log("error","CLI","打开 Codex CLI 失败",e)}auto_cli_pending=false;}
-                crate::update::maybe_automatic(&config);status.update=crate::update::snapshot();
+                crate::update::maybe_automatic(&config);status.update=crate::update::snapshot();status.app_update=crate::app_update::snapshot();
                 crate::connectivity::maybe_automatic(&config);status.connectivity=crate::connectivity::snapshot();
                 crate::pricing::maybe_automatic(&config,&worker_tx);
                 if status.update.checked_at!=update_seen {
@@ -158,7 +160,7 @@ impl Controller {
                 publish(&root,&shared,&mut status,&mut persisted,history_writable,&notify);
                 if let Some(reply)=pending {let _=reply.send(result.map(|_|status.clone()));}
                 if first&&config_error.is_none()&&!crate::cli_manager::is_mutating() {
-                    match install_cli(&root,&exe,&mut config) {Ok(ready)=>{status.cli_ready=ready;status.log(if ready{"info"}else{"warning"},"CLI",if ready{"Codex CLI 专用入口已就绪"}else{"未检测到 Windows Codex CLI"},if ready{format!("专用入口：{}\n实际程序：{}\n首次接入后，新终端将使用专用入口。",root.join("cli/codex.exe").display(),config.cli_command.join(" "))}else{"安装后将自动检测并准备专用入口。".into()});},Err(e)=>{let message=format!("CLI 接入失败：{e}");status.log("error","CLI","CLI 入口准备失败",message.clone());cli_error=Some(message.clone());if status.error.is_none(){status.error=Some(message);}}}
+                    match install_cli(&root,&exe,&mut config) {Ok(ready)=>{status.cli_ready=ready;status.log(if ready{"info"}else{"warning"},"CLI",if ready{"Codex CLI 专用入口已就绪"}else{"未检测到 Windows Codex CLI"},if ready{format!("专用入口：{}\n实际程序：{}\n从助手打开 CLI 时使用内部代理入口；普通终端保留官方 npm 入口。",root.join("cli/codex-proxy-cli.exe").display(),config.cli_command.join(" "))}else{"安装后将自动检测并准备专用入口。".into()});},Err(e)=>{let message=format!("CLI 接入失败：{e}");status.log("error","CLI","CLI 入口准备失败",message.clone());cli_error=Some(message.clone());if status.error.is_none(){status.error=Some(message);}}}
                     status.cli_detected=!settings::detect_cli(&root).is_empty();if let Ok(event)=&event {event.set(status.enabled&&status.cli_ready);}
                     publish(&root,&shared,&mut status,&mut persisted,history_writable,&notify);
                 }
@@ -166,7 +168,7 @@ impl Controller {
             }
         });Self{status,tx,traffic,worker:Mutex::new(Some(worker))}
     }
-    pub fn snapshot(&self)->Status {let finished=self.worker.lock().unwrap_or_else(|e|e.into_inner()).as_ref().is_some_and(JoinHandle::is_finished);let mut status=self.status.lock().unwrap_or_else(|e|e.into_inner()).clone();status.update=crate::update::snapshot();status.connectivity=crate::connectivity::snapshot();status.traffic_service=crate::traffic_service::snapshot();status.desktop_operation=crate::desktop_lifecycle::snapshot();status.cli_management=crate::cli_manager::snapshot();status.update_notice=crate::update_notice::snapshot();if let Ok(traffic)=self.traffic.lock(){status.traffic=traffic.snapshot();}status.sample_traffic();if finished&&status.backend_ready {status.backend_ready=false;status.enabled=false;status.guard_ready=false;status.error=Some("守护后台已退出，请重新打开助手。".into());}status}
+    pub fn snapshot(&self)->Status {let finished=self.worker.lock().unwrap_or_else(|e|e.into_inner()).as_ref().is_some_and(JoinHandle::is_finished);let mut status=self.status.lock().unwrap_or_else(|e|e.into_inner()).clone();status.update=crate::update::snapshot();status.app_update=crate::app_update::snapshot();status.connectivity=crate::connectivity::snapshot();status.traffic_service=crate::traffic_service::snapshot();status.desktop_operation=crate::desktop_lifecycle::snapshot();status.cli_management=crate::cli_manager::snapshot();status.update_notice=crate::update_notice::snapshot();if let Ok(traffic)=self.traffic.lock(){status.traffic=traffic.snapshot();}status.sample_traffic();if finished&&status.backend_ready {status.backend_ready=false;status.enabled=false;status.guard_ready=false;status.error=Some("守护后台已退出，请重新打开助手。".into());}status}
     pub fn stop(&self){let _=self.tx.send(Message::Stop);if let Some(worker)=self.worker.lock().unwrap_or_else(|e|e.into_inner()).take(){let _=worker.join();}}
 }
 impl Drop for Controller {fn drop(&mut self){self.stop();}}
@@ -192,9 +194,9 @@ fn install_cli(root:&Path,exe:&Path,config:&mut Config)->Result<bool,String> {
     if crate::cli_manager::is_mutating(){return Err("Codex CLI 管理操作正在进行，暂缓更改专用入口。".into())}
     let detected=settings::detect_cli(root);if detected.is_empty(){return Ok(false)}
     let source=exe.parent().unwrap().join("codex-proxy-cli.exe");if !source.is_file(){return Err("缺少 codex-proxy-cli.exe，请保留完整程序目录。".into())}
-    let directory=root.join("cli");fs::create_dir_all(&directory).map_err(|e|e.to_string())?;let target=directory.join("codex.exe");let bytes=fs::read(source).map_err(|e|e.to_string())?;
-    if fs::read(&target).ok().as_deref()!=Some(bytes.as_slice()){let pending=directory.join("codex.exe.pending");fs::write(&pending,&bytes).map_err(|e|e.to_string())?;if let Err(error)=fs::rename(&pending,&target){let _=fs::remove_file(&pending);return Err(error.to_string());}}
-    config.cli_command=detected;settings::save(root,config)?;platform::install_cli_path(&directory)?;Ok(true)
+    let directory=root.join("cli");fs::create_dir_all(&directory).map_err(|e|e.to_string())?;let target=directory.join("codex-proxy-cli.exe");let bytes=fs::read(source).map_err(|e|e.to_string())?;
+    if fs::read(&target).ok().as_deref()!=Some(bytes.as_slice()){let pending=directory.join("codex-proxy-cli.exe.pending");fs::write(&pending,&bytes).map_err(|e|e.to_string())?;if let Err(error)=fs::rename(&pending,&target){let _=fs::remove_file(&pending);return Err(error.to_string());}}
+    config.cli_command=detected;settings::save(root,config)?;platform::remove_legacy_cli_path(&directory)?;Ok(true)
 }
 
 #[cfg(test)]mod traffic_history_tests{

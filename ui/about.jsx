@@ -59,12 +59,13 @@ export function About({version,busy=()=>false,onSource,onRelease,onLogs,onPrivac
   </div>;
 }
 
-export function UpdateSettings({status,busy=()=>false,writable=false,onPreference,onCheck}){
+export function UpdateSettings({status,busy=()=>false,writable=false,onPreference,onCheck,onInstall,version}){
   const networkEnabled=status?.network_enabled!==false;
   const automatic=!!status?.auto_check_updates;
   const interval=intervals.includes(status?.update_interval_hours)?status.update_interval_hours:6;
   const update=status?.update||{status:'unchecked'};
-  const manualBusy=busy('check-updates');
+  const manualBusy=busy('check-updates'),install=status?.app_update||{},installBusy=busy('install-app-update')||!!install.busy;
+  const installLabel={downloading:'正在下载安装包',verifying:'正在校验安装包',restarting:'正在重启助手',installed:'助手更新已完成',installed_cleanup_pending:'新版本运行正常，安装收尾待处理',rolled_back:'更新未完成，已恢复上一版本',error:'助手更新未完成'}[install.phase];
   const networkBusy=busy('network-enabled'),automaticBusy=busy('auto-check-updates'),intervalBusy=busy('update-interval');
   const titles={unchecked:'尚未检查更新',current:'当前已是最新版本',available:`发现新版本 ${update.latest||''}`,unpublished:'暂无公开发布版本',error:'检查更新未完成'};
   const title=update.checking?'正在检查更新':Object.hasOwn(titles,update.status)?titles[update.status]:'尚未检查更新';
@@ -78,6 +79,8 @@ export function UpdateSettings({status,busy=()=>false,writable=false,onPreferenc
       <Row icon="arrow-sync-24-regular" title="自动检查更新" description="按设定间隔在后台检查，不自动下载或安装。"><div className="switch-control">{automaticBusy&&<Symbol name="arrow-sync-24-regular" spin/>}<Switch id="auto-check-updates" aria-label="自动检查更新" aria-busy={automaticBusy} checked={automatic} disabled={!writable||typeof onPreference!=='function'||!networkEnabled||automaticBusy} onChange={(_,data)=>onPreference('autoCheckUpdates',data.checked)}/></div></Row>
       <Row icon="clock-24-regular" title="检查间隔" description="可先设置间隔，再开启自动检查。"><div className="switch-control">{intervalBusy&&<Symbol name="arrow-sync-24-regular" spin/>}<Choice id="update-interval" label="自动检查更新间隔" busy={intervalBusy} value={String(interval)} options={intervals.map(hours=>({value:String(hours),label:`${hours} 小时`}))} disabled={!writable||typeof onPreference!=='function'||!networkEnabled||intervalBusy} onChange={value=>onPreference('updateIntervalHours',Number(value))}/></div></Row>
       <Row icon={update.status==='available'?'arrow-download-24-regular':update.status==='current'?'checkmark-circle-24-regular':update.status==='error'?'warning-24-regular':'arrow-sync-24-regular'} title={title} description={<><span>上次检查：{checkedTime(update.checked_at)}</span>{update.checking&&!manualBusy&&<span className="background-check" role="status">后台检查中</span>}</>}><Button id="check-updates" className="text-action" appearance="subtle" aria-busy={manualBusy} disabled={!writable||!networkEnabled||typeof onCheck!=='function'||manualBusy} icon={<Symbol name={manualBusy?'arrow-sync-24-regular':'search-24-regular'} spin={manualBusy}/>} onClick={onCheck}>{manualBusy?'正在检查':'检查更新'}</Button></Row>
+      <div className="group-footer"><span>当前版本 {version||'—'} · 最新版本 {update.latest||'尚未检查'}</span>{update.status==='available'&&<Button id="install-app-update" appearance="primary" aria-busy={installBusy} disabled={!writable||!networkEnabled||installBusy||typeof onInstall!=='function'} icon={<Symbol name={installBusy?'arrow-sync-24-regular':'arrow-download-24-regular'} spin={installBusy}/>} onClick={()=>onInstall(update.latest)}>{installBusy?installLabel||'正在准备更新':'更新并重启'}</Button>}</div>
+      {(installBusy||installLabel)&&<div className="release-notes" role="status"><span>{installLabel||'正在准备更新'}{install.phase==='downloading'?` · ${(Math.max(0,install.downloaded||0)/1048576).toFixed(1)} MB${install.total?` / ${(install.total/1048576).toFixed(1)} MB`:''}`:''}</span>{installBusy&&<progress aria-label="助手更新进度" max={install.phase==='downloading'&&install.total?install.total:undefined} value={install.phase==='downloading'&&install.total?install.downloaded:undefined}/>}<p>{install.error||'保留本机配置与日志；更新仅重启助手。'}</p></div>}
       {!update.checking&&update.status==='error'&&error&&<div className="release-notes error-text" role="status">{error}</div>}
       {!update.checking&&['current','available'].includes(update.status)&&notes&&<div className="group-footer update-notes-entry"><span>{update.status==='available'?`版本 ${update.latest||''} 的更新内容`:'查看此版本的更新内容'}</span><Dialog><DialogTrigger disableButtonEnhancement><Button appearance="subtle" aria-haspopup="dialog">查看更新说明</Button></DialogTrigger><DialogSurface className="release-dialog app-dialog"><DialogBody><DialogTitle>更新说明{update.latest?` · ${update.latest}`:''}</DialogTitle><DialogContent><ReleaseNotes notes={notes}/></DialogContent><DialogActions><DialogTrigger disableButtonEnhancement><Button appearance="secondary">关闭</Button></DialogTrigger></DialogActions></DialogBody></DialogSurface></Dialog></div>}
     </div>
@@ -90,7 +93,7 @@ export function PrivacyInfo({busy=()=>false,onLogs,onRead}){
   return <>
     <h2>本机数据与隐私</h2>
     <div className="settings-group">
-      <ul className="privacy-summary"><li><strong>本机保存</strong> 配置、启动偏好和最近 200 条日志。</li><li><strong>不记录内容</strong> 不保存对话、提示词或用户 CLI 参数；可选流量统计只计字节。</li><li><strong>联网可控</strong> 版本检查、网页探测与价格同步可关闭，没有遥测或数据上报。</li></ul>
+      <ul className="privacy-summary"><li><strong>本机保存</strong> 配置、启动偏好和最近 200 条运行日志；可选连接与流量日志另保留最近 300 条。</li><li><strong>不记录内容</strong> 不保存对话、提示词或用户 CLI 参数；可选流量统计只计字节。</li><li><strong>联网可控</strong> 版本检查、网页探测与价格同步可关闭，没有遥测或数据上报。</li></ul>
       <button type="button" className="about-detail-entry privacy-entry" onClick={onRead}><Symbol name="lock-closed-24-regular"/>完整数据与隐私说明<Symbol name="chevron-right-20-regular"/></button>
       <div className="group-footer"><span>日志保存在本机</span>{action('open-logs','打开日志目录',onLogs)}</div>
     </div>
@@ -104,7 +107,7 @@ export function Disclaimer(){
 export function PrivacyDetails(){return <div className="settings-group privacy-full"><div className="about-copy">
         <p>配置、启动偏好和最近 200 条分类运行日志保存在本机。</p>
         <p>本机采样包括代理端口连接耗时、目标进程树 TCP 连接数与守护进程内存。用量统计在本机读取 Codex 会话日志，只提取时间、模型、来源和 token 等用量元数据；解析时忽略对话内容，不保存或展示原文。不记录或上报对话、提示词、用户 CLI 参数；启动参数仅原样转发给已安装的 CLI。</p>
-        <p>进程流量统计默认关闭，只按目标进程 ID 计数字节，不抓取内容、不保留连接 IP 或端口。打开实时连接详情时，会临时读取目标进程的当前 TCP 地址、端口和状态，用于本机展示，不写入日志或历史。安装或卸载辅助服务时请求 Windows 授权，正常开启、关闭统计不再反复授权。</p>
+        <p>进程流量统计默认关闭，只按目标进程 ID 计数字节，不抓取内容、不保留连接 IP 或端口。打开实时连接详情时，会临时读取目标进程的当前 TCP 地址、端口和状态，用于本机展示；仅在你开启“流量日志”后，将连接时间、进程、TCP 地址及端口和流量采样保存在本机，每类最多 300 条，不保存通信内容或向外发送。安装或卸载辅助服务时请求 Windows 授权，正常开启、关闭统计不再反复授权。</p>
         <p>联网用于读取 GitHub 公开更新清单、用户手动发起的 npm 官方 CLI 更新检查与包管理、下载 models.dev 公开模型价格目录，以及经当前代理探测 ChatGPT 网页。价格目录经当前本地代理获取并缓存在本机，不向 models.dev 发送本机模型列表或用量记录。网页探测不使用 Cookie，只回显公网出口 IP、国家代码与 HTTP 耗时，不验证账号或对话。</p>
         <p>本应用没有遥测或数据上报。请求以应用名称与版本作标识，不附带本机日志、对话或参数；外部链接由你点击后在浏览器中打开。</p>
         <p>关闭允许联网检测后，停止后续助手外部请求，已设更新间隔会保留。目标应用代理、本机 TCP 探测和本机用量读取继续运行。用量费用按匹配到的公开参考价或你设置的覆盖价估算，不代表订阅账单；未匹配的模型不补造单价。</p>

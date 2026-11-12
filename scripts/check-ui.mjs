@@ -125,7 +125,7 @@ try {
   assert.doesNotMatch(introduction,/本机采样包括|只在本机读取 Codex 会话日志/,'Full privacy copy belongs in its inner page.');
   const privacy=renderToStaticMarkup(React.createElement(PrivacyDetails));
   assert.match(privacy,/不记录或上报对话、提示词、用户 CLI 参数/);assert.match(privacy,/启动参数仅原样转发给已安装的 CLI/);assert.match(privacy,/目标应用代理、本机 TCP 探测和本机用量读取继续运行/);
-  assert.match(privacy,/打开实时连接详情时，会临时读取/);assert.match(privacy,/不写入日志或历史/);assert.match(privacy,/不保存或展示原文/);
+  assert.match(privacy,/打开实时连接详情时，会临时读取/);assert.match(privacy,/仅在你开启“流量日志”后/);assert.match(privacy,/不保存或展示原文/);
   const privacyPage=settingsPanel(render('settings',sample,'privacy'),'privacy');assert.match(privacyPage,/本机采样包括/);
   const disclaimer=settingsPanel(render('settings',sample,'disclaimer'),'disclaimer');assert.match(disclaimer,/国际出入口信道/);assert.match(disclaimer,/不排除依法不得排除的责任/);
   assert.match(introduction,/MIT 许可/);assert.match(introduction,/aria-haspopup="dialog"/);assert.doesNotMatch(introduction,/<details\b[^>]*class="privacy-details"/);
@@ -235,7 +235,7 @@ try {
   assert.match(collecting,/2\.0 KB\/s/);assert.match(collecting,/1\.0 KB\/s/);assert.match(collecting,/4\.0 KB/);assert.match(collecting,/>0 B</);
   assert.match(collecting,/目标进程上传与下载速率趋势/);assert.match(collecting,/累计上传/);assert.match(collecting,/累计下载/);
   const partial=traffic({state:'collecting',partial:true,message:'仅含已验证目标，累计可能不完整。',receive_bps:2048,send_bps:1024,received_bytes:4096,sent_bytes:0,target_count:2});
-  assert.match(partial,/部分统计/);assert.match(partial,/累计可能不完整/);assert.match(partial,/2\.0 KB\/s/);
+  assert.match(partial,/采集中 · 累计不完整/);assert.match(partial,/累计可能不完整/);assert.match(partial,/2\.0 KB\/s/);
   for(const state of ['disabled','starting','needs_permission','unavailable']){
     const inactive=traffic({state,receive_bps:2048,send_bps:1024,received_bytes:4096,sent_bytes:0,target_count:2});
     assert.doesNotMatch(rateLabels(inactive),/2\.0 KB\/s|1\.0 KB\/s/);assert.doesNotMatch(inactive,/累计 0 B|授权采集/);
@@ -255,7 +255,8 @@ try {
 
   const cli=(data,pending=new Set(),networkEnabled=true)=>renderToStaticMarkup(React.createElement(CliManagement,{data,writable:true,networkEnabled,busy:name=>pending.has(name),onCheck:noop,onUpdate:noop,onUninstall:noop}));
   const managed={source:'npm_user_global',supported:true,target_token:'isolated-token',current:'0.1.0',latest:'0.2.0',operation:null};
-  const managedCli=cli(managed);assert.match(managedCli,/npm · 当前用户/);assert.match(managedCli,/当前 0\.1\.0/);assert.match(managedCli,/最新 0\.2\.0/);for(const id of ['cli-check','cli-update','cli-uninstall'])assert.equal(disabled(control(managedCli,'button',id)),false);
+  const managedCli=cli(managed);assert.match(managedCli,/npm · 当前用户/);assert.match(managedCli,/当前版本<\/small><strong>0\.1\.0/);assert.match(managedCli,/最新版本<\/small><strong>0\.2\.0/);for(const id of ['cli-check','cli-update','cli-uninstall'])assert.equal(disabled(control(managedCli,'button',id)),false);
+  const firstCli=cli({source:'not_installed',install_token:'verified-npm-token'});assert.equal(disabled(control(firstCli,'button','cli-install')),false);assert.doesNotMatch(firstCli,/id="cli-uninstall"/);assert.match(cli({...managed,latest:managed.current}),/已是最新/);
   const unsupported=cli({source:'unmanaged',supported:false,current:'1.0.0',reason:'此安装来源不受支持，请使用原安装工具管理。'});assert.match(unsupported,/非托管安装/);assert.match(unsupported,/使用原安装工具管理/);for(const id of ['cli-check','cli-uninstall'])assert.equal(disabled(control(unsupported,'button',id)),true);
   const checkingCli=cli(managed,new Set(['cli-check']));assert.match(control(checkingCli,'button','cli-check'),/aria-busy="true"/);for(const id of ['cli-update','cli-uninstall']){assert.match(control(checkingCli,'button',id),/aria-busy="false"/);assert.equal(disabled(control(checkingCli,'button',id)),true);}
   const offlineCli=cli(managed,new Set(),false);assert.equal(disabled(control(offlineCli,'button','cli-check')),true);assert.match(offlineCli,/允许联网检测后可检查更新/);assert.equal(disabled(control(offlineCli,'button','cli-uninstall')),false);

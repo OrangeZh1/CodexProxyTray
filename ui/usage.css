@@ -85,8 +85,8 @@
 .usage-view .usage-tab-count { border-radius: 4px; padding: 0 6px; background: var(--bg-subtle,var(--panel-hover)); color: var(--text-muted); font-size: 11px; line-height: 18px; font-weight: 500; font-variant-numeric: tabular-nums; }
 .usage-view .usage-table-scroll { width: 100%; max-height: none; min-width: 0; overflow-x: auto; overflow-y: visible; }
 .usage-view .usage-table-scroll:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: -2px; }
-.usage-view .usage-table { width: 100%; table-layout: fixed; border-collapse: separate; border-spacing: 0; color: var(--text-secondary); font-size: 12px; line-height: 18px; }
-.usage-view .usage-table th { position: sticky; top: 0; z-index: 1; padding: 9px 7px; border-bottom: 1px solid var(--panel-stroke); background: var(--app-bg); color: var(--text-muted); font-size: 10px; font-weight: 400; text-align: right; white-space: nowrap; }
+.usage-view .usage-table { width: 100%; table-layout: fixed; border-collapse: separate; border-spacing: 0; color: var(--text-primary); font-size: 13px; line-height: 20px; }
+.usage-view .usage-table th { position: sticky; top: 0; z-index: 1; padding: 9px 7px; border-bottom: 1px solid var(--panel-stroke); background: var(--app-bg); color: var(--text-secondary); font-size: 12px; font-weight: 500; text-align: right; white-space: nowrap; }
 .usage-view .usage-table th:first-child, .usage-view .usage-table th[data-usage-column="model"], .usage-view .usage-table th[data-usage-column="provider"] { text-align: left; }
 .usage-view .usage-table td { padding: 9px 7px; border-bottom: 1px solid var(--panel-stroke); vertical-align: middle; overflow: hidden; text-overflow: ellipsis; }
 .usage-view .usage-table tbody tr:last-child td { border-bottom: 0; }
@@ -99,7 +99,7 @@
 .usage-view .usage-column-help .usage-symbol { width: 12px; height: 12px; }
 .usage-view .usage-column-help:focus-visible { outline: 1.5px solid var(--focus-ring); outline-offset: 2px; }
 .usage-view .usage-number { text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }
-.usage-view .usage-table td[data-usage-column="cost"] { color: var(--text-primary); font-weight: 600; }
+.usage-view .usage-table td:is([data-usage-column="cost"],[data-usage-column="speed"]) { color: var(--text-primary); font-weight: 600; }
 .usage-view .usage-table-actions .setting-select { width: 160px; }
 .usage-view .usage-table-actions .setting-select > button { height: 32px; min-height: 32px; font-size: 12px; }
 .usage-view .usage-table-empty { padding: 36px 20px; color: var(--text-muted); font-size: 12px; text-align: center; }
@@ -148,8 +148,8 @@
 .usage-drawer .usage-detail-model { margin: 8px 0 14px; color: var(--text-secondary); font-size: 14px; overflow-wrap: anywhere; }
 .usage-drawer .usage-unit-prices { margin-top: 20px; color: var(--text-muted); font-size: 11px; }
 .usage-drawer .usage-unit-prices .drawer-detail-rows { margin-top: 4px; }
-:is(.usage-drawer,.usage-pricing-dialog) .usage-price-sync-actions { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 10px 0; color: var(--text-muted); font-size: 11px; }
-:is(.usage-drawer,.usage-pricing-dialog) .usage-price-sync-status { min-height: 20px; color: var(--text-muted); font-size: 12px; line-height: 20px; }
+:is(.usage-drawer,.usage-pricing-dialog) .usage-price-sync-actions { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-start; gap: 12px; margin: 10px 0; color: var(--text-muted); font-size: 11px; }
+:is(.usage-drawer,.usage-pricing-dialog) .usage-price-sync-status { order: 2; min-height: 20px; color: var(--text-muted); font-size: 12px; line-height: 20px; }
 :is(.usage-drawer,.usage-pricing-dialog) #usage-prices-sync { min-height: 32px; font-size: 13px; line-height: 20px; font-weight: 400; }
 :is(.usage-drawer,.usage-pricing-dialog) .usage-pricing-catalog { display: grid; gap: 10px; margin-top: 16px; }
 :is(.usage-drawer,.usage-pricing-dialog) .usage-pricing-catalog > .fui-Button { justify-self: start; font-size: 12px; }
@@ -206,3 +206,13 @@
 @media(max-width:700px) { .usage-view .usage-stats { grid-template-columns: repeat(2,minmax(0,1fr)); } .usage-view .usage-stat:nth-child(2) { border-right: 0; } .usage-view .usage-stat:nth-child(-n+2) { border-bottom: 1px solid var(--panel-stroke); } .usage-view .usage-token-breakdown { grid-template-columns: repeat(3,minmax(0,1fr)); } .usage-view .usage-stat-value { font-size: 23px; } .usage-view .usage-toolbar { flex-wrap: wrap; } .usage-view .usage-toolbar-actions { margin-left: auto; } }
 @media(max-width:540px) { .usage-range-popover .usage-range-body { grid-template-columns: 1fr; } .usage-range-popover .usage-range-calendar { padding: 10px 0 0; border-left: 0; border-top: 1px solid var(--panel-stroke); } .usage-range-popover .usage-calendar-grid > button { min-height: 25px; } .usage-view .usage-price-fields { grid-template-columns: 1fr; } .usage-view .usage-chart-xaxis > span:nth-child(2) { display: none; } }
 @media(prefers-reduced-motion:reduce) { .usage-view .usage-spinner, .usage-range-popover .usage-spinner, .usage-drawer .usage-spinner { animation: none !important; } .usage-view .usage-token-collapse, .usage-view .usage-token-toggle .usage-symbol, .usage-view .usage-stat-hit, .usage-view .usage-tab-underline, .usage-view .usage-tabs > [role="tab"], .usage-range-popover .usage-range-field { transition: none !important; } }
+
+.usage-price-sync-status:empty { display: none; }
+.usage-pricing-dialog .usage-price-sync-actions + .error-text { margin: 4px 0 10px; }
+
+.usage-scan-progress { display: grid; gap: 6px; margin: -6px 0 14px; padding: 10px 14px; border: 1px solid var(--panel-stroke); border-radius: 7px; background: var(--panel-bg); color: var(--text-secondary); font-size: 12px; }
+.usage-scan-progress progress { width: 100%; height: 5px; accent-color: var(--accent); }
+.usage-scan-progress small { color: var(--text-muted); }
+
+.usage-view .usage-table :is(th,td):first-child { padding-left: 18px; }
+.usage-view .usage-table :is(th,td):last-child { padding-right: 18px; }

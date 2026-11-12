@@ -1,4 +1,4 @@
-CodexProxyTray v0.2.0 · Windows x64
+CodexProxyTray v0.2.1 · Windows x64
 
 用途
 为 ChatGPT 桌面端和 Windows Codex CLI 提供指定的本地 HTTP 代理环境，
@@ -22,7 +22,7 @@ CodexProxyTray v0.2.0 · Windows x64
 
 首次接入
 已经运行的 ChatGPT 保留原来的环境，请先保存工作，方便时完整退出并重开。
-CLI 专用入口会加入当前用户 PATH，需要新开终端才能使用新入口。
+只保留一套当前用户 npm Codex CLI；从助手打开时经过内部代理入口，不再将同名入口加入 PATH。普通终端使用官方 codex 入口和终端本来的代理环境。
 直接运行原 CLI 的绝对路径会绕过入口；WSL、远程和容器代理需单独配置。
 桌面助手需要 Microsoft Edge WebView2 Runtime，界面本身不依赖 Node.js、
 Python 或 VBScript；如果 CLI 通过 npm 安装，请保留它需要的 Node.js 环境。

@@ -1,5 +1,5 @@
 import { readFileSync } from 'node:fs';
-export const RELEASES = 'https://github.com/OrangeZh1/chatgpt-proxy-launcher/releases';
+export const RELEASES = 'https://github.com/OrangeZh1/CodexProxyTray/releases';
 const manifestUrl = `${RELEASES}/latest/download/CodexProxyTray-update.json`;
 const { version: current } = JSON.parse(readFileSync(new URL('../package.json',import.meta.url),'utf8'));
 export function parseManifest(value) {
