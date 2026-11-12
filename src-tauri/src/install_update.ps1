@@ -1,8 +1,10 @@
 param([ValidateSet('Prepare','Apply')][string]$Phase,[Parameter(Mandatory=$true)][string]$Job)
 $ErrorActionPreference='Stop'
+# The helper uses only protected Windows modules, independent of a PowerShell 7 parent.
+$env:PSModulePath=Join-Path $PSHOME 'Modules'
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 function Plain([string]$Path){$cursor=[IO.Path]::GetFullPath($Path);while($cursor){$item=Get-Item -LiteralPath $cursor -Force;if($item.Attributes -band [IO.FileAttributes]::ReparsePoint){throw '路径包含重解析点，已停止更新。'};$parent=[IO.Path]::GetDirectoryName($cursor);if($parent -eq $cursor){break};$cursor=$parent}}
-function Hash([string]$Path){(Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()}
+function Hash([string]$Path){$algorithm=[Security.Cryptography.SHA256]::Create();$stream=$null;try{$stream=[IO.File]::OpenRead($Path);([BitConverter]::ToString($algorithm.ComputeHash($stream))).Replace('-','').ToLowerInvariant()}finally{if($stream){$stream.Dispose()};$algorithm.Dispose()}}
 function Json([string]$Path){Plain $Path;if((Get-Item -LiteralPath $Path).Length -gt 262144){throw '安装记录过大。'};Get-Content -LiteralPath $Path -Raw -Encoding UTF8|ConvertFrom-Json}
 function CopyDurable([string]$From,[string]$To){Plain $From;Plain ([IO.Path]::GetDirectoryName($To));$sourceStream=[IO.File]::Open($From,'Open','Read','Read');$output=[IO.File]::Open($To,'CreateNew','Write','None');try{$sourceStream.CopyTo($output);$output.Flush($true)}finally{$output.Dispose();$sourceStream.Dispose()};if((Hash $From) -cne (Hash $To)){throw '恢复副本校验失败。'}}
 function RestoreConfig([string]$From,[string]$To){$temporary=$To+'.restore-pending';CopyDurable $From $temporary;if(Test-Path -LiteralPath $To){Plain $To;[IO.File]::Replace($temporary,$To,[NullString]::Value)}else{[IO.File]::Move($temporary,$To)};if((Hash $From) -cne (Hash $To)){throw '配置恢复校验失败。'}}
