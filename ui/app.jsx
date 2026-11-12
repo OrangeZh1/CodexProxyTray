@@ -271,7 +271,7 @@ export function App({initialStatus=null,initialPage=globalThis.__QA_NAV__?.page|
       <section hidden={page!=='usage'} aria-label="用量统计">{page==='usage'&&<UsageView invoke={invoke}/>}</section>
       <section hidden={page!=='logs'} aria-label="运行日志">
         <TabList aria-label="日志类型" selectedValue={logTab} onTabSelect={(_,value)=>setLogTab(value.value)}><Tab value="events">运行事件</Tab><Tab value="traffic">流量日志</Tab></TabList>
-        {logTab==='traffic'?page==='logs'&&<FlowLogs invoke={invoke} writable={writable}/>:<>
+        {logTab==='traffic'?page==='logs'&&<FlowLogs invoke={appWindow?invoke:null} writable={writable&&!!appWindow}/>:<>
         <LogFilters level={logFilter} period={logPeriod} query={logQuery} start={logStart} end={logEnd} count={filtered.length} total={logs.length} onLevel={setLogFilter} onPeriod={value=>{if(value==='custom'){setCustomStart(logStart);setCustomEnd(logEnd);}setLogPeriod(value);}} onQuery={setLogQuery} onStart={setCustomStart} onEnd={setCustomEnd} onReset={()=>{setLogPeriod('all');setCustomStart('');setCustomEnd('');setLogQuery('');setLogFilter('all');}}/>
         {logStart&&logEnd&&logStart>logEnd&&<div className="inline-note error-text" role="alert">开始日期不能晚于结束日期。</div>}
         {status?.log_storage_error&&<div className="inline-note error-text">历史日志保存异常：{status.log_storage_error}</div>}

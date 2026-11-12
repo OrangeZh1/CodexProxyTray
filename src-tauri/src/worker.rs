@@ -196,7 +196,7 @@ fn install_cli(root:&Path,exe:&Path,config:&mut Config)->Result<bool,String> {
     let source=exe.parent().unwrap().join("codex-proxy-cli.exe");if !source.is_file(){return Err("缺少 codex-proxy-cli.exe，请保留完整程序目录。".into())}
     let directory=root.join("cli");fs::create_dir_all(&directory).map_err(|e|e.to_string())?;let target=directory.join("codex-proxy-cli.exe");let bytes=fs::read(source).map_err(|e|e.to_string())?;
     if fs::read(&target).ok().as_deref()!=Some(bytes.as_slice()){let pending=directory.join("codex-proxy-cli.exe.pending");fs::write(&pending,&bytes).map_err(|e|e.to_string())?;if let Err(error)=fs::rename(&pending,&target){let _=fs::remove_file(&pending);return Err(error.to_string());}}
-    config.cli_command=detected;settings::save(root,config)?;platform::remove_legacy_cli_path(&directory)?;Ok(true)
+    config.cli_command=detected;settings::save(root,config)?;platform::remove_legacy_cli_path(&directory)?;if config.cli_command.len()==2{if let Some(appdata)=std::env::var_os("APPDATA"){platform::ensure_user_cli_path(&std::path::PathBuf::from(appdata).join("npm"))?;}}Ok(true)
 }
 
 #[cfg(test)]mod traffic_history_tests{

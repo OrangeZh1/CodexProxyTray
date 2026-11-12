@@ -226,7 +226,7 @@ pub fn install(target_token:String)->Result<CliState,String>{
         let outcome=(||{fs::write(scratch.join("user.npmrc"),b"").and_then(|_|fs::write(scratch.join("global.npmrc"),b"")).map_err(|_|"无法隔离 npm 配置。")?;let args=mutation_args(&target,Mutation::Install,Some(&latest),&scratch)?;
             if new_install_target()?.token!=target_token{return Err("安装目标已变化，未继续安装。".into())}fs::create_dir_all(&target.prefix).map_err(|_|"无法创建当前用户 npm 目录。")?;execute_npm(&target,&args,&config,Mutation::Install)
         })();for name in ["user.npmrc","global.npmrc"]{let _=fs::remove_file(scratch.join(name));}let _=fs::remove_dir(&scratch);let after=local_install();apply_local(&after);outcome?;
-        if after?.is_none_or(|install|install.version!=latest){return Err("npm 已退出，但未检测到请求的 CLI 版本，请查看当前状态。".into())}progress(format!("Codex CLI {latest} 已安装；使用一份当前用户 npm 安装。"));Ok(())})();finish(result)?;drop(operation);Ok(snapshot())
+        if after?.is_none_or(|install|install.version!=latest){return Err("npm 已退出，但未检测到请求的 CLI 版本，请查看当前状态。".into())}crate::platform::ensure_user_cli_path(&target.prefix).map_err(|error|format!("Codex CLI 已安装，但用户命令路径未能保存：{error}"))?;progress(format!("Codex CLI {latest} 已安装；使用一份当前用户 npm 安装。"));Ok(())})();finish(result)?;drop(operation);Ok(snapshot())
 }
 
 #[cfg(test)]mod tests{
