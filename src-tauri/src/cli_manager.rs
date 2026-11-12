@@ -231,7 +231,7 @@ pub fn install(target_token:String)->Result<CliState,String>{
 
 #[cfg(test)]mod tests{
     use super::*;
-    fn sandbox()->PathBuf{let path=std::env::temp_dir().join(format!("cli-manager-check-{}-{}",std::process::id(),SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));fs::create_dir(&path).unwrap();path}
+    fn sandbox()->PathBuf{static NEXT:std::sync::atomic::AtomicU64=std::sync::atomic::AtomicU64::new(0);let path=std::env::temp_dir().join(format!("cli-manager-check-{}-{}-{}",std::process::id(),SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos(),NEXT.fetch_add(1,Ordering::Relaxed)));fs::create_dir(&path).unwrap();path}
     fn fixture(root:&Path)->(Vec<String>,PathBuf){let prefix=root.join("current user npm");let node=root.join("node/node.exe");let npm=root.join("node/node_modules/npm/bin/npm-cli.js");let script=prefix.join("node_modules/@openai/codex/bin/codex.js");
         for path in [&node,&npm,&script]{fs::create_dir_all(path.parent().unwrap()).unwrap();fs::write(path,b"fixture").unwrap();}
         fs::write(npm.parent().unwrap().parent().unwrap().join("package.json"),br#"{"name":"npm","bin":{"npm":"bin/npm-cli.js"}}"#).unwrap();
