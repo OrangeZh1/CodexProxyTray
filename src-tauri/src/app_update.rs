@@ -8,17 +8,31 @@ const RELEASES:&str="https://github.com/OrangeZh1/CodexProxyTray/releases";
 const SCRIPT:&str=include_str!("install_update.ps1");
 const MAX_ZIP:u64=128*1024*1024;
 #[derive(Clone,Default,Serialize,Deserialize)]#[serde(default)]
-pub struct Progress{pub busy:bool,pub phase:String,pub version:Option<String>,pub downloaded:u64,pub total:Option<u64>,pub error:Option<String>}
+pub struct Progress{pub started_at:u64,pub completed_at:u64,pub operation:String,pub busy:bool,pub phase:String,pub version:Option<String>,pub downloaded:u64,pub total:Option<u64>,pub error:Option<String>}
 #[derive(Default)]struct Gate{updating:bool,management:u32}
 static GATE:Mutex<Gate>=Mutex::new(Gate{updating:false,management:0});
 static VIEW:OnceLock<Mutex<Progress>>=OnceLock::new();
-fn view()->&'static Mutex<Progress>{VIEW.get_or_init(||{let saved=fs::read(settings::root().join("update-install-result.json")).ok().filter(|b|b.len()<=16384).and_then(|bytes|serde_json::from_slice::<Progress>(&bytes).ok());Mutex::new(saved.unwrap_or_default())})}
-pub fn snapshot()->Progress{view().lock().unwrap_or_else(|e|e.into_inner()).clone()}
+static READY:OnceLock<Mutex<Option<Prepared>>>=OnceLock::new();
+#[derive(Serialize,Deserialize)]struct ReadyReceipt{schema:u32,job:String,version:String}
+fn read_small(path:&Path,limit:u64)->Option<Vec<u8>>{let file=fs::File::open(path).ok()?;let mut bytes=vec![];file.take(limit+1).read_to_end(&mut bytes).ok()?;(bytes.len()as u64<=limit).then_some(bytes)}
+fn ready()->&'static Mutex<Option<Prepared>>{READY.get_or_init(||{
+    let loaded=(||{let saved:ReadyReceipt=serde_json::from_slice(&read_small(&settings::root().join("update-download-ready.json"),4096)?).ok()?;
+        if saved.schema!=1||!version(&saved.version)||!crate::core::newer_version(&saved.version,env!("CARGO_PKG_VERSION"))||saved.job.split('-').count()!=2||!saved.job.bytes().all(|b|b.is_ascii_digit()||b==b'-'){return None}
+        let job=settings::root().join("updates").join(saved.job);if !job.join("verified.json").is_file()||job.join("cancelled.json").exists(){return None}Some(Prepared{job,version:saved.version,_lease:None})})();Mutex::new(loaded)
+})}
+
+fn view()->&'static Mutex<Progress>{VIEW.get_or_init(||{let saved=read_small(&settings::root().join("update-install-result.json"),16384).and_then(|bytes|serde_json::from_slice::<Progress>(&bytes).ok());Mutex::new(saved.unwrap_or_default())})}
+pub fn snapshot()->Progress{
+    let mut state=view().lock().unwrap_or_else(|e|e.into_inner()).clone();
+    if !state.busy{let package_version=ready().lock().unwrap_or_else(|e|e.into_inner()).as_ref().map(|package|package.version.clone());if let Some(version)=package_version{state.phase="ready".into();state.version=Some(version);}else if let Some(bytes)=read_small(&settings::root().join("update-install-result.json"),16384){if let Ok(result)=serde_json::from_slice::<Progress>(&bytes){if result.completed_at>=state.started_at&&result.completed_at>state.completed_at&&matches!(result.phase.as_str(),"installed"|"rolled_back"|"error"|"installed_cleanup_pending"){state=result;}}}}
+    state
+}
+
 pub fn busy()->bool{GATE.lock().unwrap_or_else(|e|e.into_inner()).updating}
 pub struct Lease{update:bool}
 impl Drop for Lease{fn drop(&mut self){let mut gate=GATE.lock().unwrap_or_else(|e|e.into_inner());if self.update{gate.updating=false;view().lock().unwrap_or_else(|e|e.into_inner()).busy=false;}else{gate.management=gate.management.saturating_sub(1);}}}
 pub fn management()->Result<Lease,String>{let mut gate=GATE.lock().map_err(|_|"操作状态暂不可用。")?;if gate.updating{return Err("助手正在准备更新，请等待完成。".into())}gate.management+=1;Ok(Lease{update:false})}
-fn begin(version:&str)->Result<Lease,String>{let mut gate=GATE.lock().map_err(|_|"操作状态暂不可用。")?;if gate.updating||gate.management!=0{return Err("另一项管理操作仍在进行，请稍后更新助手。".into())}gate.updating=true;*view().lock().unwrap_or_else(|e|e.into_inner())=Progress{busy:true,phase:"downloading".into(),version:Some(version.into()),..Progress::default()};Ok(Lease{update:true})}
+fn begin(version:&str,operation:&str)->Result<Lease,String>{let mut gate=GATE.lock().map_err(|_|"操作状态暂不可用。")?;if gate.updating||gate.management!=0{return Err("另一项管理操作仍在进行，请稍后更新助手。".into())}gate.updating=true;*view().lock().unwrap_or_else(|e|e.into_inner())=Progress{started_at:settings::now(),operation:operation.into(),busy:true,phase:if operation=="download"{"downloading"}else{"verifying"}.into(),version:Some(version.into()),..Progress::default()};Ok(Lease{update:true})}
 fn phase(value:&str){view().lock().unwrap_or_else(|e|e.into_inner()).phase=value.into();}
 fn version(value:&str)->bool{!value.starts_with('v')&&crate::core::version_parts(value).is_some()}
 fn checksum(text:&str,name:&str)->Result<String,String>{
@@ -41,8 +55,9 @@ fn download(client:&reqwest::blocking::Client,url:&str,path:&Path,limit:u64,repo
 fn powershell()->PathBuf{PathBuf::from(std::env::var_os("SystemRoot").unwrap_or_else(||"C:\\Windows".into())).join("System32/WindowsPowerShell/v1.0/powershell.exe")}
 fn command(job:&Path,phase:&str)->Command{let mut command=Command::new(powershell());command.args(["-NoLogo","-NoProfile","-NonInteractive","-ExecutionPolicy","Bypass","-File"]).arg(job.join("installer.ps1")).args(["-Phase",phase,"-Job"]).arg(job).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).creation_flags(0x08000000);command}
 fn wait_prepare(child:&mut Child)->Result<(),String>{let deadline=Instant::now()+Duration::from_secs(45);loop{match child.try_wait(){Ok(Some(status))=>return if status.success(){Ok(())}else{Err("安装包或安装目录校验未通过；原程序和恢复资料已保留。".into())},Ok(None)=>{},Err(_)=>return Err("无法读取安装校验结果。".into())}if Instant::now()>=deadline{let _=child.kill();let _=child.wait();return Err("安装校验超时，原程序未替换。".into())}thread::sleep(Duration::from_millis(100));}}
-pub struct Prepared{job:PathBuf,_lease:Lease}
-impl Drop for Prepared{fn drop(&mut self){let _=fs::write(self.job.join("cancelled.json"),b"{}");let mut state=view().lock().unwrap_or_else(|e|e.into_inner());state.phase="error".into();state.error=Some("更新交接未完成，助手继续运行。".into());}}
+pub struct Prepared{job:PathBuf,version:String,_lease:Option<Lease>}
+impl Drop for Prepared{fn drop(&mut self){if self._lease.is_some(){let _=fs::write(self.job.join("cancelled.json"),b"{}");let mut state=view().lock().unwrap_or_else(|e|e.into_inner());state.phase="error".into();state.error=Some("更新交接未完成，助手继续运行。".into());}}}
+
 impl Prepared{
     pub fn handoff(self)->Result<Self,String>{
         // The script signals readiness only after holding the installation lock.
@@ -53,7 +68,7 @@ impl Prepared{
 pub fn prepare(expected:String)->Result<Prepared,String>{
     if !version(&expected)||!crate::core::newer_version(&expected,env!("CARGO_PKG_VERSION")){return Err("请先检查并选择可用的新版本。".into())}
     let checked=crate::update::snapshot();if checked.status!="available"||checked.latest.as_deref()!=Some(&expected){return Err("更新信息已变化，请重新检查。".into())}
-    let lease=begin(&expected)?;
+    let lease=begin(&expected,"download")?;
     let result=(||{
         let root=settings::root();let config=settings::load(&root).map_err(|_|"无法读取现有配置，未下载更新。")?;let client=client(&config)?;
         let job=root.join("updates").join(format!("{}-{}",std::process::id(),settings::now()));fs::create_dir_all(job.parent().unwrap()).and_then(|_|fs::create_dir(&job)).map_err(|_|"无法创建更新工作目录。")?;
@@ -70,7 +85,25 @@ pub fn prepare(expected:String)->Result<Prepared,String>{
         if !settings::load(&root).is_ok_and(|c|c.network_enabled){return Err("联网检测已关闭，更新已停止，原程序保持运行。".into())}
         Ok(job)
     })();
-    match result{Ok(job)=>Ok(Prepared{job,_lease:lease}),Err(error)=>{let mut state=view().lock().unwrap_or_else(|e|e.into_inner());state.phase="error".into();state.error=Some(error.clone());Err(error)}}
+    match result{Ok(job)=>Ok(Prepared{job,version:expected,_lease:Some(lease)}),Err(error)=>{let mut state=view().lock().unwrap_or_else(|e|e.into_inner());state.phase="error".into();state.error=Some(error.clone());Err(error)}}
+}
+
+pub fn download_update(expected:String)->Result<Progress,String>{
+    let existing=ready().lock().map_err(|_|"更新包状态暂不可用。")?.as_ref().map(|package|package.version.clone());
+    if let Some(existing)=existing{if existing==expected{return Ok(snapshot())}return Err(format!("已有已校验的 {existing} 更新包，请先完成重启更新。"))}
+    let mut package=prepare(expected.clone())?;
+    let receipt=ReadyReceipt{schema:1,job:package.job.file_name().ok_or("更新目录无效。")?.to_string_lossy().into(),version:expected};settings::write_json(&settings::root().join("update-download-ready.json"),&receipt)?;
+    drop(package._lease.take());*ready().lock().map_err(|_|"更新包状态暂不可用。")?=Some(package);phase("ready");Ok(snapshot())
+}
+pub fn install_ready(expected:String)->Result<Prepared,String>{
+    if !version(&expected)||!crate::core::newer_version(&expected,env!("CARGO_PKG_VERSION")){return Err("目标版本无效，请重新检查更新。".into())}
+    let lease=begin(&expected,"install")?;phase("verifying");
+    let mut package={let mut current=ready().lock().map_err(|_|"更新包状态暂不可用。")?;if current.as_ref().is_none_or(|package|package.version!=expected){return Err("请先下载并校验此版本的更新包。".into())}current.take().unwrap()};package._lease=Some(lease);
+    let mut plan:serde_json::Value=serde_json::from_slice(&read_small(&package.job.join("plan.json"),262144).ok_or("下载记录不可读取，已保留原程序。")?).map_err(|_|"下载记录无效。")?;
+    let exe=std::env::current_exe().map_err(|_|"无法核验当前助手。")?;
+    if plan["schema"]!=1||plan["product"]!="CodexProxyTray"||plan["version"]!=expected||plan["executable"].as_str().is_none_or(|path|settings::normalized_executable(Path::new(path))!=settings::normalized_executable(&exe)){return Err("安装目录或下载记录已变化，未开始替换。".into())}
+    let identity=unsafe{crate::traffic::identity_on(windows::Win32::System::Threading::GetCurrentProcess())}.map_err(|_|"无法核验助手进程。")?;plan["parent_pid"]=serde_json::json!(std::process::id());plan["parent_created"]=serde_json::json!(identity.created_filetime.to_string());settings::write_json(&package.job.join("plan.json"),&plan)?;
+    package.handoff()
 }
 
 #[cfg(test)]mod tests{use super::*;#[test]fn only_canonical_versions_and_exact_unique_asset_hashes_are_accepted(){assert!(version("0.2.1"));for bad in ["v0.2.1","../0.2.1","0.2.1-beta","01.2.1"]{assert!(!version(bad));}let hash="a".repeat(64);assert_eq!(checksum(&format!("{hash}  package.zip\n"),"package.zip").unwrap(),hash);assert!(checksum(&format!("{hash}  package.zip\n{hash}  package.zip"),"package.zip").is_err());assert!(checksum(&format!("{hash}  ../package.zip"),"package.zip").is_err());assert!(checksum("bogus  package.zip","package.zip").is_err());}}

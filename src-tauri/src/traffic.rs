@@ -1,6 +1,6 @@
 //! Opt-in process traffic coordinator and authenticated collector IPC.
 //! No listener, collector, privilege request or ETW session is created by new().
-use std::{ffi::{OsStr,OsString},mem::size_of,os::windows::ffi::{OsStrExt,OsStringExt},path::{Path,PathBuf},sync::{Arc,Mutex,atomic::{AtomicBool,Ordering}},thread::{self,JoinHandle},time::{Duration,Instant,SystemTime,UNIX_EPOCH}};
+use std::{collections::HashMap,ffi::{OsStr,OsString},mem::size_of,os::windows::ffi::{OsStrExt,OsStringExt},path::{Path,PathBuf},sync::{Arc,Mutex,atomic::{AtomicBool,Ordering}},thread::{self,JoinHandle},time::{Duration,Instant,SystemTime,UNIX_EPOCH}};
 use serde::{Serialize,Deserialize};
 use windows::{core::{GUID,PCWSTR,PWSTR},Win32::{Foundation::*,Security::{GetTokenInformation,TOKEN_QUERY,TOKEN_USER,TokenUser,SECURITY_ATTRIBUTES,PSECURITY_DESCRIPTOR},Security::{Authorization::{ConvertSidToStringSidW,ConvertStringSecurityDescriptorToSecurityDescriptorW},Cryptography::{BCryptGenRandom,BCRYPT_USE_SYSTEM_PREFERRED_RNG}},Storage::FileSystem::*,System::{Pipes::*,Threading::*}}};
 use crate::{traffic_core::{self,ProcessIdentity},traffic_etw::{EtwSession,EngineError,EngineSample}};
@@ -11,34 +11,42 @@ pub enum TrafficState{Disabled,Starting,Collecting,NeedsInstallation,NeedsPermis
 #[derive(Clone,Debug,Serialize,Deserialize)]#[serde(deny_unknown_fields)]
 pub struct TrafficSnapshot{
     pub state:TrafficState,pub timestamp_ms:u64,pub received_bytes:Option<u64>,pub sent_bytes:Option<u64>,pub receive_bps:Option<f64>,pub send_bps:Option<f64>,pub target_count:u32,pub lost_events:Option<u64>,pub lost_buffers:Option<u64>,pub message:Option<String>,pub scope:String,
-    #[serde(default)]pub partial:bool,
+    #[serde(default)]pub buffer_limited:bool,#[serde(default)]pub partial:bool,#[serde(default)]pub missed_bindings:u64,#[serde(default)]pub first_missed_at:Option<u64>,#[serde(default)]pub last_missed_at:Option<u64>,
 }
 impl TrafficSnapshot{
-    fn state(state:TrafficState,message:Option<String>)->Self{Self{state,timestamp_ms:now(),received_bytes:None,sent_bytes:None,receive_bps:None,send_bps:None,target_count:0,lost_events:None,lost_buffers:None,message,scope:"current_verified_processes_since_enable".into(),partial:false}}
+    fn state(state:TrafficState,message:Option<String>)->Self{Self{state,timestamp_ms:now(),received_bytes:None,sent_bytes:None,receive_bps:None,send_bps:None,target_count:0,lost_events:None,lost_buffers:None,message,scope:"current_verified_processes_since_enable".into(),buffer_limited:false,partial:false,missed_bindings:0,first_missed_at:None,last_missed_at:None}}
     pub fn disabled()->Self{Self::state(TrafficState::Disabled,None)}
 }
 #[derive(Clone,Copy)]pub enum EnableMode{Normal}
 #[derive(Serialize,Deserialize)]#[serde(tag="type",rename_all="snake_case",deny_unknown_fields)]
 enum ToCollector{Targets{protocol:u32,targets:Vec<ProcessIdentity>},Stop{protocol:u32},StoppedReceived{protocol:u32}}
 #[derive(Serialize,Deserialize)]#[serde(deny_unknown_fields)]struct FromCollector{protocol:u32,snapshot:TrafficSnapshot,stopped:bool}
-struct Shared{snapshot:Mutex<TrafficSnapshot>,targets:Mutex<(u64,Vec<ProcessIdentity>)>,target_error:Mutex<Option<String>>,stop_confirmed:AtomicBool}
+struct Shared{snapshot:Mutex<TrafficSnapshot>,targets:Mutex<(u64,Vec<ProcessIdentity>,HashMap<ProcessIdentity,(Instant,crate::native::ProcessLease)>)>,target_error:Mutex<Option<String>>,stop_confirmed:AtomicBool}
 struct Running{stop:Arc<AtomicBool>,thread:JoinHandle<()>}
 pub struct Coordinator{shared:Arc<Shared>,running:Option<Running>}
 impl Coordinator{
-    pub fn new()->Self{Self{shared:Arc::new(Shared{snapshot:Mutex::new(TrafficSnapshot::disabled()),targets:Mutex::new((0,vec![])),target_error:Mutex::new(None),stop_confirmed:AtomicBool::new(true)}),running:None}}
+    pub fn new()->Self{Self{shared:Arc::new(Shared{snapshot:Mutex::new(TrafficSnapshot::disabled()),targets:Mutex::new((0,vec![],HashMap::new())),target_error:Mutex::new(None),stop_confirmed:AtomicBool::new(true)}),running:None}}
     pub fn snapshot(&self)->TrafficSnapshot{let raw=self.shared.snapshot.lock().map(|value|value.clone()).unwrap_or_else(|_|TrafficSnapshot::state(TrafficState::Unavailable,Some("流量统计状态不可用。".into())));if raw.state!=TrafficState::Disabled{if let Some(error)=self.shared.target_error.lock().ok().and_then(|error|error.clone()){return TrafficSnapshot::state(TrafficState::Unavailable,Some(error))}}raw}
-    pub fn set_targets(&self,targets:Vec<ProcessIdentity>)->Result<(),String>{traffic_core::validate_targets(&targets)?;{let mut current=self.shared.targets.lock().map_err(|_|"流量统计进程名单不可用。")?;if current.1!=targets{current.0=current.0.wrapping_add(1);current.1=targets;}}*self.shared.target_error.lock().map_err(|_|"流量统计进程名单状态不可用。")?=None;Ok(())}
+    pub fn set_targets(&self,leases:Vec<crate::native::ProcessLease>)->Result<(),String>{
+        let targets=leases.iter().map(|lease|lease.identity).collect::<Vec<_>>();traffic_core::validate_targets(&targets)?;
+        {let mut current=self.shared.targets.lock().map_err(|_|"流量统计进程名单不可用。")?;current.2.retain(|_,(seen,_)|seen.elapsed()<Duration::from_secs(60));
+        let extra=targets.iter().filter(|identity|!current.2.contains_key(identity)).count();if current.2.len()+extra>4096{return Err("进程交接保留数量达到上限，已停止扩大采样范围。".into())}
+        for lease in leases{if let Some((seen,_))=current.2.get_mut(&lease.identity){*seen=Instant::now();}else{current.2.insert(lease.identity,(Instant::now(),lease));}}
+        if current.1!=targets{current.0=current.0.wrapping_add(1);current.1=targets;}}
+        *self.shared.target_error.lock().map_err(|_|"流量统计进程名单状态不可用。")?=None;Ok(())
+    }
     pub fn fail_targets(&self,message:String){if let Ok(mut current)=self.shared.targets.lock(){current.0=current.0.wrapping_add(1);current.1.clear();}if let Ok(mut error)=self.shared.target_error.lock(){*error=Some(message.clone());}put(&self.shared,TrafficSnapshot::state(TrafficState::Unavailable,Some(message)));}
     /// Normal uses the previously installed helper service. It never installs or requests UAC.
     pub fn enable(&mut self,mode:EnableMode)->Result<(),String>{
-        self.disable()?;put(&self.shared,TrafficSnapshot::state(TrafficState::Starting,Some("正在建立本用户的进程流量采样。".into())));
+        self.stop_sampling(false)?;put(&self.shared,TrafficSnapshot::state(TrafficState::Starting,Some("正在建立本用户的进程流量采样。".into())));
         let shared=self.shared.clone();let stop=Arc::new(AtomicBool::new(false));let signal=stop.clone();
         let thread=thread::Builder::new().name("traffic-ipc".into()).spawn(move||{if let Err(message)=relay(&shared,&signal,mode){put(&shared,TrafficSnapshot::state(TrafficState::Unavailable,Some(message)));}}).map_err(|_|"流量统计通信线程未能启动。")?;
         self.running=Some(Running{stop,thread});Ok(())
     }
-    pub fn disable(&mut self)->Result<(),String>{
+    pub fn disable(&mut self)->Result<(),String>{self.stop_sampling(true)}
+    fn stop_sampling(&mut self,release_targets:bool)->Result<(),String>{
         if let Some(running)=&self.running{running.stop.store(true,Ordering::Release);let deadline=Instant::now()+Duration::from_secs(5);while !running.thread.is_finished()&&Instant::now()<deadline{thread::sleep(Duration::from_millis(20));}if !running.thread.is_finished(){put(&self.shared,TrafficSnapshot::state(TrafficState::Unavailable,Some("正在等待本次采样进程协作退出。".into())));return Err("本次采样停止尚未确认，请稍候。".into());}}
-        if let Some(running)=self.running.take(){let _=running.thread.join();}if !self.shared.stop_confirmed.load(Ordering::Acquire){put(&self.shared,TrafficSnapshot::state(TrafficState::Unavailable,Some("上次系统采样停止尚未确认。".into())));return Err("上次系统采样停止尚未确认。".into())}put(&self.shared,TrafficSnapshot::disabled());Ok(())
+        if let Some(running)=self.running.take(){let _=running.thread.join();}if !self.shared.stop_confirmed.load(Ordering::Acquire){put(&self.shared,TrafficSnapshot::state(TrafficState::Unavailable,Some("上次系统采样停止尚未确认。".into())));return Err("上次系统采样停止尚未确认。".into())}put(&self.shared,TrafficSnapshot::disabled());if release_targets{if let Ok(mut targets)=self.shared.targets.lock(){targets.0=targets.0.wrapping_add(1);targets.1.clear();targets.2.clear();}}Ok(())
     }
 }
 impl Default for Coordinator{fn default()->Self{Self::new()}}
@@ -56,10 +64,11 @@ pub(crate) fn identity_on(handle:HANDLE)->windows::core::Result<ProcessIdentity>
     let(mut created,mut exited,mut kernel,mut user)=(FILETIME::default(),FILETIME::default(),FILETIME::default(),FILETIME::default());GetProcessTimes(handle,&mut created,&mut exited,&mut kernel,&mut user)?;
     Ok(ProcessIdentity{pid:GetProcessId(handle),created_filetime:((created.dwHighDateTime as u64)<<32)|created.dwLowDateTime as u64})
 }}
-pub(crate) fn open_identity(identity:ProcessIdentity)->windows::core::Result<Option<OwnedHandle>>{unsafe{
-    let raw=match OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION|PROCESS_SYNCHRONIZE,false,identity.pid){Ok(raw)=>raw,Err(error)if win_code(&error)==87=>return Ok(None),Err(error)=>return Err(error)};let process=OwnedHandle(raw);
-    if identity_on(process.0)?!=identity||WaitForSingleObject(process.0,0)!=WAIT_TIMEOUT{return Ok(None)}Ok(Some(process))
+pub(crate) fn open_identity(identity:ProcessIdentity)->windows::core::Result<Option<OwnedHandle>>{let Some(process)=open_lifetime_identity(identity)?else{return Ok(None)};if unsafe{WaitForSingleObject(process.0,0)}!=WAIT_TIMEOUT{return Ok(None)}Ok(Some(process))}
+pub(crate) fn open_lifetime_identity(identity:ProcessIdentity)->windows::core::Result<Option<OwnedHandle>>{unsafe{
+    let raw=match OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION|PROCESS_SYNCHRONIZE,false,identity.pid){Ok(raw)=>raw,Err(error)if win_code(&error)==87=>return Ok(None),Err(error)=>return Err(error)};let process=OwnedHandle(raw);if identity_on(process.0)?!=identity{return Ok(None)}Ok(Some(process))
 }}
+
 fn own_image()->Result<PathBuf,String>{std::env::current_exe().and_then(std::fs::canonicalize).map_err(|_|"无法验证采样程序路径。".into())}
 fn same_image(handle:HANDLE,expected:&Path)->bool{unsafe{let mut path=vec![0u16;32768];let mut length=path.len()as u32;if QueryFullProcessImageNameW(handle,PROCESS_NAME_WIN32,PWSTR(path.as_mut_ptr()),&mut length).is_err(){return false}path.truncate(length as usize);PathBuf::from(OsString::from_wide(&path)).canonicalize().ok().is_some_and(|actual|actual.as_os_str().to_string_lossy().eq_ignore_ascii_case(&expected.as_os_str().to_string_lossy()))}}
 pub(crate) fn process_sid(process:HANDLE)->Result<String,String>{unsafe{
@@ -113,7 +122,7 @@ fn relay(shared:&Arc<Shared>,stop:&Arc<AtomicBool>,mode:EnableMode)->Result<(),S
     while !pipe.connect()?{if !child.alive(){return Err("采样进程在连接前退出。".into())}if Instant::now()>=deadline{return Err("采样进程连接超时。".into())}thread::sleep(Duration::from_millis(20));}
     let mut client=0;unsafe{GetNamedPipeClientProcessId(pipe.handle.0,&mut client).map_err(|_|"无法验证采样客户端。")?;}
     if client!=child.pid(){return Err("采样客户端身份不匹配。".into())}crate::traffic_service::validate_collector(child.handle())?;
-    let(mut version,targets)=shared.targets.lock().map_err(|_|"采样进程名单不可用。")?.clone();
+    let(mut version,targets)={let targets=shared.targets.lock().map_err(|_|"采样进程名单不可用。")?;(targets.0,targets.1.clone())};
     // Once a target message might have arrived, only a verified collector STOP acknowledgement
     // can prove that the system logger is gone; a child exiting is not that proof.
     shared.stop_confirmed.store(false,Ordering::Release);
@@ -123,7 +132,7 @@ fn relay(shared:&Arc<Shared>,stop:&Arc<AtomicBool>,mode:EnableMode)->Result<(),S
             if stop.load(Ordering::Acquire){return Ok(())}
             match accept_frame(shared,&pipe){Ok(Some(state))=>{last_message=Instant::now();terminal=matches!(state,TrafficState::NeedsPermission|TrafficState::Unavailable);},Err(_)if terminal&&shared.stop_confirmed.load(Ordering::Acquire)=>return Ok(()),Err(error)=>return Err(error),Ok(None)=>{}}
             if !child.alive(){if shared.stop_confirmed.load(Ordering::Acquire){return Ok(())}return Err("采样进程退出，但系统会话停止未确认。".into())}
-            let(next,targets)=shared.targets.lock().map_err(|_|"采样进程名单不可用。")?.clone();if next!=version{pipe.write(&ToCollector::Targets{protocol:PROTOCOL,targets},||child.alive())?;version=next;}
+            let(next,targets)={let targets=shared.targets.lock().map_err(|_|"采样进程名单不可用。")?;(targets.0,targets.1.clone())};if next!=version{pipe.write(&ToCollector::Targets{protocol:PROTOCOL,targets},||child.alive())?;version=next;}
             if last_message.elapsed()>Duration::from_secs(6){return Err("采样进程响应超时。".into())}thread::sleep(Duration::from_millis(20));
         }
     })();
@@ -162,8 +171,9 @@ fn measured_snapshot(sample:EngineSample,previous:&mut Option<(Instant,u64,u64)>
         if let Some((before,sent,received))=*previous{let seconds=at.duration_since(before).as_secs_f64();if seconds>0.0{value.send_bps=Some(sample.sent.saturating_sub(sent)as f64/seconds);value.receive_bps=Some(sample.received.saturating_sub(received)as f64/seconds);}}
         *previous=Some((at,sample.sent,sample.received));value
     };
-    snapshot.partial=sample.partial;
+    snapshot.buffer_limited=sample.buffer_limited;snapshot.partial=sample.partial;snapshot.missed_bindings=sample.missed_bindings;snapshot.first_missed_at=sample.first_missed_at;snapshot.last_missed_at=sample.last_missed_at;
     if sample.partial&&matches!(snapshot.state,TrafficState::Collecting|TrafficState::Starting){snapshot.message=Some("部分短命进程在绑定前已退出或身份发生变化；仅统计已验证进程，累计可能不完整。".into());}
+    if sample.buffer_limited{snapshot.message=Some("待核验计量缓冲达到上限，本次累计无法确认完整。".into());}
     snapshot.target_count=sample.target_count;snapshot.lost_events=sample.lost_events;snapshot.lost_buffers=sample.lost_buffers;snapshot
 }
 fn collect(token:&str,parent_identity:ProcessIdentity)->Result<(),String>{
@@ -190,7 +200,7 @@ fn collect(token:&str,parent_identity:ProcessIdentity)->Result<(),String>{
 
 #[cfg(test)]mod tests{
     use super::*;
-    fn sample(partial:bool)->EngineSample{EngineSample{sent:2048,received:4096,seen:true,had_targets:true,partial,target_count:2,lost_events:Some(0),lost_buffers:Some(0),error:None}}
+    fn sample(partial:bool)->EngineSample{EngineSample{buffer_limited:false,missed_bindings:0,first_missed_at:None,last_missed_at:None,sent:2048,received:4096,seen:true,had_targets:true,partial,target_count:2,lost_events:Some(0),lost_buffers:Some(0),error:None}}
     #[test]fn a_short_lived_target_keeps_verified_rates_but_marks_cumulative_partial(){
         let at=Instant::now();let mut previous=Some((at-Duration::from_secs(2),1024,2048));let snapshot=measured_snapshot(sample(true),&mut previous,at);
         assert_eq!(snapshot.state,TrafficState::Collecting);assert_eq!(snapshot.send_bps,Some(512.0));assert_eq!(snapshot.receive_bps,Some(1024.0));assert_eq!(snapshot.sent_bytes,Some(2048));assert_eq!(snapshot.received_bytes,Some(4096));assert_eq!(snapshot.target_count,2);assert!(snapshot.partial);assert!(snapshot.message.unwrap().contains("累计可能不完整"));

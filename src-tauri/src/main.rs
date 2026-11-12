@@ -105,9 +105,10 @@ mod core;
         let result=tauri::async_runtime::spawn_blocking(crate::exchange_rate::read).await.unwrap_or_else(|_|Err("参考汇率查询暂不可用。".into()));
         if !result.as_ref().is_ok_and(|view|!view.network_enabled){crate::event_log::read_state(&state.tx,crate::event_log::ReadState::Exchange,result.as_ref().map_or(true,|view|view.error.is_some()||view.rate.is_none()),"汇率","USD/CNY 参考汇率自动获取未完成","USD/CNY 参考汇率当前可读取");}result
     }
+    #[tauri::command]async fn download_app_update(expected_version:String,window:tauri::WebviewWindow)->Result<crate::app_update::Progress,String>{if window.label()!="main"{return Err("请从主窗口下载助手更新。".into())}tauri::async_runtime::spawn_blocking(move||crate::app_update::download_update(expected_version)).await.map_err(|_|"更新下载未能完成。".to_owned())?}
     #[tauri::command]async fn install_app_update(expected_version:String,window:tauri::WebviewWindow,app:tauri::AppHandle)->Result<(),String>{
         if window.label()!="main"{return Err("请从主窗口更新助手。".into())}
-        let result=tauri::async_runtime::spawn_blocking(move||crate::app_update::prepare(expected_version)?.handoff()).await.map_err(|_|"助手更新未能完成。".to_owned())??;
+        let result=tauri::async_runtime::spawn_blocking(move||crate::app_update::install_ready(expected_version)).await.map_err(|_|"助手更新未能完成。".to_owned())??;
         std::mem::forget(result);app.exit(0);Ok(())
     }
     #[tauri::command]async fn install_cli(target_token:String,state:State<'_,Controller>)->Result<crate::cli_manager::CliState,String>{
@@ -138,7 +139,7 @@ mod core;
         let refreshing=std::env::args().any(|s|s=="--refresh");
         let background=quitting||refreshing||std::env::args().any(|s|s=="--background");
         let app=tauri::Builder::default().manage(UiStartup{ready:AtomicBool::new(false),show_requested:AtomicBool::new(!background),page:std::sync::Mutex::new(None),tray_ready:AtomicBool::new(false),tray_requested:AtomicBool::new(false),tray_height:AtomicU32::new(380),tray_point:std::sync::Mutex::new(None)}).plugin(tauri_plugin_single_instance::init(|app,args,_|{if args.iter().any(|arg|arg=="--quit"){if let Err(error)=request_quit(app){let _=app.state::<Controller>().tx.send(Message::Notice("warning".into(),"生命周期".into(),"退出助手已暂缓".into(),error));}}else if args.iter().any(|arg|arg=="--refresh"){let(tx,_)=std::sync::mpsc::channel();let _=app.state::<Controller>().tx.send(Message::Refresh(tx));}else if !args.iter().any(|arg|arg=="--background"){show(app);}}))
-            .invoke_handler(tauri::generate_handler![get_status,report_ui_error,record_ui_event,frontend_ready,navigate_main,quit_helper,set_enabled,save_proxy,save_system,choose_cli_workdir,refresh_status,launch_codex,launch_cli,capture_desktop_target,manage_desktop,check_cli_updates,install_cli,update_cli,uninstall_cli,get_runtime_connections,get_runtime_memory,get_usage,get_usage_prices,set_usage_price_sync,reload_usage_prices,open_usage_prices_dir,get_usage_exchange_rate,check_updates,install_app_update,get_flow_logs,set_flow_logging,check_connectivity,enable_traffic,disable_traffic,install_traffic_service,uninstall_traffic_service,open_release,open_source,open_logs])
+            .invoke_handler(tauri::generate_handler![get_status,report_ui_error,record_ui_event,frontend_ready,navigate_main,quit_helper,set_enabled,save_proxy,save_system,choose_cli_workdir,refresh_status,launch_codex,launch_cli,capture_desktop_target,manage_desktop,check_cli_updates,install_cli,update_cli,uninstall_cli,get_runtime_connections,get_runtime_memory,get_usage,get_usage_prices,set_usage_price_sync,reload_usage_prices,open_usage_prices_dir,get_usage_exchange_rate,check_updates,download_app_update,install_app_update,get_flow_logs,set_flow_logging,check_connectivity,enable_traffic,disable_traffic,install_traffic_service,uninstall_traffic_service,open_release,open_source,open_logs])
             .setup(move|app|{
                 if quitting {app.handle().exit(0);return Ok(());}
                 TrayIconBuilder::with_id("main-tray").icon(tray_image()).tooltip("CodexProxyTray").show_menu_on_left_click(false)

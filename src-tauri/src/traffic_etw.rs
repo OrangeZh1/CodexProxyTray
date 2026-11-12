@@ -1,15 +1,28 @@
 //! Windows-only ETW engine. This module does nothing until EtwSession::start is called.
-use std::{collections::HashMap,mem::size_of,sync::{Arc,RwLock,atomic::{AtomicBool,AtomicU32,AtomicU64,Ordering}},thread::{self,JoinHandle}};
+use std::{collections::{HashMap,HashSet,VecDeque},mem::size_of,sync::{Arc,RwLock,Mutex,atomic::{AtomicBool,AtomicU32,AtomicU64,Ordering}},thread::{self,JoinHandle},time::{Duration,Instant}};
 use windows::{core::{GUID,PCWSTR,PWSTR},Win32::{Foundation::{GetLastError,ERROR_ACCESS_DENIED,ERROR_PRIVILEGE_NOT_HELD,ERROR_NOT_ALL_ASSIGNED,WAIT_TIMEOUT,WAIT_OBJECT_0,FILETIME},Security::{AdjustTokenPrivileges,LookupPrivilegeValueW,TOKEN_PRIVILEGES,LUID_AND_ATTRIBUTES,TOKEN_QUERY,TOKEN_ADJUST_PRIVILEGES,SE_PRIVILEGE_ENABLED,SE_SYSTEM_PROFILE_NAME},System::{Diagnostics::Etw::*,Threading::{GetCurrentProcess,OpenProcessToken,WaitForSingleObject,GetProcessTimes}}}};
-use crate::traffic::{OwnedHandle,open_identity,process_sid};
+use crate::traffic::{OwnedHandle,open_lifetime_identity,process_sid};
 use crate::traffic_core::{self,ProcessIdentity,Direction,Decode};
 
 pub struct EngineError{pub code:u32,pub message:&'static str}
 impl EngineError{pub fn needs_permission(&self)->bool{matches!(self.code,5|1300|1314)}}
 struct BoundProcess{identity:ProcessIdentity,handle:OwnedHandle,active:bool,exited:AtomicU64}
-struct State{owner_sid:String,bindings:RwLock<HashMap<u32,Vec<BoundProcess>>>,sent:AtomicU64,received:AtomicU64,seen:AtomicBool,had_targets:AtomicBool,partial:AtomicBool,unsupported:AtomicBool,overflow:AtomicBool,consumer_error:AtomicU32,binding_error:AtomicU32}
-impl State{fn new(owner_sid:String)->Self{Self{owner_sid,bindings:RwLock::new(HashMap::new()),sent:AtomicU64::new(0),received:AtomicU64::new(0),seen:AtomicBool::new(false),had_targets:AtomicBool::new(false),partial:AtomicBool::new(false),unsupported:AtomicBool::new(false),overflow:AtomicBool::new(false),consumer_error:AtomicU32::new(0),binding_error:AtomicU32::new(0)}}}
-pub struct EngineSample{pub sent:u64,pub received:u64,pub seen:bool,pub had_targets:bool,pub partial:bool,pub target_count:u32,pub lost_events:Option<u64>,pub lost_buffers:Option<u64>,pub error:Option<EngineError>}
+#[derive(Default)]struct Missed{identities:HashSet<ProcessIdentity>,first:Option<u64>,last:Option<u64>}
+struct PendingPacket{packet:traffic_core::Packet,at:u64,received:Instant}
+#[derive(Default)]struct Pending{packets:VecDeque<PendingPacket>,gaps:HashMap<u32,(Instant,u64,u64)>,unknown_gap:Option<u64>,swept:Option<Instant>}
+impl Pending{fn expire(&mut self){
+    if self.swept.is_none_or(|at|at.elapsed()>=Duration::from_secs(1)){self.gaps.retain(|_,(seen,_,_)|seen.elapsed()<Duration::from_secs(60));self.swept=Some(Instant::now());}
+    while self.packets.front().is_some_and(|event|event.received.elapsed()>Duration::from_secs(10))||self.packets.len()>16384{
+        let old=self.packets.pop_front().unwrap();if self.gaps.len()<4096||self.gaps.contains_key(&old.packet.pid){self.gaps.entry(old.packet.pid).and_modify(|gap|{gap.0=Instant::now();gap.1=gap.1.min(old.at);gap.2=gap.2.max(old.at);}).or_insert((Instant::now(),old.at,old.at));}else{self.unknown_gap=Some(old.at);}
+    }
+}}
+struct State{buffer_limited:AtomicBool,pending:Mutex<Pending>,missed:Mutex<Missed>,owner_sid:String,bindings:RwLock<HashMap<u32,Vec<BoundProcess>>>,sent:AtomicU64,received:AtomicU64,seen:AtomicBool,had_targets:AtomicBool,partial:AtomicBool,unsupported:AtomicBool,overflow:AtomicBool,consumer_error:AtomicU32,binding_error:AtomicU32}
+impl State{
+    fn new(owner_sid:String)->Self{Self{buffer_limited:AtomicBool::new(false),pending:Mutex::new(Pending::default()),missed:Mutex::new(Missed::default()),owner_sid,bindings:RwLock::new(HashMap::new()),sent:AtomicU64::new(0),received:AtomicU64::new(0),seen:AtomicBool::new(false),had_targets:AtomicBool::new(false),partial:AtomicBool::new(false),unsupported:AtomicBool::new(false),overflow:AtomicBool::new(false),consumer_error:AtomicU32::new(0),binding_error:AtomicU32::new(0)}}
+    fn count(&self,packet:traffic_core::Packet){let counter=match packet.direction{Direction::Send=>&self.sent,Direction::Receive=>&self.received};if counter.fetch_update(Ordering::Relaxed,Ordering::Relaxed,|value|value.checked_add(packet.bytes as u64)).is_err(){self.overflow.store(true,Ordering::Relaxed);}self.seen.store(true,Ordering::Relaxed);}
+    fn miss(&self,identity:ProcessIdentity,first:u64,last:u64){self.partial.store(true,Ordering::Relaxed);let mut missed=self.missed.lock().unwrap_or_else(|error|error.into_inner());if missed.identities.len()<4096||missed.identities.contains(&identity){missed.identities.insert(identity);missed.first=Some(missed.first.map_or(first,|at|at.min(first)));missed.last=Some(missed.last.map_or(last,|at|at.max(last)));}else{self.binding_error.store(8,Ordering::Relaxed);}}
+}
+pub struct EngineSample{pub buffer_limited:bool,pub missed_bindings:u64,pub first_missed_at:Option<u64>,pub last_missed_at:Option<u64>,pub sent:u64,pub received:u64,pub seen:bool,pub had_targets:bool,pub partial:bool,pub target_count:u32,pub lost_events:Option<u64>,pub lost_buffers:Option<u64>,pub error:Option<EngineError>}
 const NAME_UNITS:usize=1025;
 fn output_properties(storage:&mut [u64])->*mut EVENT_TRACE_PROPERTIES{unsafe{
     let guid=(*(storage.as_ptr()as *const EVENT_TRACE_PROPERTIES)).Wnode.Guid;storage.fill(0);let props=storage.as_mut_ptr()as *mut EVENT_TRACE_PROPERTIES;
@@ -41,28 +54,23 @@ impl ProfilePrivilege{
 }
 impl Drop for ProfilePrivilege{fn drop(&mut self){unsafe{let _=AdjustTokenPrivileges(self.token.0,false,Some(&self.previous),0,None,None);}}}
 
+fn owns_at(state:&State,process:&BoundProcess,timestamp:u64)->bool{unsafe{
+    match WaitForSingleObject(process.handle.0,0){WAIT_TIMEOUT=>process.active&&traffic_core::within_lifetime(process.identity.created_filetime,None,timestamp),WAIT_OBJECT_0=>match exited_at(process){Some(end)=>traffic_core::within_lifetime(process.identity.created_filetime,Some(end),timestamp),None=>{state.binding_error.store(6,Ordering::Relaxed);false}},_=>{state.binding_error.store(6,Ordering::Relaxed);false}}
+}}
+fn epoch_ms(filetime:u64)->u64{filetime.saturating_sub(116_444_736_000_000_000)/10_000}
+fn backfill(state:&State,bindings:&HashMap<u32,Vec<BoundProcess>>){
+    let mut pending=state.pending.lock().unwrap_or_else(|error|error.into_inner());pending.expire();pending.packets.retain(|event|{let known=bindings.get(&event.packet.pid).is_some_and(|lifetimes|lifetimes.iter().any(|process|owns_at(state,process,event.at)));if known{state.count(event.packet);}!known});
+    for lifetimes in bindings.values(){for process in lifetimes{if let Some((_,first,last))=pending.gaps.get(&process.identity.pid){let end=exited_at(process).unwrap_or(u64::MAX);if *last>=process.identity.created_filetime&&*first<=end{state.miss(process.identity,epoch_ms((*first).max(process.identity.created_filetime)),epoch_ms((*last).min(end)));}}if let Some(_at)=pending.unknown_gap.filter(|at|*at>=process.identity.created_filetime){state.partial.store(true,Ordering::Relaxed);state.buffer_limited.store(true,Ordering::Relaxed);}}}
+}
 unsafe extern "system" fn record_callback(record:*mut EVENT_RECORD){
-    if record.is_null(){return}let record=unsafe{&*record};if record.UserContext.is_null(){return}
-    let state=unsafe{&*(record.UserContext as *const State)};
-    let provider=record.EventHeader.ProviderId.to_u128();
-    // Do not create a slice over addresses, ports, connection IDs or packet contents.
+    if record.is_null(){return}let record=unsafe{&*record};if record.UserContext.is_null(){return}let state=unsafe{&*(record.UserContext as *const State)};
+    // Only PID + size; never read endpoint, connection ID or packet content fields.
     let fields=if record.UserDataLength>=8&&!record.UserData.is_null(){unsafe{std::slice::from_raw_parts(record.UserData as *const u8,8)}}else{&[]};
-    match traffic_core::decode(provider,record.EventHeader.EventDescriptor.Version,record.EventHeader.EventDescriptor.Opcode,fields){
-        Decode::Ignore=>{},Decode::Unsupported=>{state.unsupported.store(true,Ordering::Relaxed);},
-        Decode::Packet(packet)=>{
-            let Ok(bindings)=state.bindings.read()else{return};let Some(lifetimes)=bindings.get(&packet.pid)else{return};
-            // ProcessTrace converts QPC to FILETIME because RAW_TIMESTAMP is deliberately absent.
-            // Retained handles anchor identities, including exited processes whose ETW buffers arrive later.
-            if record.EventHeader.TimeStamp<0{return}let timestamp=record.EventHeader.TimeStamp as u64;
-            let owned=lifetimes.iter().any(|process|{
-                let wait=unsafe{WaitForSingleObject(process.handle.0,0)};
-                if wait==WAIT_TIMEOUT{return process.active&&traffic_core::within_lifetime(process.identity.created_filetime,None,timestamp)}
-                if wait!=WAIT_OBJECT_0{state.binding_error.store(6,Ordering::Relaxed);return false}
-                match exited_at(process){Some(exited)=>traffic_core::within_lifetime(process.identity.created_filetime,Some(exited),timestamp),None=>{state.binding_error.store(6,Ordering::Relaxed);false}}
-            });if !owned{return}
-            let counter=match packet.direction{Direction::Send=>&state.sent,Direction::Receive=>&state.received};
-            if counter.fetch_update(Ordering::Relaxed,Ordering::Relaxed,|value|value.checked_add(packet.bytes as u64)).is_err(){state.overflow.store(true,Ordering::Relaxed);}
-            state.seen.store(true,Ordering::Relaxed);
+    match traffic_core::decode(record.EventHeader.ProviderId.to_u128(),record.EventHeader.EventDescriptor.Version,record.EventHeader.EventDescriptor.Opcode,fields){
+        Decode::Ignore=>{},Decode::Unsupported=>{state.unsupported.store(true,Ordering::Relaxed);},Decode::Packet(packet)=>{
+            if record.EventHeader.TimeStamp<0{return}let timestamp=record.EventHeader.TimeStamp as u64;let Ok(bindings)=state.bindings.read()else{return};
+            if let Some(lifetimes)=bindings.get(&packet.pid){if lifetimes.iter().any(|process|owns_at(state,process,timestamp)){state.count(packet);}}
+            else{let mut pending=state.pending.lock().unwrap_or_else(|error|error.into_inner());pending.packets.push_back(PendingPacket{packet,at:timestamp,received:Instant::now()});pending.expire();}
         }
     }
 }
@@ -105,14 +113,15 @@ impl EtwSession{
             if let Some(existing)=bindings.get_mut(&identity.pid).and_then(|list|list.iter_mut().find(|process|process.identity==identity)){existing.active=true;continue}
             // Bound lifetime history is kept for delayed ETW buffers. Fail closed at a finite session limit.
             if bindings.values().map(Vec::len).sum::<usize>()>=4096{fault=8;continue}
-            match open_identity(identity){Ok(Some(handle))=>{if process_sid(handle.0).ok().as_deref()!=Some(self.state.owner_sid.as_str()){fault=1307;continue}bindings.entry(identity.pid).or_default().push(BoundProcess{identity,handle,active:true,exited:AtomicU64::new(0)});self.state.had_targets.store(true,Ordering::Relaxed);},Ok(None)=>{
+            match open_lifetime_identity(identity){Ok(Some(handle))=>{if process_sid(handle.0).ok().as_deref()!=Some(self.state.owner_sid.as_str()){fault=1307;continue}bindings.entry(identity.pid).or_default().push(BoundProcess{identity,handle,active:true,exited:AtomicU64::new(0)});self.state.had_targets.store(true,Ordering::Relaxed);},Ok(None)=>{
                 // Process lists cross an authenticated pipe: normal process churn can
                 // invalidate an identity before it reaches this consumer. Never bind
                 // its reused PID, but keep counting other verified handles. The
                 // cumulative result stays explicitly partial until the next session.
-                self.state.partial.store(true,Ordering::Relaxed);
+                let at=crate::settings::now();self.state.miss(identity,at,at);
             },Err(error)=>{fault=error.code().0 as u32&0xffff;}}
         }
+        backfill(&self.state,&bindings);
         // Discard still-live processes removed from the verified scope; keep only exited tombstones.
         for list in bindings.values_mut(){list.retain(|process|process.active||unsafe{WaitForSingleObject(process.handle.0,0)}==WAIT_OBJECT_0);}bindings.retain(|_,list|!list.is_empty());
         // True identity/permission/history failures remain fatal for this session;
@@ -124,7 +133,8 @@ impl EtwSession{
         let(lost_events,lost_buffers)=if code.0==0{(Some((*props).EventsLost as u64),Some((*props).LogBuffersLost as u64+(*props).RealTimeBuffersLost as u64))}else{(None,None)};
         let error=sample_error(&self.state,code.0,lost_events,lost_buffers);
         let count=self.state.bindings.read().map(|bindings|bindings.values().flatten().filter(|process|process.active&&WaitForSingleObject(process.handle.0,0)==WAIT_TIMEOUT).count()as u32).unwrap_or(0);
-        EngineSample{sent:self.state.sent.load(Ordering::Relaxed),received:self.state.received.load(Ordering::Relaxed),seen:self.state.seen.load(Ordering::Relaxed),had_targets:self.state.had_targets.load(Ordering::Relaxed),partial:self.state.partial.load(Ordering::Relaxed),target_count:count,lost_events,lost_buffers,error}
+        let missed=self.state.missed.lock().unwrap_or_else(|error|error.into_inner());
+        EngineSample{buffer_limited:self.state.buffer_limited.load(Ordering::Relaxed),missed_bindings:missed.identities.len()as u64,first_missed_at:missed.first,last_missed_at:missed.last,sent:self.state.sent.load(Ordering::Relaxed),received:self.state.received.load(Ordering::Relaxed),seen:self.state.seen.load(Ordering::Relaxed),had_targets:self.state.had_targets.load(Ordering::Relaxed),partial:self.state.partial.load(Ordering::Relaxed),target_count:count,lost_events,lost_buffers,error}
     }}
     pub fn stop(&mut self)->Result<(),EngineError>{unsafe{
         if self.control.Value!=0{stop_owned(self.control,&mut self.properties);self.control.Value=0;}
@@ -165,18 +175,24 @@ mod tests{
     fn release_child(child:&mut std::process::Child){
         child.stdin.take().unwrap().write_all(b"x").unwrap();assert!(child.wait().unwrap().success());
     }
-    #[test]fn expired_bindings_leave_live_targets_usable_and_explicitly_partial(){
-        let mut child=child_fixture();let expired=crate::traffic::identity_on(windows::Win32::Foundation::HANDLE(child.as_raw_handle())).unwrap();release_child(&mut child);
+    #[test]fn process_exit_during_handoff_keeps_exact_lifetime_and_backfills_only_verified_bytes(){
+        let mut child=child_fixture();let(identity,_,_,lease)=unsafe{crate::native::process_identity_with_lease(child.id())}.unwrap();let mut coordinator=crate::traffic::Coordinator::new();coordinator.set_targets(vec![lease]).unwrap();release_child(&mut child);drop(child);
+        assert!(crate::traffic::open_identity(identity).unwrap().is_none());let mut session=without_trace();let probe=BoundProcess{identity,handle:open_lifetime_identity(identity).unwrap().unwrap(),active:false,exited:AtomicU64::new(0)};let exited=exited_at(&probe).unwrap();
+        let mut fields=[identity.pid.to_le_bytes(),128u32.to_le_bytes()].concat();let mut record=EVENT_RECORD::default();record.UserContext=Arc::as_ptr(&session.state)as *mut _;record.UserData=fields.as_mut_ptr().cast();record.UserDataLength=fields.len()as u16;record.EventHeader.ProviderId=GUID::from_u128(traffic_core::TCP_PROVIDER);record.EventHeader.EventDescriptor.Version=2;record.EventHeader.EventDescriptor.Opcode=10;record.EventHeader.TimeStamp=(identity.created_filetime+(exited-identity.created_filetime)/2)as i64;
+        unsafe{record_callback(&mut record)};assert_eq!(session.state.sent.load(Ordering::Relaxed),0);assert_eq!(session.state.pending.lock().unwrap().packets.len(),1);
+        session.set_targets(&[identity]).unwrap();assert!(!session.state.partial.load(Ordering::Relaxed));assert_eq!(session.state.sent.load(Ordering::Relaxed),128);session.set_targets(&[identity]).unwrap();assert_eq!(session.state.sent.load(Ordering::Relaxed),128,"Backfill must be credited only once");
+        record.EventHeader.TimeStamp=(exited+1)as i64;unsafe{record_callback(&mut record)};record.EventHeader.TimeStamp=(identity.created_filetime-1)as i64;unsafe{record_callback(&mut record)};assert_eq!(session.state.sent.load(Ordering::Relaxed),128);
+        fields[..4].copy_from_slice(&u32::MAX.to_le_bytes());unsafe{record_callback(&mut record)};assert_eq!(session.state.sent.load(Ordering::Relaxed),128,"Unknown processes never enter target totals");coordinator.disable().unwrap();
+    }
+    #[test]fn handoff_buffer_is_bounded_and_expired_target_events_remain_explicitly_partial(){
         let own=crate::traffic::identity_on(unsafe{GetCurrentProcess()}).unwrap();let mut session=without_trace();
-        session.set_targets(&[own,expired]).unwrap();assert!(session.state.partial.load(Ordering::Relaxed));assert_eq!(session.state.binding_error.load(Ordering::Relaxed),0);
-        let bindings=session.state.bindings.read().unwrap();assert!(bindings.contains_key(&own.pid));assert!(!bindings.contains_key(&expired.pid));drop(bindings);
-        session.set_targets(&[own]).unwrap();assert!(session.state.partial.load(Ordering::Relaxed),"Earlier skipped bytes cannot become complete when a later list succeeds");
-        assert!(sample_error(&session.state,0,Some(0),Some(0)).is_none());
-        let mut clean=without_trace();clean.set_targets(&[own]).unwrap();assert!(!clean.state.partial.load(Ordering::Relaxed));
+        {let mut pending=session.state.pending.lock().unwrap();pending.packets.push_back(PendingPacket{packet:traffic_core::Packet{pid:own.pid,bytes:128,direction:Direction::Send},at:own.created_filetime+1,received:Instant::now()-Duration::from_secs(11)});}
+        session.set_targets(&[own]).unwrap();assert!(session.state.partial.load(Ordering::Relaxed));assert_eq!(session.state.missed.lock().unwrap().identities.len(),1);assert_eq!(session.state.sent.load(Ordering::Relaxed),0);
+        let mut pending=Pending::default();for pid in 1..=16385{pending.packets.push_back(PendingPacket{packet:traffic_core::Packet{pid,bytes:1,direction:Direction::Send},at:1,received:Instant::now()});}pending.expire();assert!(pending.packets.len()<=16384&&pending.gaps.len()<=4096);
     }
     #[test]fn stale_pid_identity_is_never_bound_to_the_replacement(){
         let own=crate::traffic::identity_on(unsafe{GetCurrentProcess()}).unwrap();let stale=ProcessIdentity{created_filetime:own.created_filetime-1,..own};let mut session=without_trace();
-        session.set_targets(&[stale]).unwrap();assert!(session.state.bindings.read().unwrap().is_empty());assert!(session.state.partial.load(Ordering::Relaxed));
+        session.set_targets(&[stale]).unwrap();session.set_targets(&[stale]).unwrap();{let missed=session.state.missed.lock().unwrap();assert_eq!(missed.identities.len(),1);assert!(missed.first.is_some()&&missed.last>=missed.first);}assert!(session.state.bindings.read().unwrap().is_empty());assert!(session.state.partial.load(Ordering::Relaxed));
         session.set_targets(&[own]).unwrap();let bindings=session.state.bindings.read().unwrap();assert_eq!(bindings[&own.pid].len(),1);assert_eq!(bindings[&own.pid][0].identity,own);
     }
     #[test]fn late_events_use_retained_exit_times_and_cannot_cross_pid_lifetimes(){

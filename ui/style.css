@@ -672,3 +672,25 @@ html[data-input-modality="pointer"] :is(.fui-Button,.fui-Tab,.fui-Option,.fui-Me
 .flow-samples { width: 100%; border-collapse: collapse; font-size: 13px; font-variant-numeric: tabular-nums; }
 .flow-samples th, .flow-samples td { padding: 10px 14px; text-align: right; border-bottom: 1px solid var(--panel-stroke); white-space: nowrap; }
 .flow-samples th:first-child, .flow-samples td:first-child { text-align: left; }
+
+.dashboard-content { max-width: 1240px; }
+.dashboard-content .dashboard-grid { gap: 16px; }
+.dashboard-content .metric-card { padding: 20px; }
+.dashboard-content .guard-value, .dashboard-content .metric-value { font-size: 28px; line-height: 1.2; }
+.dashboard-content .traffic-chart-card .probe-chart { flex: 0 0 150px; min-height: 150px; }
+.dashboard-content .traffic-plot, .dashboard-content .traffic-plot > svg { min-height: 150px; height: 150px; }
+.dashboard-content .guard-card { min-height: 140px; }
+.dashboard-content .dashboard-summary .metric-card { min-height: 154px; }
+@media(max-width:1000px) { .dashboard-content .guard-card { min-height: 112px; } .dashboard-content .traffic-chart-card .probe-chart { flex-basis: 130px; min-height: 130px; } .dashboard-content .traffic-plot, .dashboard-content .traffic-plot > svg { min-height: 130px; height: 130px; } }
+
+.update-version-comparison strong { color: var(--text-primary); font-weight: 600; }
+.app-update-progress { display: grid; gap: 12px; margin: 0 20px 16px; padding: 16px; border: 1px solid var(--panel-stroke); border-radius: 7px; background: var(--app-bg); font-size: 13px; }
+.app-update-progress-heading { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 8px; }
+.app-update-progress-heading > span { color: var(--text-muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+.app-update-progress p { margin: 0; color: var(--text-secondary); font-size: 12px; }
+.app-update-progress.has-error p { color: var(--bad); }
+.app-update-steps { display: flex; flex-wrap: wrap; align-items: center; gap: 12px 24px; margin: 0; padding: 0; list-style: none; color: var(--text-muted); font-size: 12px; }
+.app-update-steps li { display: flex; align-items: center; gap: 6px; }
+.app-update-steps .active { color: var(--accent); }
+.app-update-steps .complete { color: var(--good); }
+.app-update-steps .symbol { width: 16px; height: 16px; }

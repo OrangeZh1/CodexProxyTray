@@ -129,7 +129,7 @@ impl Controller {
                 if let Ok(mut sampler)=sampler.lock(){
                     let mut targets_valid=true;
                     let desired_traffic=config.traffic_enabled&&config_error.is_none()&&!service_paused;
-                    if desired_traffic{match native::traffic_targets(&root,&config){Ok(targets)=>{if let Err(error)=sampler.set_targets(targets){targets_valid=false;sampler.fail_targets(error);}},Err(error)=>{targets_valid=false;sampler.fail_targets(format!("无法验证本轮目标进程：{error}"));}}}
+                    if desired_traffic{match native::traffic_targets_held(&root,&config){Ok(targets)=>{if let Err(error)=sampler.set_targets(targets){targets_valid=false;sampler.fail_targets(error);}},Err(error)=>{targets_valid=false;sampler.fail_targets(format!("无法验证本轮目标进程：{error}"));}}}
                     if traffic_requested||desired_traffic!=traffic_applied{
                         if desired_traffic&&!targets_valid{result=Err("无法验证目标进程，未开始新的流量采样。".into());}
                         else{let action=if desired_traffic{sampler.enable(crate::traffic::EnableMode::Normal)}else{sampler.disable()};traffic_applied=desired_traffic;if let Err(error)=action{result=Err(error)}}

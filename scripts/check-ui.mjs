@@ -103,7 +103,7 @@ try {
   checks++;
 
   const noop=()=>{};
-  const about=(status,pending=new Set())=>renderToStaticMarkup(React.createElement(UpdateSettings,{status,busy:name=>pending.has(name),writable:true,onPreference:noop,onCheck:noop}));
+  const about=(status,pending=new Set())=>renderToStaticMarkup(React.createElement(UpdateSettings,{status,busy:name=>pending.has(name),writable:true,onPreference:noop,onCheck:noop,onDownload:noop,onInstall:noop,version}));
   const introduction=renderToStaticMarkup(React.createElement(About,{version,onSource:noop,onRelease:noop,onLogs:noop}));
   const control=(markup,tag,id)=>{
     const escaped=id.replace(/[.*+?^${}()|[\]\\]/g,'\\$&');
