@@ -30,7 +30,7 @@ for(const view of ['main','tray'])for(const theme of ['light','dark']){
   const window=new Window({url:'http://tauri.localhost/',settings:{enableJavaScriptEvaluation:true,disableJavaScriptFileLoading:true,disableCSSFileLoading:true,suppressInsecureJavaScriptEnvironmentWarning:true}});
   const errors=[],commands=[],invocations=[],plans=new Map(),usageTimers=new Map(),rowAnimations=[];
   const hold=command=>{let resolve,reject;const promise=new Promise((yes,no)=>{resolve=yes;reject=no;});const request={promise,resolve,reject,started:false};const queue=plans.get(command)||[];queue.push(request);plans.set(command,queue);return request;};
-  const until=async(predicate,label)=>{for(let i=0;i<150;i++){if(predicate())return;await delay(20);}assert.ok(predicate(),label);};
+  const until=async(predicate,label)=>{console.log(`[client ${view}/${theme}] ${label} (RSS ${Math.round(process.memoryUsage().rss/1048576)} MiB)`);for(let i=0;i<150;i++){if(predicate())return;await delay(20);}assert.ok(predicate(),label);};
   const count=command=>commands.filter(value=>value===command).length;
   const call=command=>invocations.filter(value=>value.command===command).at(-1);
   const textButton=(selector,text)=>[...window.document.querySelectorAll(selector)].find(button=>button.textContent.trim()===text);
