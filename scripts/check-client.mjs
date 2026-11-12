@@ -29,6 +29,10 @@ function usageSnapshot(args={},count=55){
 for(const view of ['main','tray'])for(const theme of ['light','dark']){
   const window=new Window({url:'http://tauri.localhost/',settings:{enableJavaScriptEvaluation:true,disableJavaScriptFileLoading:true,disableCSSFileLoading:true,suppressInsecureJavaScriptEnvironmentWarning:true}});
   const errors=[],commands=[],invocations=[],plans=new Map(),usageTimers=new Map(),rowAnimations=[];
+  // Bound a faulty DOM-model focus loop so CI produces a diagnostic instead of
+  // exhausting the runner; ordinary focus and all assertions still execute.
+  const originalFocus=window.HTMLElement.prototype.focus;let focusCalls=0;
+  window.HTMLElement.prototype.focus=function(...args){focusCalls++;if(focusCalls%100===0)console.log(`[focus ${view}/${theme}] ${focusCalls}: ${this.tagName}#${this.id}`);if(focusCalls>1000)throw Error('DOM-model focus did not settle after 1000 calls');return originalFocus.apply(this,args);};
   const hold=command=>{let resolve,reject;const promise=new Promise((yes,no)=>{resolve=yes;reject=no;});const request={promise,resolve,reject,started:false};const queue=plans.get(command)||[];queue.push(request);plans.set(command,queue);return request;};
   const until=async(predicate,label)=>{console.log(`[client ${view}/${theme}] ${label} (RSS ${Math.round(process.memoryUsage().rss/1048576)} MiB)`);for(let i=0;i<150;i++){if(predicate())return;await delay(20);}assert.ok(predicate(),label);};
   const count=command=>commands.filter(value=>value===command).length;
