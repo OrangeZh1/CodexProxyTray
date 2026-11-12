@@ -7,9 +7,9 @@ use crate::traffic_core::{self,ProcessIdentity,Direction,Decode};
 pub struct EngineError{pub code:u32,pub message:&'static str}
 impl EngineError{pub fn needs_permission(&self)->bool{matches!(self.code,5|1300|1314)}}
 struct BoundProcess{identity:ProcessIdentity,handle:OwnedHandle,active:bool,exited:AtomicU64}
-struct State{owner_sid:String,bindings:RwLock<HashMap<u32,Vec<BoundProcess>>>,sent:AtomicU64,received:AtomicU64,seen:AtomicBool,had_targets:AtomicBool,incomplete:AtomicBool,unsupported:AtomicBool,overflow:AtomicBool,consumer_error:AtomicU32,binding_error:AtomicU32}
-impl State{fn new(owner_sid:String)->Self{Self{owner_sid,bindings:RwLock::new(HashMap::new()),sent:AtomicU64::new(0),received:AtomicU64::new(0),seen:AtomicBool::new(false),had_targets:AtomicBool::new(false),incomplete:AtomicBool::new(false),unsupported:AtomicBool::new(false),overflow:AtomicBool::new(false),consumer_error:AtomicU32::new(0),binding_error:AtomicU32::new(0)}}}
-pub struct EngineSample{pub sent:u64,pub received:u64,pub seen:bool,pub had_targets:bool,pub target_count:u32,pub lost_events:Option<u64>,pub lost_buffers:Option<u64>,pub error:Option<EngineError>}
+struct State{owner_sid:String,bindings:RwLock<HashMap<u32,Vec<BoundProcess>>>,sent:AtomicU64,received:AtomicU64,seen:AtomicBool,had_targets:AtomicBool,partial:AtomicBool,unsupported:AtomicBool,overflow:AtomicBool,consumer_error:AtomicU32,binding_error:AtomicU32}
+impl State{fn new(owner_sid:String)->Self{Self{owner_sid,bindings:RwLock::new(HashMap::new()),sent:AtomicU64::new(0),received:AtomicU64::new(0),seen:AtomicBool::new(false),had_targets:AtomicBool::new(false),partial:AtomicBool::new(false),unsupported:AtomicBool::new(false),overflow:AtomicBool::new(false),consumer_error:AtomicU32::new(0),binding_error:AtomicU32::new(0)}}}
+pub struct EngineSample{pub sent:u64,pub received:u64,pub seen:bool,pub had_targets:bool,pub partial:bool,pub target_count:u32,pub lost_events:Option<u64>,pub lost_buffers:Option<u64>,pub error:Option<EngineError>}
 const NAME_UNITS:usize=1025;
 fn output_properties(storage:&mut [u64])->*mut EVENT_TRACE_PROPERTIES{unsafe{
     let guid=(*(storage.as_ptr()as *const EVENT_TRACE_PROPERTIES)).Wnode.Guid;storage.fill(0);let props=storage.as_mut_ptr()as *mut EVENT_TRACE_PROPERTIES;
@@ -58,7 +58,7 @@ unsafe extern "system" fn record_callback(record:*mut EVENT_RECORD){
                 let wait=unsafe{WaitForSingleObject(process.handle.0,0)};
                 if wait==WAIT_TIMEOUT{return process.active&&traffic_core::within_lifetime(process.identity.created_filetime,None,timestamp)}
                 if wait!=WAIT_OBJECT_0{state.binding_error.store(6,Ordering::Relaxed);return false}
-                match exited_at(process){Some(exited)=>traffic_core::within_lifetime(process.identity.created_filetime,Some(exited),timestamp),None=>{state.incomplete.store(true,Ordering::Relaxed);false}}
+                match exited_at(process){Some(exited)=>traffic_core::within_lifetime(process.identity.created_filetime,Some(exited),timestamp),None=>{state.binding_error.store(6,Ordering::Relaxed);false}}
             });if !owned{return}
             let counter=match packet.direction{Direction::Send=>&state.sent,Direction::Receive=>&state.received};
             if counter.fetch_update(Ordering::Relaxed,Ordering::Relaxed,|value|value.checked_add(packet.bytes as u64)).is_err(){state.overflow.store(true,Ordering::Relaxed);}
@@ -104,20 +104,27 @@ impl EtwSession{
         for &identity in targets{
             if let Some(existing)=bindings.get_mut(&identity.pid).and_then(|list|list.iter_mut().find(|process|process.identity==identity)){existing.active=true;continue}
             // Bound lifetime history is kept for delayed ETW buffers. Fail closed at a finite session limit.
-            if bindings.values().map(Vec::len).sum::<usize>()>=4096{self.state.incomplete.store(true,Ordering::Relaxed);continue}
-            match open_identity(identity){Ok(Some(handle))=>{if process_sid(handle.0).ok().as_deref()!=Some(self.state.owner_sid.as_str()){fault=1307;continue}bindings.entry(identity.pid).or_default().push(BoundProcess{identity,handle,active:true,exited:AtomicU64::new(0)});self.state.had_targets.store(true,Ordering::Relaxed);},Ok(None)=>{self.state.incomplete.store(true,Ordering::Relaxed);},Err(error)=>{fault=error.code().0 as u32&0xffff;}}
+            if bindings.values().map(Vec::len).sum::<usize>()>=4096{fault=8;continue}
+            match open_identity(identity){Ok(Some(handle))=>{if process_sid(handle.0).ok().as_deref()!=Some(self.state.owner_sid.as_str()){fault=1307;continue}bindings.entry(identity.pid).or_default().push(BoundProcess{identity,handle,active:true,exited:AtomicU64::new(0)});self.state.had_targets.store(true,Ordering::Relaxed);},Ok(None)=>{
+                // Process lists cross an authenticated pipe: normal process churn can
+                // invalidate an identity before it reaches this consumer. Never bind
+                // its reused PID, but keep counting other verified handles. The
+                // cumulative result stays explicitly partial until the next session.
+                self.state.partial.store(true,Ordering::Relaxed);
+            },Err(error)=>{fault=error.code().0 as u32&0xffff;}}
         }
         // Discard still-live processes removed from the verified scope; keep only exited tombstones.
         for list in bindings.values_mut(){list.retain(|process|process.active||unsafe{WaitForSingleObject(process.handle.0,0)}==WAIT_OBJECT_0);}bindings.retain(|_,list|!list.is_empty());
-        self.state.binding_error.store(fault,Ordering::Relaxed);Ok(())
+        // True identity/permission/history failures remain fatal for this session;
+        // a later good target list cannot make the missed cumulative bytes complete.
+        if fault!=0{self.state.binding_error.store(fault,Ordering::Relaxed);}Ok(())
     }
     pub fn sample(&mut self)->EngineSample{unsafe{
         let props=output_properties(&mut self.properties);let code=ControlTraceW(self.control,PCWSTR::null(),props,EVENT_TRACE_CONTROL_QUERY);
         let(lost_events,lost_buffers)=if code.0==0{(Some((*props).EventsLost as u64),Some((*props).LogBuffersLost as u64+(*props).RealTimeBuffersLost as u64))}else{(None,None)};
-        let binding_error=self.state.binding_error.load(Ordering::Relaxed);
-        let error=if code.0!=0{Some(EngineError{code:code.0,message:"无法读取本次采样的丢失事件统计。"})}else if lost_events!=Some(0)||lost_buffers!=Some(0){Some(EngineError{code:234,message:"系统网络事件发生丢失，当前流量不完整。"})}else if binding_error!=0{Some(EngineError{code:binding_error,message:"部分目标进程身份无法验证，未显示不完整流量。"})}else if self.state.incomplete.load(Ordering::Relaxed){Some(EngineError{code:1168,message:"部分目标进程未能及时绑定，当前统计段不完整。"})}else if self.state.unsupported.load(Ordering::Relaxed){Some(EngineError{code:50,message:"当前 Windows 网络事件格式不受支持。"})}else if self.state.overflow.load(Ordering::Relaxed){Some(EngineError{code:534,message:"网络统计计数超出范围。"})}else{let code=self.state.consumer_error.load(Ordering::Relaxed);if code!=0{Some(EngineError{code,message:"网络事件消费者已退出。"})}else{None}};
+        let error=sample_error(&self.state,code.0,lost_events,lost_buffers);
         let count=self.state.bindings.read().map(|bindings|bindings.values().flatten().filter(|process|process.active&&WaitForSingleObject(process.handle.0,0)==WAIT_TIMEOUT).count()as u32).unwrap_or(0);
-        EngineSample{sent:self.state.sent.load(Ordering::Relaxed),received:self.state.received.load(Ordering::Relaxed),seen:self.state.seen.load(Ordering::Relaxed),had_targets:self.state.had_targets.load(Ordering::Relaxed),target_count:count,lost_events,lost_buffers,error}
+        EngineSample{sent:self.state.sent.load(Ordering::Relaxed),received:self.state.received.load(Ordering::Relaxed),seen:self.state.seen.load(Ordering::Relaxed),had_targets:self.state.had_targets.load(Ordering::Relaxed),partial:self.state.partial.load(Ordering::Relaxed),target_count:count,lost_events,lost_buffers,error}
     }}
     pub fn stop(&mut self)->Result<(),EngineError>{unsafe{
         if self.control.Value!=0{stop_owned(self.control,&mut self.properties);self.control.Value=0;}
@@ -130,10 +137,64 @@ impl EtwSession{
 }
 impl Drop for EtwSession{fn drop(&mut self){let _=self.stop();}}
 
+fn sample_error(state:&State,query_code:u32,lost_events:Option<u64>,lost_buffers:Option<u64>)->Option<EngineError>{
+    if query_code!=0{return Some(EngineError{code:query_code,message:"无法读取本次采样的丢失事件统计。"})}
+    if lost_events!=Some(0)||lost_buffers!=Some(0){return Some(EngineError{code:234,message:"系统网络事件发生丢失，当前流量不完整。"})}
+    let binding_error=state.binding_error.load(Ordering::Relaxed);
+    if binding_error!=0{return Some(EngineError{code:binding_error,message:"部分目标进程身份无法验证，未显示不完整流量。"})}
+    if state.unsupported.load(Ordering::Relaxed){return Some(EngineError{code:50,message:"当前 Windows 网络事件格式不受支持。"})}
+    if state.overflow.load(Ordering::Relaxed){return Some(EngineError{code:534,message:"网络统计计数超出范围。"})}
+    let code=state.consumer_error.load(Ordering::Relaxed);
+    (code!=0).then_some(EngineError{code,message:"网络事件消费者已退出。"})
+}
+
 #[cfg(test)]
 mod tests{
     use super::*;
     use std::{io::{Read,Write},net::{TcpListener,TcpStream},time::{Duration,Instant,SystemTime,UNIX_EPOCH}};
+    use std::os::windows::{io::AsRawHandle,process::CommandExt};
+    fn without_trace()->EtwSession{
+        EtwSession{control:CONTROLTRACE_HANDLE::default(),consumer:PROCESSTRACE_HANDLE::default(),properties:vec![],_name:vec![],_logfile:Box::new(EVENT_TRACE_LOGFILEW::default()),state:Arc::new(State::new(crate::traffic::process_sid(unsafe{GetCurrentProcess()}).unwrap())),context:std::ptr::null(),thread:None,_privilege:None}
+    }
+    #[test]fn short_lived_binding_fixture(){
+        if std::env::var_os("CODEX_TRAFFIC_BINDING_FIXTURE").is_some(){let _=std::io::stdin().read_exact(&mut [0u8;1]);}
+    }
+    fn child_fixture()->std::process::Child{
+        std::process::Command::new(std::env::current_exe().unwrap()).args(["--exact","traffic_etw::tests::short_lived_binding_fixture"]).env("CODEX_TRAFFIC_BINDING_FIXTURE","1").creation_flags(0x08000000).stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().unwrap()
+    }
+    fn release_child(child:&mut std::process::Child){
+        child.stdin.take().unwrap().write_all(b"x").unwrap();assert!(child.wait().unwrap().success());
+    }
+    #[test]fn expired_bindings_leave_live_targets_usable_and_explicitly_partial(){
+        let mut child=child_fixture();let expired=crate::traffic::identity_on(windows::Win32::Foundation::HANDLE(child.as_raw_handle())).unwrap();release_child(&mut child);
+        let own=crate::traffic::identity_on(unsafe{GetCurrentProcess()}).unwrap();let mut session=without_trace();
+        session.set_targets(&[own,expired]).unwrap();assert!(session.state.partial.load(Ordering::Relaxed));assert_eq!(session.state.binding_error.load(Ordering::Relaxed),0);
+        let bindings=session.state.bindings.read().unwrap();assert!(bindings.contains_key(&own.pid));assert!(!bindings.contains_key(&expired.pid));drop(bindings);
+        session.set_targets(&[own]).unwrap();assert!(session.state.partial.load(Ordering::Relaxed),"Earlier skipped bytes cannot become complete when a later list succeeds");
+        assert!(sample_error(&session.state,0,Some(0),Some(0)).is_none());
+        let mut clean=without_trace();clean.set_targets(&[own]).unwrap();assert!(!clean.state.partial.load(Ordering::Relaxed));
+    }
+    #[test]fn stale_pid_identity_is_never_bound_to_the_replacement(){
+        let own=crate::traffic::identity_on(unsafe{GetCurrentProcess()}).unwrap();let stale=ProcessIdentity{created_filetime:own.created_filetime-1,..own};let mut session=without_trace();
+        session.set_targets(&[stale]).unwrap();assert!(session.state.bindings.read().unwrap().is_empty());assert!(session.state.partial.load(Ordering::Relaxed));
+        session.set_targets(&[own]).unwrap();let bindings=session.state.bindings.read().unwrap();assert_eq!(bindings[&own.pid].len(),1);assert_eq!(bindings[&own.pid][0].identity,own);
+    }
+    #[test]fn late_events_use_retained_exit_times_and_cannot_cross_pid_lifetimes(){
+        let mut child=child_fixture();let identity=crate::traffic::identity_on(windows::Win32::Foundation::HANDLE(child.as_raw_handle())).unwrap();let mut session=without_trace();session.set_targets(&[identity]).unwrap();release_child(&mut child);session.set_targets(&[]).unwrap();
+        let exited={let bindings=session.state.bindings.read().unwrap();exited_at(&bindings[&identity.pid][0]).unwrap()};
+        let mut fields=[identity.pid.to_le_bytes(),128u32.to_le_bytes()].concat();let mut record=EVENT_RECORD::default();record.UserContext=Arc::as_ptr(&session.state)as *mut _;record.UserData=fields.as_mut_ptr().cast();record.UserDataLength=fields.len()as u16;record.EventHeader.ProviderId=GUID::from_u128(traffic_core::TCP_PROVIDER);record.EventHeader.EventDescriptor.Version=2;record.EventHeader.EventDescriptor.Opcode=10;
+        record.EventHeader.TimeStamp=(identity.created_filetime+(exited-identity.created_filetime)/2)as i64;unsafe{record_callback(&mut record)};assert_eq!(session.state.sent.load(Ordering::Relaxed),128);
+        record.EventHeader.TimeStamp=(exited+1)as i64;unsafe{record_callback(&mut record)};record.EventHeader.TimeStamp=(identity.created_filetime-1)as i64;unsafe{record_callback(&mut record)};assert_eq!(session.state.sent.load(Ordering::Relaxed),128);
+        assert!(!session.state.partial.load(Ordering::Relaxed),"A retained exact lifetime handles delayed buffers without losing scope");
+    }
+    #[test]fn partial_scope_never_hides_permission_loss_or_real_engine_failure(){
+        let state=State::new("fixture".into());state.partial.store(true,Ordering::Relaxed);assert!(sample_error(&state,0,Some(0),Some(0)).is_none());
+        assert_eq!(sample_error(&state,0,Some(1),Some(0)).unwrap().code,234);assert_eq!(sample_error(&state,5,None,None).unwrap().code,5);
+        state.binding_error.store(5,Ordering::Relaxed);assert_eq!(sample_error(&state,0,Some(0),Some(0)).unwrap().code,5);state.binding_error.store(0,Ordering::Relaxed);
+        state.unsupported.store(true,Ordering::Relaxed);assert_eq!(sample_error(&state,0,Some(0),Some(0)).unwrap().code,50);state.unsupported.store(false,Ordering::Relaxed);
+        state.overflow.store(true,Ordering::Relaxed);assert_eq!(sample_error(&state,0,Some(0),Some(0)).unwrap().code,534);state.overflow.store(false,Ordering::Relaxed);
+        state.consumer_error.store(6,Ordering::Relaxed);assert_eq!(sample_error(&state,0,Some(0),Some(0)).unwrap().code,6);
+    }
     fn transfer_loopback(bytes:usize){
         let timeout=Duration::from_secs(2);let listener=TcpListener::bind((std::net::Ipv4Addr::LOCALHOST,0)).expect("bind isolated CI loopback socket");
         listener.set_nonblocking(true).unwrap();

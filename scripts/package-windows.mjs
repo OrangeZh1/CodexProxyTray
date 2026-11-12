@@ -19,8 +19,10 @@ if(await sha256(loader)!=='86545b66cdb0603bc26b626fb9ad610cb6e71f28d468f5ea66df2
 await mkdir(output,{recursive:true});if((await readdir(output)).length)throw Error('Output must be empty; existing deliverables are preserved.');
 const receipt={schema:1,product:'CodexProxyTray',version,packaged_at:new Date().toISOString(),source_commit:process.env.GITHUB_SHA||null,files:[]};
 for(const [name,path] of files){await copyFile(path,join(output,name));receipt.files.push({name,sha256:await sha256(join(output,name))});}
-await copyFile(new URL('../LICENSE',import.meta.url),join(output,'LICENSE'));
-receipt.files.push({name:'LICENSE',sha256:await sha256(join(output,'LICENSE'))});
+for(const [name,path] of [['LICENSE','../LICENSE'],['THIRD_PARTY_NOTICES.md','../THIRD_PARTY_NOTICES.md'],['flag-icons-license.txt','../ui/flags/LICENSE']]){
+  await copyFile(new URL(path,import.meta.url),join(output,name));
+  receipt.files.push({name,sha256:await sha256(join(output,name))});
+}
 await writeFile(join(output,'SHA256SUMS.txt'),receipt.files.map(file=>`${file.sha256}  ${file.name}`).join('\n')+'\n');
 await writeFile(join(output,'package-receipt.json'),JSON.stringify(receipt,null,2)+'\n');
 console.log(`Packaged all three required runtime files: ${output}`);

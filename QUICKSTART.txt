@@ -1,4 +1,4 @@
-CodexProxyTray v0.1.0 · Windows x64
+CodexProxyTray v0.2.0 · Windows x64
 
 用途
 为 ChatGPT 桌面端和 Windows Codex CLI 提供指定的本地 HTTP 代理环境，
@@ -12,7 +12,8 @@ CodexProxyTray v0.1.0 · Windows x64
 开始使用
 1. 完整解压发行 ZIP 到一个固定目录。
    请保留 CodexProxyTray.exe、codex-proxy-cli.exe、WebView2Loader.dll、
-   LICENSE、fluent-icons-license.txt 和包内的校验、版本回执文件。
+   LICENSE、THIRD_PARTY_NOTICES.md、flag-icons-license.txt、
+   fluent-icons-license.txt 和包内的校验、版本回执文件。
 2. 先启动本机代理客户端，确认 HTTP / mixed 端口可用。
 3. 双击 CodexProxyTray.exe，在“代理”页填写并应用地址，
    例如 http://127.0.0.1:7890，然后确认守护已开启。

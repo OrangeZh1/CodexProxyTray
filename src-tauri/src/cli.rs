@@ -1,6 +1,7 @@
 mod core;
 mod settings;
 #[cfg(windows)] mod native;
+#[cfg(windows)] mod desktop_lifecycle;
 #[cfg(windows)] mod traffic_core;
 #[cfg(windows)] mod platform;
 
@@ -14,7 +15,7 @@ fn main(){
     let active=valid&&platform::guard_active(&settings::event_name(&root));
     let args=std::env::args_os().skip(1).collect::<Vec<_>>();
     if args.len()==1&&args[0]=="--proxy-info"{println!("{}",serde_json::json!({"guard_active":active,"proxy_url":if active{Some(&config.proxy_url)}else{None},"target":command,"lookup":settings::cli_lookup_info(&root)}));return}
-    let Some(program)=command.first()else{eprintln!("未找到 Codex CLI。请先安装 CLI，再在 CodexProxyTray 中重新检测。");exit(127)};
+    let Some(program)=command.first()else{eprintln!("未找到 Codex CLI。请先安装 CLI，CodexProxyTray 会自动检测接入。");exit(127)};
     let mut child=Command::new(program);child.args(&command[1..]).args(args);
     if active{for(key,value)in core::proxy_pairs(&config.proxy_url){child.env(key,value);}}
     platform::wait_for_console_child();

@@ -12,7 +12,8 @@ function Draw-Logo([int]$Size) {
         $graphics.Clear([Drawing.Color]::Transparent)
         $graphics.SmoothingMode = [Drawing.Drawing2D.SmoothingMode]::AntiAlias
         if ($Size -le 24) { $graphics.PixelOffsetMode = [Drawing.Drawing2D.PixelOffsetMode]::Half }
-        $graphics.ScaleTransform($Size / 128.0, $Size / 128.0)
+        $graphics.ScaleTransform($Size / 124.0, $Size / 124.0)
+        $graphics.TranslateTransform(-2, -2)
         $tile = [Drawing.Drawing2D.GraphicsPath]::new()
         $tile.AddArc(4, 4, 58, 58, 180, 90)
         $tile.AddArc(66, 4, 58, 58, 270, 90)

@@ -13,7 +13,7 @@ foreach($path in @($output,$evidence)){if(Test-Path -LiteralPath $path){throw 'C
 $report=[ordered]@{schema=1;status='running';started_at=[DateTime]::UtcNow.ToString('o');source_commit=$env:GITHUB_SHA;scope='Create and reopen the release ZIP; verify exact files, hashes, version, source and update manifest; no application launch or user configuration access';checks=@();cleanup='not_needed';error=$null}
 $tempRoot=[IO.Path]::GetFullPath($env:RUNNER_TEMP)
 $stage=Join-Path $tempRoot ('CodexProxyTray-release-'+[Guid]::NewGuid().ToString('N'))
-$core=@('CodexProxyTray.exe','codex-proxy-cli.exe','WebView2Loader.dll','LICENSE')
+$core=@('CodexProxyTray.exe','codex-proxy-cli.exe','WebView2Loader.dll','LICENSE','THIRD_PARTY_NOTICES.md','flag-icons-license.txt')
 $payload=$core+@('package-receipt.json','QUICKSTART.txt','fluent-icons-license.txt','SHA256SUMS.txt')
 function Hash([string]$Path){(Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()}
 function Require([bool]$Condition,[string]$Name){if(-not $Condition){throw $Name};$script:report.checks+=@{name=$Name;status='passed'}}
@@ -25,7 +25,8 @@ try {
     Require ($version -match '^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$' -and $tauri.version -eq $version -and $receipt.version -eq $version) 'version_matches_package_and_application'
     Require ($receipt.schema -eq 1 -and $receipt.product -eq 'CodexProxyTray' -and $receipt.source_commit -eq $env:GITHUB_SHA) 'source_receipt_matches_ci'
     $names=@(Get-ChildItem -LiteralPath $package -Force|Select-Object -ExpandProperty Name)
-    Require (@(Compare-Object ($core+@('package-receipt.json','SHA256SUMS.txt')|Sort-Object) ($names|Sort-Object)).Count -eq 0 -and @($receipt.files).Count -eq 4) 'input_package_allowlist'
+    Require (@(Compare-Object ($core+@('package-receipt.json','SHA256SUMS.txt')|Sort-Object) ($names|Sort-Object)).Count -eq 0 -and @($receipt.files).Count -eq $core.Count) 'input_package_allowlist'
+    Require (@(Compare-Object ($core|Sort-Object) (@($receipt.files.name)|Sort-Object)).Count -eq 0) 'receipt_contains_exact_package_files'
     foreach($file in $receipt.files){Require ($file.name -in $core -and (Hash (Join-Path $package $file.name)) -eq $file.sha256) ('verified_'+$file.name)}
     $quick=Join-Path $repo 'QUICKSTART.txt'
     Require ((Get-Content -LiteralPath $quick -Raw -Encoding utf8).Contains("CodexProxyTray v$version")) 'offline_guide_matches_version'

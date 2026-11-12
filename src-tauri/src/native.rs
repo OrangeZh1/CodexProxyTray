@@ -92,15 +92,15 @@ pub fn resume(request:ResumeRequest) -> Result<(),String> { unsafe {
     let result=(||{if GetProcessIdOfThread(thread)!=request.pid{return Err("启动线程与进程不匹配".into())}let process=OpenProcess(0x1000,0,request.pid);if process.is_null(){return Err(os_error())}let allowed=family_matches(process);CloseHandle(process);if !allowed{return Err("目标不属于 ChatGPT 应用包".into())}if ResumeThread(thread)==u32::MAX{return Err(os_error())}Ok(())})();CloseHandle(thread);result
 } }
 
-pub struct DesktopInfo {pub pid:u32,pub started_at:u64,pub pids:Vec<u32>}
+pub struct DesktopInfo {pub pid:u32,pub started_at:u64,pub created_filetime:u64,pub pids:Vec<u32>}
 pub fn desktop_info() -> Option<DesktopInfo> { unsafe {
     let snapshot=CreateToolhelp32Snapshot(2,0);if snapshot as isize == -1{return None}
     let mut entry:ProcessEntry=std::mem::zeroed();entry.size=std::mem::size_of::<ProcessEntry>() as u32;let mut rows=vec![];
     let mut more=Process32FirstW(snapshot,&mut entry);while more!=0 {rows.push((entry.pid,entry.parent,string(&entry.exe).eq_ignore_ascii_case("ChatGPT.exe")));more=Process32NextW(snapshot,&mut entry);}CloseHandle(snapshot);
     let mut roots=vec![];
-    for &(pid,parent,is_chatgpt) in &rows {if !is_chatgpt||rows.iter().any(|&(p,_,chatgpt)|p==parent&&chatgpt){continue}let process=OpenProcess(0x1000,0,pid);if process.is_null(){continue}let(mut created,mut exited,mut kernel,mut user)=(0,0,0,0);let good=family_matches(process)&&GetProcessTimes(process,&mut created,&mut exited,&mut kernel,&mut user)!=0;CloseHandle(process);if good {roots.push((created/10000-11644473600000,pid));}}
-    roots.sort_unstable();let &(started_at,pid)=roots.first()?;let ids=roots.iter().map(|r|r.1).collect::<Vec<_>>();
-    Some(DesktopInfo{pid,started_at,pids:crate::core::descendant_pids(&rows.iter().map(|r|(r.0,r.1)).collect::<Vec<_>>(),&ids)})
+    for &(pid,parent,is_chatgpt) in &rows {if !is_chatgpt||rows.iter().any(|&(p,_,chatgpt)|p==parent&&chatgpt){continue}let process=OpenProcess(0x1000,0,pid);if process.is_null(){continue}let(mut created,mut exited,mut kernel,mut user)=(0,0,0,0);let good=family_matches(process)&&GetProcessTimes(process,&mut created,&mut exited,&mut kernel,&mut user)!=0;CloseHandle(process);if good {roots.push((created,pid));}}
+    roots.sort_unstable();let &(created_filetime,pid)=roots.first()?;let ids=roots.iter().map(|r|r.1).collect::<Vec<_>>();
+    Some(DesktopInfo{pid,started_at:(created_filetime/10000).saturating_sub(11644473600000),created_filetime,pids:crate::core::descendant_pids(&rows.iter().map(|r|(r.0,r.1)).collect::<Vec<_>>(),&ids)})
 } }
 /// Attribution is based on live process identity and exact installed paths. A
 /// similarly named codex.exe/node.exe is never enough to join the target set.
@@ -123,7 +123,7 @@ pub fn traffic_targets(root:&std::path::Path,config:&crate::settings::Config)->R
     }if !added{break}}
     let targets=selected.into_iter().filter_map(|pid|identified.remove(&pid)).collect::<Vec<_>>();crate::traffic_core::validate_targets(&targets)?;Ok(targets)
 }}
-unsafe fn process_identity(pid:u32)->Option<(crate::traffic_core::ProcessIdentity,String,bool)>{
+pub(crate) unsafe fn process_identity(pid:u32)->Option<(crate::traffic_core::ProcessIdentity,String,bool)>{
     let process=OpenProcess(0x1000,0,pid);if process.is_null(){return None}
     let mut path=vec![0u16;32768];let mut length=path.len()as u32;let(mut created,mut exited,mut kernel,mut user)=(0,0,0,0);
     let valid=QueryFullProcessImageNameW(process,0,path.as_mut_ptr(),&mut length)!=0&&GetProcessTimes(process,&mut created,&mut exited,&mut kernel,&mut user)!=0&&created!=0&&exited==0;
@@ -140,5 +140,6 @@ pub fn tcp_connections(pids:&[u32])->Option<usize>{unsafe{
 pub fn small_icon_size()->u32{unsafe{GetSystemMetricsForDpi(49,GetDpiForSystem()).max(16)as u32}}
 pub fn set_window_icons(window:Handle){unsafe{let dpi=GetDpiForWindow(window);for (kind,metric) in [(0,49),(1,11)]{let size=GetSystemMetricsForDpi(metric,dpi);let icon=LoadImageW(GetModuleHandleW(ptr::null()),32512usize as *const u16,1,size,size,0x8000);if !icon.is_null(){SendMessageW(window,0x0080,kind,icon as isize);}}}}
 
-pub fn open_desktop() -> Result<(),String> { open(&format!("shell:AppsFolder\\{FAMILY}!App")) }
+pub fn open_desktop() -> Result<(),String> { crate::desktop_lifecycle::launch_desktop() }
+pub(crate) fn activate_desktop() -> Result<(),String> { open(&format!("shell:AppsFolder\\{FAMILY}!App")) }
 pub fn open(target:&str) -> Result<(),String> { unsafe {let verb=wide("open");let file=wide(target);let result=ShellExecuteW(ptr::null_mut(),verb.as_ptr(),file.as_ptr(),ptr::null(),ptr::null(),1);if result<=32{Err(format!("无法打开目标：Windows 错误 {result}"))}else{Ok(())}} }

@@ -3,7 +3,7 @@
 use std::{ffi::{OsStr,OsString},mem::size_of,os::windows::ffi::{OsStrExt,OsStringExt},path::{Path,PathBuf},sync::{Arc,Mutex,atomic::{AtomicBool,Ordering}},thread::{self,JoinHandle},time::{Duration,Instant,SystemTime,UNIX_EPOCH}};
 use serde::{Serialize,Deserialize};
 use windows::{core::{GUID,PCWSTR,PWSTR},Win32::{Foundation::*,Security::{GetTokenInformation,TOKEN_QUERY,TOKEN_USER,TokenUser,SECURITY_ATTRIBUTES,PSECURITY_DESCRIPTOR},Security::{Authorization::{ConvertSidToStringSidW,ConvertStringSecurityDescriptorToSecurityDescriptorW},Cryptography::{BCryptGenRandom,BCRYPT_USE_SYSTEM_PREFERRED_RNG}},Storage::FileSystem::*,System::{Pipes::*,Threading::*}}};
-use crate::{traffic_core::{self,ProcessIdentity},traffic_etw::{EtwSession,EngineError}};
+use crate::{traffic_core::{self,ProcessIdentity},traffic_etw::{EtwSession,EngineError,EngineSample}};
 
 const PROTOCOL:u32=2;const MAX_FRAME:usize=32768;const PIPE_PREFIX:&str=r"\\.\pipe\CodexProxyTray.Traffic.";
 #[derive(Clone,Copy,Debug,Serialize,Deserialize,PartialEq,Eq)]#[serde(rename_all="snake_case")]
@@ -11,9 +11,10 @@ pub enum TrafficState{Disabled,Starting,Collecting,NeedsInstallation,NeedsPermis
 #[derive(Clone,Debug,Serialize,Deserialize)]#[serde(deny_unknown_fields)]
 pub struct TrafficSnapshot{
     pub state:TrafficState,pub timestamp_ms:u64,pub received_bytes:Option<u64>,pub sent_bytes:Option<u64>,pub receive_bps:Option<f64>,pub send_bps:Option<f64>,pub target_count:u32,pub lost_events:Option<u64>,pub lost_buffers:Option<u64>,pub message:Option<String>,pub scope:String,
+    #[serde(default)]pub partial:bool,
 }
 impl TrafficSnapshot{
-    fn state(state:TrafficState,message:Option<String>)->Self{Self{state,timestamp_ms:now(),received_bytes:None,sent_bytes:None,receive_bps:None,send_bps:None,target_count:0,lost_events:None,lost_buffers:None,message,scope:"current_verified_processes_since_enable".into()}}
+    fn state(state:TrafficState,message:Option<String>)->Self{Self{state,timestamp_ms:now(),received_bytes:None,sent_bytes:None,receive_bps:None,send_bps:None,target_count:0,lost_events:None,lost_buffers:None,message,scope:"current_verified_processes_since_enable".into(),partial:false}}
     pub fn disabled()->Self{Self::state(TrafficState::Disabled,None)}
 }
 #[derive(Clone,Copy)]pub enum EnableMode{Normal}
@@ -151,6 +152,20 @@ fn parse_collector_args(args:&[OsString])->Result<(String,ProcessIdentity),Strin
     let pid=args[4].to_str().and_then(|value|value.parse::<u32>().ok()).filter(|&value|value!=0).ok_or("采样父进程无效。")?;let created_filetime=args[6].to_str().and_then(|value|value.parse::<u64>().ok()).filter(|&value|value!=0).ok_or("采样父进程无效。")?;Ok((token.into(),ProcessIdentity{pid,created_filetime}))
 }
 fn engine_failure(error:EngineError)->TrafficSnapshot{TrafficSnapshot::state(if error.needs_permission(){TrafficState::NeedsPermission}else{TrafficState::Unavailable},Some(format!("{}（{}）",error.message,error.code)))}
+fn measured_snapshot(sample:EngineSample,previous:&mut Option<(Instant,u64,u64)>,at:Instant)->TrafficSnapshot{
+    let mut snapshot=if let Some(error)=sample.error{
+        *previous=None;engine_failure(error)
+    }else if sample.had_targets&&!sample.seen{
+        TrafficSnapshot::state(TrafficState::Starting,Some("等待首个已验证目标进程的网络事件。".into()))
+    }else{
+        let mut value=TrafficSnapshot::state(TrafficState::Collecting,None);value.sent_bytes=Some(sample.sent);value.received_bytes=Some(sample.received);
+        if let Some((before,sent,received))=*previous{let seconds=at.duration_since(before).as_secs_f64();if seconds>0.0{value.send_bps=Some(sample.sent.saturating_sub(sent)as f64/seconds);value.receive_bps=Some(sample.received.saturating_sub(received)as f64/seconds);}}
+        *previous=Some((at,sample.sent,sample.received));value
+    };
+    snapshot.partial=sample.partial;
+    if sample.partial&&matches!(snapshot.state,TrafficState::Collecting|TrafficState::Starting){snapshot.message=Some("部分短命进程在绑定前已退出或身份发生变化；仅统计已验证进程，累计可能不完整。".into());}
+    snapshot.target_count=sample.target_count;snapshot.lost_events=sample.lost_events;snapshot.lost_buffers=sample.lost_buffers;snapshot
+}
 fn collect(token:&str,parent_identity:ProcessIdentity)->Result<(),String>{
     let parent=open_identity(parent_identity).map_err(|_|"采样父进程不可访问。")?.ok_or("采样父进程已退出。")?;let exe=own_image()?;
     let broker=if process_sid(unsafe{GetCurrentProcess()})?=="S-1-5-18"{crate::traffic_service::validate_service_collector(parent.0)?;Some(crate::traffic_service::collector_broker()?)}else{if !same_image(parent.0,&exe){return Err("采样父程序路径不匹配。".into())}None};
@@ -164,11 +179,26 @@ fn collect(token:&str,parent_identity:ProcessIdentity)->Result<(),String>{
         if !alive(){return Ok(())}
         if !broker_alive(){return Err("流量辅助服务已退出，本次采样已停止。".into())}
         match pipe.read::<ToCollector>()?{Some(ToCollector::Targets{protocol,targets})if protocol==PROTOCOL=>session.set_targets(&targets)?,Some(ToCollector::Stop{protocol})if protocol==PROTOCOL=>return Ok(()),Some(_)=>return Err("采样协议无效。".into()),None=>{}}
-        if sampled.elapsed()>=Duration::from_secs(1){let at=Instant::now();let sample=session.sample();let mut snapshot=if let Some(error)=sample.error{engine_failure(error)}else if sample.had_targets&&!sample.seen{TrafficSnapshot::state(TrafficState::Starting,Some("等待首个已验证目标进程的网络事件。".into()))}else{let mut value=TrafficSnapshot::state(TrafficState::Collecting,None);value.sent_bytes=Some(sample.sent);value.received_bytes=Some(sample.received);if let Some((before,sent,received))=previous{let seconds=at.duration_since(before).as_secs_f64();if seconds>0.0{value.send_bps=Some(sample.sent.saturating_sub(sent)as f64/seconds);value.receive_bps=Some(sample.received.saturating_sub(received)as f64/seconds);}}previous=Some((at,sample.sent,sample.received));value};snapshot.target_count=sample.target_count;snapshot.lost_events=sample.lost_events;snapshot.lost_buffers=sample.lost_buffers;pipe.write(&FromCollector{protocol:PROTOCOL,snapshot,stopped:false},alive)?;sampled=at;}
+        if sampled.elapsed()>=Duration::from_secs(1){let at=Instant::now();let snapshot=measured_snapshot(session.sample(),&mut previous,at);pipe.write(&FromCollector{protocol:PROTOCOL,snapshot,stopped:false},alive)?;sampled=at;}
         thread::sleep(Duration::from_millis(20));
     }})();
     // Parent death and IPC errors take this same cleanup path; no global logger name is ever stopped.
     if let Err(error)=session.stop(){let _=pipe.write(&FromCollector{protocol:PROTOCOL,snapshot:engine_failure(error),stopped:false},alive);return Err("本次采样停止未确认。".into())}
     let snapshot=match &result{Ok(())=>TrafficSnapshot::disabled(),Err(message)=>TrafficSnapshot::state(TrafficState::Unavailable,Some(message.clone()))};
     let _=pipe.finish(&FromCollector{protocol:PROTOCOL,snapshot,stopped:true},alive);result
+}
+
+#[cfg(test)]mod tests{
+    use super::*;
+    fn sample(partial:bool)->EngineSample{EngineSample{sent:2048,received:4096,seen:true,had_targets:true,partial,target_count:2,lost_events:Some(0),lost_buffers:Some(0),error:None}}
+    #[test]fn a_short_lived_target_keeps_verified_rates_but_marks_cumulative_partial(){
+        let at=Instant::now();let mut previous=Some((at-Duration::from_secs(2),1024,2048));let snapshot=measured_snapshot(sample(true),&mut previous,at);
+        assert_eq!(snapshot.state,TrafficState::Collecting);assert_eq!(snapshot.send_bps,Some(512.0));assert_eq!(snapshot.receive_bps,Some(1024.0));assert_eq!(snapshot.sent_bytes,Some(2048));assert_eq!(snapshot.received_bytes,Some(4096));assert_eq!(snapshot.target_count,2);assert!(snapshot.partial);assert!(snapshot.message.unwrap().contains("累计可能不完整"));
+    }
+    #[test]fn partial_scope_does_not_turn_engine_errors_or_waiting_into_zero_traffic(){
+        let at=Instant::now();let mut previous=Some((at-Duration::from_secs(1),1,1));let mut denied=sample(true);denied.error=Some(EngineError{code:5,message:"权限不足"});let snapshot=measured_snapshot(denied,&mut previous,at);
+        assert_eq!(snapshot.state,TrafficState::NeedsPermission);assert_eq!(snapshot.sent_bytes,None);assert_eq!(snapshot.send_bps,None);assert!(snapshot.message.unwrap().contains("权限不足"));assert!(previous.is_none());
+        let mut lost=sample(true);lost.error=Some(EngineError{code:234,message:"系统网络事件发生丢失"});assert_eq!(measured_snapshot(lost,&mut previous,at).state,TrafficState::Unavailable);
+        let mut waiting=sample(true);waiting.seen=false;let snapshot=measured_snapshot(waiting,&mut previous,at);assert_eq!(snapshot.state,TrafficState::Starting);assert!(snapshot.partial);assert_eq!(snapshot.received_bytes,None);assert_eq!(snapshot.receive_bps,None);
+    }
 }

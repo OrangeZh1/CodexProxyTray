@@ -1,0 +1,16 @@
+.log-filter-panel { padding: 12px; margin-bottom: 14px; border: 1px solid var(--panel-stroke); border-radius: 8px; background: var(--panel-bg); color: var(--text-primary); }
+.log-filter-controls { display: grid; grid-template-columns: 136px 144px minmax(160px,1fr) 32px; align-items: center; gap: 8px; }
+.log-filter-panel .setting-select { width: 100%; min-width: 0 !important; height: 32px; min-height: 32px; }
+.log-filter-panel .setting-select > button { min-height: 30px; height: 30px; padding: 0 10px; font: inherit; font-size: 13px; font-weight: 400 !important; line-height: 20px; }
+.log-filter-panel .fui-Input { min-height: 32px; min-width: 0; width: 100%; font-size: 13px; font-weight: 400; line-height: 20px; }
+.log-filter-panel .fui-Input__input { min-width: 0; font: inherit; font-weight: 400; }
+.log-filter-panel .log-filter-symbol { display: block; flex-shrink: 0; width: 18px; height: 18px; color: var(--text-muted); }
+.log-filter-panel .log-filter-reset { width: 32px; min-width: 32px !important; height: 32px; min-height: 32px; padding: 0; border-radius: 5px; }
+.log-filter-custom { display: grid; grid-template-columns: minmax(0,1fr) minmax(0,1fr); gap: 8px; margin-top: 10px; }
+.log-filter-custom label { display: grid; min-width: 0; gap: 5px; color: var(--text-secondary); font-size: 12px; line-height: 18px; }
+.log-filter-count { margin-top: 8px; color: var(--text-muted); font-size: 11px; line-height: 16px; text-align: right; font-variant-numeric: tabular-nums; }
+@media(max-width:1000px) {
+  .log-filter-controls { grid-template-columns: minmax(0,1fr) minmax(0,1fr) 32px; }
+  .log-filter-query { grid-column: 1 / -1; grid-row: 2; }
+  .log-filter-reset { grid-column: 3; grid-row: 1; }
+}

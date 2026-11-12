@@ -114,7 +114,7 @@ jobs:
           path: ${{ runner.temp }}/CodexProxyTray-cli-evidence/
           if-no-files-found: ignore
           retention-days: 7
-      - name: 打包三份必要运行文件
+      - name: 打包必要运行文件与第三方许可
         shell: pwsh
         run: |
           $ErrorActionPreference='Stop'
