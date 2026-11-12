@@ -56,7 +56,7 @@ fn download(client:&reqwest::blocking::Client,url:&str,path:&Path,limit:u64,repo
 }
 fn powershell()->PathBuf{PathBuf::from(std::env::var_os("SystemRoot").unwrap_or_else(||"C:\\Windows".into())).join("System32/WindowsPowerShell/v1.0/powershell.exe")}
 fn command(job:&Path,phase:&str)->Command{let mut command=Command::new(powershell());command.args(["-NoLogo","-NoProfile","-NonInteractive","-ExecutionPolicy","Bypass","-File"]).arg(job.join("installer.ps1")).args(["-Phase",phase,"-Job"]).arg(job).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).creation_flags(0x08000000);command}
-fn wait_prepare(child:&mut Child)->Result<(),String>{let deadline=Instant::now()+Duration::from_secs(45);loop{match child.try_wait(){Ok(Some(status))=>return if status.success(){Ok(())}else{Err("安装包或安装目录校验未通过；原程序和恢复资料已保留。".into())},Ok(None)=>{},Err(_)=>return Err("无法读取安装校验结果。".into())}if Instant::now()>=deadline{let _=child.kill();let _=child.wait();return Err("安装校验超时，原程序未替换。".into())}thread::sleep(Duration::from_millis(100));}}
+fn wait_prepare(child:&mut Child,job:&Path)->Result<(),String>{let deadline=Instant::now()+Duration::from_secs(45);loop{match child.try_wait(){Ok(Some(status))=>return if status.success(){Ok(())}else{Err(read_small(&job.join("result.json"),16384).and_then(|bytes|serde_json::from_slice::<serde_json::Value>(&bytes).ok()).and_then(|value|value["error"].as_str().map(|text|text.chars().take(1000).collect::<String>())).unwrap_or_else(||"安装包或安装目录校验未通过；原程序和恢复资料已保留。".into()))},Ok(None)=>{},Err(_)=>return Err("无法读取安装校验结果。".into())}if Instant::now()>=deadline{let _=child.kill();let _=child.wait();return Err("安装校验超时，原程序未替换。".into())}thread::sleep(Duration::from_millis(100));}}
 pub struct Prepared{job:PathBuf,version:String,_lease:Option<Lease>}
 impl Drop for Prepared{fn drop(&mut self){if self._lease.is_some(){let _=fs::write(self.job.join("cancelled.json"),b"{}");let mut state=view().lock().unwrap_or_else(|e|e.into_inner());state.phase="error".into();state.error=Some("更新交接未完成，助手继续运行。".into());}}}
 
@@ -83,7 +83,7 @@ pub fn prepare(expected:String)->Result<Prepared,String>{
         let exe=std::env::current_exe().map_err(|_|"无法确定当前安装位置。")?;
         let identity=unsafe{crate::traffic::identity_on(windows::Win32::System::Threading::GetCurrentProcess())}.map_err(|_|"无法核验助手进程。")?;
         settings::write_json(&job.join("plan.json"),&serde_json::json!({"schema":1,"product":"CodexProxyTray","version":expected,"zip_sha256":zip_hash,"manifest_sha256":manifest_hash,"executable":exe,"data_root":root,"parent_pid":std::process::id(),"parent_created":identity.created_filetime.to_string()}))?;
-        phase("verifying");let mut child=command(&job,"Prepare").spawn().map_err(|_|"无法启动安装包校验。")?;wait_prepare(&mut child)?;
+        phase("verifying");let mut child=command(&job,"Prepare").spawn().map_err(|_|"无法启动安装包校验。")?;wait_prepare(&mut child,&job)?;
         if !settings::load(&root).is_ok_and(|c|c.network_enabled){return Err("联网检测已关闭，更新已停止，原程序保持运行。".into())}
         Ok(job)
     })();

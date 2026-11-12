@@ -11,7 +11,7 @@ $zip=Join-Path $release ("CodexProxyTray-v$($manifest.version)-windows-x64.zip")
 $report=[ordered]@{schema=1;status='running';checks=@();scope='Isolated real helper restart, hash/path rejection, rollback and config/log preservation; no real user profiles, network or service changes';cleanup='pending'}
 function Hash([string]$Path){(Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()}
 function WriteJson([string]$Path,$Value){[IO.File]::WriteAllText($Path,($Value|ConvertTo-Json -Depth 20),[Text.UTF8Encoding]::new($false))}
-function Require([bool]$Condition,[string]$Name){if(-not $Condition){throw $Name};$script:report.checks+=@{name=$Name;status='passed'}}
+function Require([bool]$Condition,[string]$Name){if(-not $Condition){foreach($case in $script:cases){if($case.job -and (Test-Path -LiteralPath (Join-Path $case.job 'result.json'))){Write-Output ('Installer outcome: '+(Get-Content -LiteralPath (Join-Path $case.job 'result.json') -Raw))}};throw $Name};$script:report.checks+=@{name=$Name;status='passed'}}
 function StartOwned($Case,[string]$File,[string[]]$Arguments){$info=[Diagnostics.ProcessStartInfo]::new($File);$info.UseShellExecute=$false;$info.CreateNoWindow=$true;$info.WindowStyle='Hidden';$info.WorkingDirectory=[IO.Path]::GetDirectoryName($File);$info.Environment['LOCALAPPDATA']=$Case.profile;$info.Environment['APPDATA']=Join-Path $Case.profile 'Roaming';$info.Environment['WEBVIEW2_USER_DATA_FOLDER']=Join-Path $Case.profile 'webview';foreach($argument in $Arguments){$info.ArgumentList.Add($argument)};[Diagnostics.Process]::Start($info)}
 function WaitFor([scriptblock]$Check,[int]$Seconds,[string]$Name){$end=[DateTime]::UtcNow.AddSeconds($Seconds);do{if(& $Check){return};Start-Sleep -Milliseconds 200}while([DateTime]::UtcNow -lt $end);throw $Name}
 function Case([string]$Name){
@@ -71,6 +71,7 @@ try {
     $report.status='passed'
 } catch {$report.status='failed';$report['error']=$_.Exception.Message;$report['diagnostic_root']=$root;throw}
 finally {
+    foreach($case in $cases){foreach($jobFolder in @(Get-ChildItem -LiteralPath (Join-Path $case.data 'updates') -Directory -ErrorAction SilentlyContinue)){foreach($name in @('result.json','plan.json','verified.json')){$path=Join-Path $jobFolder.FullName $name;if(Test-Path -LiteralPath $path){Copy-Item -LiteralPath $path -Destination (Join-Path $EvidenceDirectory ((Split-Path -Leaf $case.directory)+'-'+$jobFolder.Name+'-'+$name))}}}}
     foreach($case in $cases){try{StopCase $case}catch{$report.cleanup='retained: owned fixture still active'}}
     if($report.status -eq 'passed' -and $report.cleanup -ne 'retained: owned fixture still active'){
         $resolved=(Resolve-Path -LiteralPath $root).Path;$boundary=[IO.Path]::GetFullPath($env:RUNNER_TEMP);if(-not $resolved.StartsWith($boundary+'\',[StringComparison]::OrdinalIgnoreCase) -or ((Get-Item -LiteralPath $resolved).Attributes -band [IO.FileAttributes]::ReparsePoint)){throw 'Cleanup boundary mismatch'}
