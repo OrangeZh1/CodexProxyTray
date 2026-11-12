@@ -270,6 +270,7 @@ try {
   assert.match(usage,/data-usage-state="ready"/);assert.match(usage,/Token 用量趋势，纵轴从 0/);assert.match(usage,/model-a/);assert.match(usage,/model-b/);assert.match(usage,/估算费用 · USD/);assert.match(usage,/尚未配置完整单价/);assert.doesNotMatch(usage,/北京时间|NaN|Infinity/);
   assert.match(control(usage,'button','usage-metric-tokens'),/aria-pressed="true"/);assert.match(control(usage,'button','usage-metric-cost'),/aria-pressed="false"/);assert.match(control(usage,'button','usage-metric-records'),/aria-pressed="false"/);
   assert.match(usage,/id="usage-record-0"/);assert.match(usage,/用量设置/);assert.doesNotMatch(usage,/统计范围与计算口径|usage-source-line|usage-provider-summary/);
+  const timingUsage=renderToStaticMarkup(React.createElement(UsageView,{initialSnapshot:{...usageData,records:usageData.records.map((row,index)=>({...row,ttft_ms:index?97:1279,timing_estimated:index===0}))}}));assert.match(timingUsage,/≈ 1\.3 s/);assert.match(timingUsage,/97 ms/);
   const absentUsage=renderToStaticMarkup(React.createElement(UsageView,{initialSnapshot:{...usageData,source_available:false,summary:{input_tokens:0,cached_input_tokens:0,output_tokens:0,total_tokens:0,request_count:0},records:[],models:[],series:[]}}));
   assert.match(absentUsage,/data-usage-state="empty"/);assert.match(absentUsage,/未找到本机可读取的 Codex 用量记录/);assert.doesNotMatch(absentUsage,/\$0\.00/,'Missing source data must not imply a zero bill.');
   checks++;
