@@ -21,7 +21,8 @@ function Case([string]$Name){
     WriteJson (Join-Path $data 'config.json') @{launch_target='none';network_enabled=$false;auto_check_updates=$false;connectivity_enabled=$false;traffic_enabled=$false;proxy_url='http://127.0.0.1:17890'}
     WriteJson (Join-Path $data 'logs\events-v1.json') @{schema=1;records=@(@{id=1;at=1;level='info';category='fixture';message='preserve-this-record';details='synthetic local data'})}
     $files=@(Get-ChildItem -LiteralPath $target|ForEach-Object {@{name=$_.Name;sha256=Hash $_.FullName}})
-    WriteJson (Join-Path $directory 'app\active-version.json') @{schema=1;state='active';current=@{path=$target;files=$files;source_commit=$env:GITHUB_SHA};recovery_references=@()}
+    $previous=Join-Path $directory 'app\previous';[void](New-Item -ItemType Directory -Path $previous);[IO.Compression.ZipFile]::ExtractToDirectory($zip,$previous)
+    WriteJson (Join-Path $directory 'app\active-version.json') @{schema=1;state='active';current=@{path=$target;files=$files;source_commit=$env:GITHUB_SHA};previous=@{path=$previous;files=$files;source_commit=$env:GITHUB_SHA};recovery_references=@()}
     WriteJson (Join-Path $directory 'app\install-journal.json') @{schema=1;state='installed'}
     $case=[pscustomobject]@{directory=$directory;profile=$profilePath;data=$data;target=$target;exe=(Join-Path $target 'CodexProxyTray.exe');parent=$null;job=$null;installer=$null}
     $case.parent=StartOwned $case $case.exe @('--background')
@@ -48,6 +49,7 @@ try {
     Require ((Hash (Join-Path $job 'config.json')) -eq $configHash) 'original_configuration_archived_exactly'
     $logs=Get-Content -LiteralPath (Join-Path $job 'events-v1.json') -Raw|ConvertFrom-Json;Require (@($logs.records|Where-Object message -eq 'preserve-this-record').Count -eq 1) 'all_pre_update_log_records_archived'
     Require ((Test-Path -LiteralPath (Join-Path $good.directory 'app\previous\CodexProxyTray.exe')) -and -not (Test-Path -LiteralPath (Join-Path $job 'package.zip'))) 'one_previous_version_and_download_cleanup'
+    Require (@(Get-ChildItem -LiteralPath (Join-Path $good.directory 'app') -Directory).Count -eq 2 -and (Test-Path -LiteralPath (Join-Path $job 'receipt-lifecycle.json'))) 'retired_code_removed_only_after_receipt_references_are_superseded'
     Copy-Item -LiteralPath (Join-Path $job 'result.json') -Destination (Join-Path $EvidenceDirectory 'success-result.json');StopCase $good
     # A validly hashed synthetic package whose executable exits without readiness
     # exercises the actual rollback; no production-only test bypass is added.
