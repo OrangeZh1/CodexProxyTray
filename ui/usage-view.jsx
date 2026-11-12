@@ -193,10 +193,10 @@ export function UsageView({invoke,initialSnapshot=null}){
     const before=new Set(previous.keys),fresh=new Set(entries.filter(entry=>!before.has(entry.key)&&entry.row.at>=previous.latest).map(entry=>entry.key));
     if(!fresh.size)return;
     const reduced=window.matchMedia?.('(prefers-reduced-motion: reduce)').matches,style=getComputedStyle(body),highlight=style.getPropertyValue('--action-soft').trim()||style.getPropertyValue('--selection-bg').trim(),animations=[],marked=[];
-    for(const row of Array.from(body.rows)){
+    for(const row of Array.from(body.children)){
       if(!fresh.has(row.dataset.usageRowKey))continue;
       row.dataset.usageRowPhase='new';marked.push(row);let finish;
-      for(const cell of Array.from(row.cells)){
+      for(const cell of Array.from(row.children)){
         const own=getComputedStyle(cell).boxShadow,keep=own&&own!=='none'?`, ${own}`:'';
         finish=cell.animate([{boxShadow:`inset 0 0 0 100vmax ${highlight}${keep}`},{boxShadow:`inset 0 0 0 100vmax transparent${keep}`}],{duration:1200,easing:'ease-in',fill:'backwards'});animations.push(finish);
       }
