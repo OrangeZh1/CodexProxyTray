@@ -120,12 +120,12 @@ try {
   assert.match(buttonLabel(background,'update-interval'),/3 小时/);
   assert.doesNotMatch(background,/<img\b|about-brand|北京时间/);
   assert.match(background,/20:34:56/);
-  assert.match(introduction,/不记录对话、提示词或用户 CLI 参数/);
+  assert.match(introduction,/不保存对话、提示词或用户 CLI 参数/);
   assert.match(introduction,/完整数据与隐私说明|privacy-entry/);assert.match(introduction,/免责声明/);
   assert.doesNotMatch(introduction,/本机采样包括|只在本机读取 Codex 会话日志/,'Full privacy copy belongs in its inner page.');
   const privacy=renderToStaticMarkup(React.createElement(PrivacyDetails));
-  assert.match(privacy,/不记录或上报对话、提示词、用户 CLI 参数/);assert.match(privacy,/启动参数仅原样转发给已安装的 CLI/);assert.match(privacy,/目标应用代理和本机 TCP 探测继续运行/);
-  assert.match(privacy,/打开实时连接详情时，会临时读取/);assert.match(privacy,/不写入日志或历史/);assert.match(privacy,/不保存或展示会话内容/);
+  assert.match(privacy,/不记录或上报对话、提示词、用户 CLI 参数/);assert.match(privacy,/启动参数仅原样转发给已安装的 CLI/);assert.match(privacy,/目标应用代理、本机 TCP 探测和本机用量读取继续运行/);
+  assert.match(privacy,/打开实时连接详情时，会临时读取/);assert.match(privacy,/不写入日志或历史/);assert.match(privacy,/不保存或展示原文/);
   const privacyPage=settingsPanel(render('settings',sample,'privacy'),'privacy');assert.match(privacyPage,/本机采样包括/);
   const disclaimer=settingsPanel(render('settings',sample,'disclaimer'),'disclaimer');assert.match(disclaimer,/国际出入口信道/);assert.match(disclaimer,/不排除依法不得排除的责任/);
   assert.match(introduction,/MIT 许可/);assert.match(introduction,/aria-haspopup="dialog"/);assert.doesNotMatch(introduction,/<details\b[^>]*class="privacy-details"/);
@@ -216,7 +216,7 @@ try {
 
   const connectivity=(result,extra={})=>renderToStaticMarkup(React.createElement(ConnectivityCard,{result,observed:true,writable:true,enabled:true,busy:false,onCheck:noop,...extra}));
   const available=connectivity({status:'available',latency_ms:1234,ip:'203.0.113.7',country:'CN',http_status:200,checked_at:1000});
-  assert.match(available,/ChatGPT 网页连通性/);assert.match(available,/完整 HTTP 探测耗时/);assert.match(available,/探测出口/);assert.match(available,/203\.0\.113\.7/);assert.match(available,/>CN</);assert.match(available,/网页可达/);
+  assert.match(available,/ChatGPT 网页连通性/);assert.match(available,/完整 HTTP 探测耗时/);assert.match(available,/探测出口/);assert.match(available,/203\.0\.113\.7/);assert.match(available,/flags\/cn\.svg/);assert.match(available,/中国/);assert.match(available,/网页可达/);
   for(const http of [403,429]){
     const restricted=connectivity({status:'available',latency_ms:200,http_status:http,ip:'203.0.113.7',country:'CN'});
     assert.match(restricted,/访问受限/);assert.doesNotMatch(restricted,/网页可达|203\.0\.113\.7/);
