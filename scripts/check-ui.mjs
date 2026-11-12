@@ -92,7 +92,8 @@ try {
   assert.match(unknown,/等待统计状态/);
   assert.doesNotMatch(unknown,/本地代理 TCP 连接耗时趋势|0\.00|NaN|Infinity/);
   const values=[...unknown.matchAll(/class="metric-value"[^>]*>([\s\S]*?)<\/(?:strong|div)>/g)].map(match=>match[1].replace(/<[^>]*>/g,''));
-  assert.ok(values.length>=4);assert.ok(values.every(value=>value.trim().startsWith('—')));
+  assert.ok(values.length>=4);assert.ok(values.every(value=>/^(?:—|待采样)/.test(value.trim())));
+  assert.match(unknown,/id="open-memory"[\s\S]*?待采样/);
   assert.doesNotMatch(html,/\bid="(?:refresh|refresh-logs)"|aria-label="检测 ChatGPT 网页连通性"/);
   checks++;
 
