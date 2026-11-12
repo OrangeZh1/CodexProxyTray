@@ -72,7 +72,7 @@ GitHub 自动生成的 Source code 是源码归档；日常使用请下载上面
 
 ## 界面与功能
 
-以下功能说明对应 v0.2.1 源码（尚未发布），发行包内容以对应 Release 说明为准；旧版便携包需要更新后才能使用新增功能。
+以下功能说明对应已发布的 [v0.2.1](https://github.com/OrangeZh1/CodexProxyTray/releases/tag/v0.2.1)，发行包内容以对应 Release 说明为准；旧版便携包需要更新后才能使用新增功能。
 
 | 页面 | 可以做什么 |
 | --- | --- |
