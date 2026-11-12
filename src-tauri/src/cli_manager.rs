@@ -171,7 +171,7 @@ fn active_cli(root:&Path,install:&Install)->Result<bool,String>{
         let snapshot=CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS,0).map_err(|_|"无法检查正在运行的 CLI，未开始修改。")?;
         let result=(||{let mut entry=PROCESSENTRY32W{dwSize:std::mem::size_of::<PROCESSENTRY32W>()as u32,..Default::default()};Process32FirstW(snapshot,&mut entry).map_err(|_|"无法读取进程列表，未开始修改 CLI。".to_owned())?;let mut more=true;
             while more{let name=String::from_utf16_lossy(&entry.szExeFile[..entry.szExeFile.iter().position(|value|*value==0).unwrap_or(entry.szExeFile.len())]);
-                if name.eq_ignore_ascii_case("codex.exe"){
+                if name.eq_ignore_ascii_case("codex.exe")||name.eq_ignore_ascii_case("codex-proxy-cli.exe"){
                     let handle=match OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,false,entry.th32ProcessID){Ok(handle)=>Some(handle),Err(error)if error.code().0 as u32&0xffff==ERROR_INVALID_PARAMETER.0=>None,Err(_)=>return Err("无法确认某个 CLI 进程的归属，未开始更新或卸载。".into())};
                     if let Some(handle)=handle{
                     let mut image=vec![0u16;32768];let mut length=image.len()as u32;let queried=QueryFullProcessImageNameW(handle,PROCESS_NAME_WIN32,PWSTR(image.as_mut_ptr()),&mut length);let _=CloseHandle(handle);
@@ -287,9 +287,9 @@ else process.exit(9);"#);
     }
     #[test]fn active_process_check_uses_exact_binary_paths_and_never_name_alone(){
         let root=sandbox();let(command,prefix)=fixture(&root);let install=inspect_install(&command,&prefix).unwrap();
-        let expected=install.package.join("vendor/x86_64-pc-windows-msvc/bin/codex.exe");let foreign=root.join("unrelated/codex.exe");
-        for path in [&expected,&foreign]{fs::create_dir_all(path.parent().unwrap()).unwrap();fs::copy(std::env::current_exe().unwrap(),path).unwrap();}
-        for (index,path,wanted) in [(0,&foreign,false),(1,&expected,true)]{
+        let expected=install.package.join("vendor/x86_64-pc-windows-msvc/bin/codex.exe");let foreign=root.join("unrelated/codex.exe");let proxy=root.join("assistant/cli/codex-proxy-cli.exe");let foreign_proxy=root.join("unrelated/codex-proxy-cli.exe");
+        for path in [&expected,&foreign,&proxy,&foreign_proxy]{fs::create_dir_all(path.parent().unwrap()).unwrap();fs::copy(std::env::current_exe().unwrap(),path).unwrap();}
+        for (index,path,wanted) in [(0,&foreign,false),(1,&expected,true),(2,&proxy,true),(3,&foreign_proxy,false)]{
             let handshake=root.join(format!("process-{index}"));fs::create_dir(&handshake).unwrap();
             let mut child=Command::new(path).args(["--exact","cli_manager::tests::owned_cli_process_fixture","--nocapture"]).env("CODEX_PROXY_CLI_MANAGER_PROCESS_FIXTURE",&handshake).creation_flags(0x08000000).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
             let result=(||{let deadline=Instant::now()+Duration::from_secs(5);while !handshake.join("ready").exists()&&Instant::now()<deadline{if child.try_wait().unwrap().is_some(){break}thread::sleep(Duration::from_millis(20));}
