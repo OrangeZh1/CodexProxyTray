@@ -80,6 +80,8 @@ jobs:
             ~/.cargo/git
             target/
           key: windows-native-v1-${{ env.RUST_VERSION }}-${{ hashFiles('src-tauri/Cargo.lock') }}
+          restore-keys: |
+            windows-native-v1-${{ env.RUST_VERSION }}-
       - name: 准备 Windows Rust
         shell: pwsh
         run: rustup toolchain install $env:RUST_VERSION --profile minimal --target x86_64-pc-windows-msvc --no-self-update
