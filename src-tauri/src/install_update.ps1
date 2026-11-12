@@ -1,6 +1,9 @@
 param([ValidateSet('Prepare','Apply')][string]$Phase,[Parameter(Mandatory=$true)][string]$Job)
 $ErrorActionPreference='Stop'
 # The helper uses only protected Windows modules, independent of a PowerShell 7 parent.
+$originalModulePath=$env:PSModulePath
+$originalModulesPresent=$null -ne $originalModulePath
+if($env:CODEX_PROXY_UPDATER_MODULES_PRESENT -in @('0','1')){$originalModulesPresent=$env:CODEX_PROXY_UPDATER_MODULES_PRESENT -eq '1';$originalModulePath=$env:CODEX_PROXY_UPDATER_MODULES}
 $env:PSModulePath=Join-Path $PSHOME 'Modules'
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 function Plain([string]$Path){$cursor=[IO.Path]::GetFullPath($Path);while($cursor){$item=Get-Item -LiteralPath $cursor -Force;if($item.Attributes -band [IO.FileAttributes]::ReparsePoint){throw '路径包含重解析点，已停止更新。'};$parent=[IO.Path]::GetDirectoryName($cursor);if($parent -eq $cursor){break};$cursor=$parent}}
@@ -19,7 +22,7 @@ function Result([string]$State,[string]$ErrorText){$value=@{schema=1;completed_a
 function SameParent($Process){$Process -and $Process.StartTime.ToUniversalTime().ToFileTimeUtc().ToString() -ceq $plan.parent_created -and $Process.MainModule.FileName -ieq $exe}
 function OwnProcesses([string]$Image){@(Get-CimInstance Win32_Process -Filter "name='CodexProxyTray.exe'"|Where-Object {$_.ExecutablePath -ieq $Image})}
 function WaitGone([int]$Id,[string]$Created,[int]$Seconds){$end=[DateTime]::UtcNow.AddSeconds($Seconds);do{if(Test-Path -LiteralPath (Join-Path $Job 'cancelled.json')){return $false};$process=Get-Process -Id $Id -ErrorAction SilentlyContinue;if(-not $process -or $process.StartTime.ToUniversalTime().ToFileTimeUtc().ToString() -cne $Created){return $true};Start-Sleep -Milliseconds 200}while([DateTime]::UtcNow -lt $end);return $false}
-function StartHelper {Start-Process -FilePath $exe -ArgumentList '--after-update' -WorkingDirectory $target -WindowStyle Hidden -PassThru}
+function StartHelper([string]$Arguments='--after-update'){$start=[Diagnostics.ProcessStartInfo]::new($exe);$start.Arguments=$Arguments;$start.UseShellExecute=$false;$start.CreateNoWindow=$true;$start.WindowStyle='Hidden';$start.WorkingDirectory=$target;if($originalModulesPresent){$start.EnvironmentVariables['PSModulePath']=$originalModulePath}else{$start.EnvironmentVariables.Remove('PSModulePath')};$start.EnvironmentVariables.Remove('CODEX_PROXY_UPDATER_MODULES');$start.EnvironmentVariables.Remove('CODEX_PROXY_UPDATER_MODULES_PRESENT');[Diagnostics.Process]::Start($start)}
 function Ready($Process){$end=[DateTime]::UtcNow.AddSeconds(40);do{if($Process.HasExited){return $false};$ok=$true;foreach($window in @('main','tray')){try{$ready=Json (Join-Path $data "ui-ready-$window.json");if($ready.helper_pid -ne $Process.Id -or $ready.rendered -ne $true -or $ready.at -lt ([DateTimeOffset]$Process.StartTime.ToUniversalTime()).ToUnixTimeMilliseconds()){$ok=$false}}catch{$ok=$false}};if($ok){$errorFile=Join-Path $data 'ui-error.json';if(Test-Path -LiteralPath $errorFile){$errorRecord=Json $errorFile;if($errorRecord.helper_pid -eq $Process.Id){return $false}};return $true};Start-Sleep -Milliseconds 250}while([DateTime]::UtcNow -lt $end);return $false}
 $payload=@('CodexProxyTray.exe','codex-proxy-cli.exe','WebView2Loader.dll','LICENSE','THIRD_PARTY_NOTICES.md','flag-icons-license.txt','package-receipt.json','QUICKSTART.txt','fluent-icons-license.txt','SHA256SUMS.txt')
 $Job=[IO.Path]::GetFullPath($Job);Plain $Job
@@ -84,7 +87,7 @@ try {
     $failure=$_.Exception.Message
     if($committed){$journal.state='cleanup-blocked';$journal.obsolete=if(Test-Path -LiteralPath $obsolete){$obsolete}else{$null};Durable $journalPath $journal;Result 'installed_cleanup_pending' ($failure+' 新版本运行正常，安装收尾未完成；恢复材料已保留。')}elseif($switched){
         $canRollback=$true
-        if($new -and -not $new.HasExited){$created=$new.StartTime.ToUniversalTime().ToFileTimeUtc().ToString();Start-Process -FilePath $exe -ArgumentList '--quit' -WorkingDirectory $target -WindowStyle Hidden|Out-Null;$canRollback=WaitGone $new.Id $created 20}
+        if($new -and -not $new.HasExited){$created=$new.StartTime.ToUniversalTime().ToFileTimeUtc().ToString();$quitter=StartHelper '--quit';[void]$quitter.WaitForExit(10000);$canRollback=WaitGone $new.Id $created 20}
         if($canRollback -and -not @(OwnProcesses $exe).Count){
             try{SafeMove $target $candidate;SafeMove $previous $target;if($movedPrevious){SafeMove $obsolete $previous};$configBackup=Join-Path $Job 'config.json';if(Test-Path -LiteralPath $configBackup){if(Test-Path -LiteralPath (Join-Path $data 'config.json')){CopyDurable (Join-Path $data 'config.json') (Join-Path $Job 'config-after-failed-update.json')};RestoreConfig $configBackup (Join-Path $data 'config.json')};foreach($pair in @(@('pre-active-version.json',$activePath),@('pre-install-journal.json',$journalPath))){if(Test-Path -LiteralPath (Join-Path $Job $pair[0])){Durable $pair[1] (Json (Join-Path $Job $pair[0]))}};$old=StartHelper;if(-not(Ready $old)){throw '回退程序未通过就绪检查。'};Result 'rolled_back' ($failure+' 已恢复上一版本；配置、日志及失败材料保留在本机。')}catch{Result 'error' ($failure+' 自动回退未完成，请保留恢复目录并手动处理。')}
         }else{Result 'error' ($failure+' 新助手尚未正常退出，未强制关闭或继续替换。')}
