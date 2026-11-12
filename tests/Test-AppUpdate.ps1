@@ -15,7 +15,7 @@ function Require([bool]$Condition,[string]$Name){if(-not $Condition){throw $Name
 function StartOwned($Case,[string]$File,[string[]]$Arguments){$info=[Diagnostics.ProcessStartInfo]::new($File);$info.UseShellExecute=$false;$info.CreateNoWindow=$true;$info.WindowStyle='Hidden';$info.WorkingDirectory=[IO.Path]::GetDirectoryName($File);$info.Environment['LOCALAPPDATA']=$Case.profile;$info.Environment['APPDATA']=Join-Path $Case.profile 'Roaming';$info.Environment['WEBVIEW2_USER_DATA_FOLDER']=Join-Path $Case.profile 'webview';foreach($argument in $Arguments){$info.ArgumentList.Add($argument)};[Diagnostics.Process]::Start($info)}
 function WaitFor([scriptblock]$Check,[int]$Seconds,[string]$Name){$end=[DateTime]::UtcNow.AddSeconds($Seconds);do{if(& $Check){return};Start-Sleep -Milliseconds 200}while([DateTime]::UtcNow -lt $end);throw $Name}
 function Case([string]$Name){
-    $directory=Join-Path $root $Name;$profile=Join-Path $directory 'profile';$data=Join-Path $profile 'CodexProxyTray';$target=Join-Path $directory 'app\current'
+    $directory=Join-Path $root $Name;$profilePath=Join-Path $directory 'profile';$data=Join-Path $profilePath 'CodexProxyTray';$target=Join-Path $directory 'app\current'
     foreach($path in @($data,(Join-Path $data 'logs'),(Join-Path $data 'updates'),$target)){[void](New-Item -ItemType Directory -Path $path -Force)}
     [IO.Compression.ZipFile]::ExtractToDirectory($zip,$target)
     WriteJson (Join-Path $data 'config.json') @{launch_target='none';network_enabled=$false;auto_check_updates=$false;connectivity_enabled=$false;traffic_enabled=$false;proxy_url='http://127.0.0.1:17890'}
@@ -23,7 +23,7 @@ function Case([string]$Name){
     $files=@(Get-ChildItem -LiteralPath $target|ForEach-Object {@{name=$_.Name;sha256=Hash $_.FullName}})
     WriteJson (Join-Path $directory 'app\active-version.json') @{schema=1;state='active';current=@{path=$target;files=$files;source_commit=$env:GITHUB_SHA};recovery_references=@()}
     WriteJson (Join-Path $directory 'app\install-journal.json') @{schema=1;state='installed'}
-    $case=[pscustomobject]@{directory=$directory;profile=$profile;data=$data;target=$target;exe=(Join-Path $target 'CodexProxyTray.exe');parent=$null;job=$null;installer=$null}
+    $case=[pscustomobject]@{directory=$directory;profile=$profilePath;data=$data;target=$target;exe=(Join-Path $target 'CodexProxyTray.exe');parent=$null;job=$null;installer=$null}
     $case.parent=StartOwned $case $case.exe @('--background')
     WaitFor {try{$value=Get-Content -LiteralPath (Join-Path $data 'ui-ready-main.json') -Raw|ConvertFrom-Json;$value.helper_pid -eq $case.parent.Id -and $value.rendered}catch{$false}} 45 'Initial helper did not render'
     return $case
