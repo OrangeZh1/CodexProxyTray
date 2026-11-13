@@ -403,16 +403,24 @@ function Run-ServicePipeline([string]$GuiBinary=$binary,[string]$ExpectedError) 
         $info.EnvironmentVariables['LOCALAPPDATA']=$sandbox;$info.EnvironmentVariables['WEBVIEW2_USER_DATA_FOLDER']=Join-Path $sandbox 'webview-data'
         $process=[Diagnostics.Process]::Start($info);[CodexProxyTray.ServiceQaNative]::PinGui($process);return $process
     }
-    $gui=$null;$pipelineFailure=$null;$final=$null
+    $gui=$null;$pipelineFailure=$null;$final=$null;$seen=[Collections.Generic.HashSet[long]]::new();$pollCount=0;$statusReadCount=0;$parseErrorCount=0;$identityMatchCount=0;$lastWaitSnapshot=$null;$lastTransition=$null;$waitTransitions=[Collections.Generic.List[object]]::new()
     try{
         Require (@(Get-Process -Name CodexProxyTray -ErrorAction SilentlyContinue).Count -eq 0) 'pipeline_other_gui_preserved'
-        $gui=&$start '--background';$guiStarted=$gui.StartTime.ToUniversalTime();$deadline=[DateTime]::UtcNow.AddSeconds(40);$seen=[Collections.Generic.HashSet[long]]::new()
+        $gui=&$start '--background';$guiStarted=$gui.StartTime.ToUniversalTime();$deadline=[DateTime]::UtcNow.AddSeconds(40)
         while([DateTime]::UtcNow -lt $deadline){
+            $pollCount++
             Require (-not $gui.HasExited) 'pipeline_gui_exited'
             $path=Join-Path $sandbox 'CodexProxyTray/status.json'
             if(Test-Path -LiteralPath $path){
-                try{$value=Get-Content -LiteralPath $path -Raw|ConvertFrom-Json}catch{Start-Sleep -Milliseconds 100;continue}
+                $statusReadCount++;try{$value=Get-Content -LiteralPath $path -Raw|ConvertFrom-Json}catch{$parseErrorCount++;Start-Sleep -Milliseconds 100;continue}
+                $lastWaitSnapshot=[ordered]@{}
+                foreach($field in @('helper_pid','backend_ready','enabled','traffic_enabled','updated_at')){$content=$value.$field;$lastWaitSnapshot[$field]=if($content -is [bool] -or $content -is [int] -or $content -is [long]){$content}else{$null}}
+                foreach($field in @('timestamp_ms','target_count')){$content=$value.traffic.$field;$lastWaitSnapshot['traffic_'+$field]=if($content -is [int] -or $content -is [long]){$content}else{$null}}
+                $lastWaitSnapshot.traffic_state=if($value.traffic.state -is [string] -and $value.traffic.state -cmatch '^[a-z_]{1,40}$'){$value.traffic.state}else{$null};$lastWaitSnapshot.service_state=if($value.traffic_service.state -is [string] -and $value.traffic_service.state -cmatch '^[a-z_]{1,40}$'){$value.traffic_service.state}else{$null};$lastWaitSnapshot.identity_matches=($value.helper_pid -eq $gui.Id)
+                $transition=@($lastWaitSnapshot.helper_pid,$lastWaitSnapshot.backend_ready,$lastWaitSnapshot.enabled,$lastWaitSnapshot.traffic_enabled,$lastWaitSnapshot.traffic_state,$lastWaitSnapshot.traffic_target_count,$lastWaitSnapshot.service_state) -join '|'
+                if($transition -cne $lastTransition -and $waitTransitions.Count -lt 8){$waitTransitions.Add($lastWaitSnapshot)};$lastTransition=$transition
                 if($value.helper_pid -eq $gui.Id){
+                    $identityMatchCount++
                     if($ExpectedError -and $value.traffic.state -eq 'unavailable' -and $value.traffic.message -like ('*'+$ExpectedError+'*')){[void]$seen.Add(-1);break}
                     if($value.traffic.state -in @('unavailable','needs_permission')){$report['pipeline_error_message']=[string]$value.traffic.message;throw 'service_pipeline_unavailable'}
                     if($value.traffic.state -eq 'collecting' -and $null -ne $value.traffic.received_bytes -and $null -ne $value.traffic.sent_bytes){[void]$seen.Add([long]$value.traffic.timestamp_ms)}
@@ -425,6 +433,8 @@ function Run-ServicePipeline([string]$GuiBinary=$binary,[string]$ExpectedError) 
         if(-not $ExpectedError){$report['service_pipeline_samples']=$seen.Count}
     }catch{$pipelineFailure=$_}
     finally{
+        # Capture the wait before --quit changes guard/collector state; never include status/log bodies.
+        $report['last_wait_snapshot']=$lastWaitSnapshot;$report['pipeline_wait_diagnostics']=[ordered]@{poll_count=$pollCount;status_read_count=$statusReadCount;parse_error_count=$parseErrorCount;identitymatch_count=$identityMatchCount;observed_stamp_count=@($seen|Where-Object {$_ -ge 0}).Count;expected_rejection=[bool]$ExpectedError;transitions=$waitTransitions.ToArray()}
         if($gui){
             try{
                 if(-not $gui.HasExited){Require ($gui.StartTime.ToUniversalTime() -eq $guiStarted -and (Same-Path $gui.Path $GuiBinary)) 'pipeline_gui_identity_changed';$quitter=&$start '--quit';try{Require ($quitter.WaitForExit(10000)) 'pipeline_quit_request_timeout';Require ([CodexProxyTray.ServiceQaNative]::GuiExitCode([uint32]$quitter.Id) -eq 0) 'pipeline_quit_request_failed'}finally{[CodexProxyTray.ServiceQaNative]::ReleaseGui([uint32]$quitter.Id);$quitter.Dispose()};Require ($gui.WaitForExit(15000)) 'pipeline_gui_stop_timeout'}
