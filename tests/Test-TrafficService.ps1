@@ -106,6 +106,9 @@ namespace CodexProxyTray {
   public static bool LinkedTokenPresent;
   public static int LinkedTokenError;
   public static string TokenPreparationStage;
+  public static string MediumFilesystemStage;
+  public static bool MediumConfigReadable,MediumDataWritable,MediumWebViewWritable;
+  public static int MediumFilesystemError;
   [StructLayout(LayoutKind.Sequential)] struct Config {public uint type,start,error;public IntPtr binary,group;public uint tag;public IntPtr dependencies,account,display;}
   [StructLayout(LayoutKind.Sequential)] struct Status {public uint type,state,controls,exit,specific,checkpoint,hint,pid,flags;}
   [StructLayout(LayoutKind.Sequential)] struct SidAndAttributes {public IntPtr Sid;public uint Attributes;}
@@ -122,6 +125,8 @@ namespace CodexProxyTray {
   [DllImport("advapi32.dll",EntryPoint="GetTokenInformation",SetLastError=true)] static extern bool GetTokenInformationBuffer(IntPtr token,int kind,IntPtr information,uint length,out uint returned);
   [DllImport("advapi32.dll",SetLastError=true)] static extern bool OpenProcessToken(IntPtr process,uint access,out IntPtr token);
   [DllImport("advapi32.dll",SetLastError=true)] static extern bool CreateRestrictedToken(IntPtr token,uint flags,uint disabledCount,[In] SidAndAttributes[] disabled,uint deletedCount,IntPtr deleted,uint restrictedCount,IntPtr restricted,out IntPtr result);
+  [DllImport("advapi32.dll",SetLastError=true)] static extern bool ImpersonateLoggedOnUser(IntPtr token);
+  [DllImport("advapi32.dll",SetLastError=true)] static extern bool RevertToSelf();
   [DllImport("advapi32.dll",SetLastError=true)] static extern bool SetTokenInformation(IntPtr token,int kind,ref MandatoryLabel information,uint length);
   [DllImport("advapi32.dll",CharSet=CharSet.Unicode,SetLastError=true)] static extern bool ConvertStringSidToSidW(string text,out IntPtr sid);
   [DllImport("advapi32.dll")] static extern uint GetLengthSid(IntPtr sid);
@@ -189,6 +194,21 @@ namespace CodexProxyTray {
     IntPtr result=restricted;restricted=IntPtr.Zero;return result;
    }} finally {if(linked!=IntPtr.Zero)CloseHandle(linked);if(restricted!=IntPtr.Zero)CloseHandle(restricted);if(admin!=IntPtr.Zero)LocalFree(admin);if(medium!=IntPtr.Zero)LocalFree(medium);}
   }
+  static void ProbeWritableDirectory(string directory) {
+   Directory.CreateDirectory(directory);string path=Path.Combine(directory,".qa-medium-write-"+Guid.NewGuid().ToString("N")+".tmp");bool owned=false;
+   try {using(var file=new FileStream(path,FileMode.CreateNew,FileAccess.ReadWrite,FileShare.None)){owned=true;file.WriteByte(0);file.Flush();}}
+   finally {if(owned)File.Delete(path);}
+  }
+  static void ProbeMediumFilesystem(IntPtr token,string localAppData,string webViewData) {
+   MediumConfigReadable=false;MediumDataWritable=false;MediumWebViewWritable=false;MediumFilesystemError=0;MediumFilesystemStage="impersonate";
+   if(!ImpersonateLoggedOnUser(token)){MediumFilesystemError=Marshal.GetLastWin32Error();throw new Win32Exception(MediumFilesystemError);}
+   try {
+    MediumFilesystemStage="read_config";using(var file=File.Open(Path.Combine(localAppData,"CodexProxyTray","config.json"),FileMode.Open,FileAccess.Read,FileShare.ReadWrite)){file.ReadByte();}MediumConfigReadable=true;
+    MediumFilesystemStage="write_app_data";ProbeWritableDirectory(Path.Combine(localAppData,"CodexProxyTray"));MediumDataWritable=true;
+    MediumFilesystemStage="write_webview_data";ProbeWritableDirectory(webViewData);MediumWebViewWritable=true;MediumFilesystemStage="verified";
+   }catch(Exception error){MediumFilesystemError=error is Win32Exception?((Win32Exception)error).NativeErrorCode:error.HResult&0xffff;throw new InvalidOperationException("medium_filesystem_access_failed",error);}
+   finally {if(!RevertToSelf())Environment.FailFast("Unable to restore the QA controller identity.");}
+  }
   public static Process StartMedium(string image,string arguments,string localAppData,string webViewData) {
    if(arguments!="--background"&&arguments!="--quit")throw new InvalidOperationException("restricted_launch_arguments_invalid");
    image=Path.GetFullPath(image);if(!Path.IsPathFullyQualified(image)||Path.GetFileName(image)!="CodexProxyTray.exe"||image.IndexOf('"')>=0)throw new InvalidOperationException("restricted_launch_image_invalid");
@@ -196,7 +216,7 @@ namespace CodexProxyTray {
    values["LOCALAPPDATA"]=localAppData;values["WEBVIEW2_USER_DATA_FOLDER"]=webViewData;var block=new StringBuilder();foreach(var pair in values){if(pair.Key.IndexOf('\0')>=0||pair.Value.IndexOf('\0')>=0)throw new InvalidOperationException("restricted_environment_invalid");block.Append(pair.Key).Append('=').Append(pair.Value).Append('\0');}block.Append('\0');if(block.Length>1048576)throw new InvalidOperationException("restricted_environment_size");
    IntPtr token=IntPtr.Zero,environment=IntPtr.Zero;var created=new ProcessInfo();bool resumed=false;Process managed=null;
    try {
-    token=MediumToken();environment=Marshal.StringToHGlobalUni(block.ToString());var startup=new StartupInfo {cb=(uint)Marshal.SizeOf(typeof(StartupInfo)),flags=1,show=0};
+    token=MediumToken();ProbeMediumFilesystem(token,localAppData,webViewData);environment=Marshal.StringToHGlobalUni(block.ToString());var startup=new StartupInfo {cb=(uint)Marshal.SizeOf(typeof(StartupInfo)),flags=1,show=0};
     // Suspend until the actual child token and process identity have been verified. No inherited handles or console.
     if(!CreateProcessWithTokenW(token,0,image,new StringBuilder("\""+image+"\" "+arguments),0x08000404,environment,Path.GetDirectoryName(image),ref startup,out created))throw new Win32Exception();
     NativeFileTime start,exit,kernel,user;if(!GetProcessTimes(created.process,out start,out exit,out kernel,out user))throw new Win32Exception();var path=new StringBuilder(32768);uint length=(uint)path.Capacity;if(!QueryFullProcessImageNameW(created.process,0,path,ref length)||!String.Equals(Path.GetFullPath(path.ToString()),image,StringComparison.OrdinalIgnoreCase))throw new InvalidOperationException("restricted_child_image_mismatch");
@@ -415,6 +435,8 @@ function Run-ServicePipeline([string]$GuiBinary=$binary,[string]$ExpectedError,[
             try{
                 if(-not $gui.HasExited){Require ($gui.StartTime.ToUniversalTime() -eq $guiStarted -and (Same-Path $gui.Path $GuiBinary)) 'pipeline_gui_identity_changed';$quitter=&$start '--quit';try{Require ($quitter.WaitForExit(10000)) 'pipeline_quit_request_timeout'}finally{$quitter.Dispose()};Require ($gui.WaitForExit(15000)) 'pipeline_gui_stop_timeout'}
                 $statusPath=Join-Path $sandbox 'CodexProxyTray/status.json';if(Test-Path -LiteralPath $statusPath){$final=Get-Content -LiteralPath $statusPath -Raw|ConvertFrom-Json}
+                if($gui.HasExited){$report['pipeline_gui_exit_code']=$gui.ExitCode;$report['pipeline_gui_exit_hex']=('{0:X8}' -f ([long]$gui.ExitCode -band 0xffffffff))}
+                if($pipelineFailure){$report['pipeline_startup_error_short']=Short-Diagnostic (Join-Path $sandbox 'CodexProxyTray/startup-error.txt');$report['pipeline_ui_error_short']=Short-Diagnostic (Join-Path $sandbox 'CodexProxyTray/ui-error.json')}
             }catch{if(-not $gui.HasExited -and $gui.StartTime.ToUniversalTime() -eq $guiStarted -and (Same-Path $gui.Path $GuiBinary)){$gui.Kill($true);[void]$gui.WaitForExit(10000)};if(-not $pipelineFailure){$pipelineFailure=$_}}
             finally{$gui.Dispose()}
         }
@@ -561,6 +583,7 @@ try {
 } catch {$failure=$true;$report.status='failed';$report.failure_case=$currentCase;$report.failure_code=Failure-Code $_}
 finally {
     $report['token_preparation']=[ordered]@{stage=[CodexProxyTray.ServiceQaNative]::TokenPreparationStage;restricted_flags=[CodexProxyTray.ServiceQaNative]::RestrictedTokenFlags;source=(Token-Evidence ([CodexProxyTray.ServiceQaNative]::SourceTokenInfo));linked_token_present=[CodexProxyTray.ServiceQaNative]::LinkedTokenPresent;linked_token_error=[CodexProxyTray.ServiceQaNative]::LinkedTokenError;linked=(Token-Evidence ([CodexProxyTray.ServiceQaNative]::LinkedTokenInfo));restricted=(Token-Evidence ([CodexProxyTray.ServiceQaNative]::RestrictedTokenInfo))}
+    $report['medium_filesystem']=[ordered]@{stage=[CodexProxyTray.ServiceQaNative]::MediumFilesystemStage;config_readable=[CodexProxyTray.ServiceQaNative]::MediumConfigReadable;app_data_writable=[CodexProxyTray.ServiceQaNative]::MediumDataWritable;webview_data_writable=[CodexProxyTray.ServiceQaNative]::MediumWebViewWritable;win32_error=[CodexProxyTray.ServiceQaNative]::MediumFilesystemError}
     try {
         if($installAttempted){
             $present=($null -ne (Inspect-Service)) -or (Test-Path -LiteralPath $serviceDirectory)
