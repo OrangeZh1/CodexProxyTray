@@ -48,6 +48,10 @@ function Failure-Code($ErrorRecord) {
     while($exception){if($exception.Message -cmatch '^[a-z][a-z0-9_]{1,90}$'){return $exception.Message};if($exception -is [ComponentModel.Win32Exception]){return 'win32_error_'+$exception.NativeErrorCode};$exception=$exception.InnerException}
     return 'unexpected_windows_error'
 }
+function Token-Evidence($Value) {
+    if($null -eq $Value){return $null}
+    return [ordered]@{elevation_type=$Value.ElevationType;elevated=$Value.Elevated;integrity_rid=$Value.IntegrityRid;administrator_enabled=$Value.AdminEnabled;owner_sid_matches=($Value.UserSid -ceq $ownerSid)}
+}
 function Short-Diagnostic([string]$Path) {
     if(-not (Test-Path -LiteralPath $Path -PathType Leaf)){return ''}
     No-Reparse $Path
@@ -93,10 +97,15 @@ namespace CodexProxyTray {
  }
  public sealed class ServiceQaTokenInfo {
   public bool Elevated,AdminEnabled;
-  public uint IntegrityRid;
+  public uint IntegrityRid,ElevationType;
   public string UserSid;
  }
  public static class ServiceQaNative {
+  public const uint RestrictedTokenFlags=0x1|0x4; // DISABLE_MAX_PRIVILEGE | LUA_TOKEN
+  public static ServiceQaTokenInfo SourceTokenInfo,LinkedTokenInfo,RestrictedTokenInfo;
+  public static bool LinkedTokenPresent;
+  public static int LinkedTokenError;
+  public static string TokenPreparationStage;
   [StructLayout(LayoutKind.Sequential)] struct Config {public uint type,start,error;public IntPtr binary,group;public uint tag;public IntPtr dependencies,account,display;}
   [StructLayout(LayoutKind.Sequential)] struct Status {public uint type,state,controls,exit,specific,checkpoint,hint,pid,flags;}
   [StructLayout(LayoutKind.Sequential)] struct SidAndAttributes {public IntPtr Sid;public uint Attributes;}
@@ -151,8 +160,8 @@ namespace CodexProxyTray {
    IntPtr memory=Marshal.AllocHGlobal((int)needed);if(!GetTokenInformationBuffer(token,kind,memory,needed,out needed)){Marshal.FreeHGlobal(memory);throw new Win32Exception();}return memory;
   }
   static ServiceQaTokenInfo ReadToken(IntPtr token) {
-   uint elevated,returned;if(!GetTokenInformation(token,20,out elevated,4,out returned))throw new Win32Exception();
-   var result=new ServiceQaTokenInfo {Elevated=elevated!=0};IntPtr memory=TokenBuffer(token,1);
+   uint elevated,elevationType,returned;if(!GetTokenInformation(token,20,out elevated,4,out returned)||!GetTokenInformation(token,18,out elevationType,4,out returned))throw new Win32Exception();
+   var result=new ServiceQaTokenInfo {Elevated=elevated!=0,ElevationType=elevationType};IntPtr memory=TokenBuffer(token,1);
    try {result.UserSid=new SecurityIdentifier(Marshal.ReadIntPtr(memory)).Value;}finally{Marshal.FreeHGlobal(memory);}
    memory=TokenBuffer(token,25);
    try {string sid=new SecurityIdentifier(Marshal.ReadIntPtr(memory)).Value;if(!sid.StartsWith("S-1-16-",StringComparison.Ordinal))throw new InvalidOperationException("integrity_sid_invalid");result.IntegrityRid=uint.Parse(sid.Substring(7));}finally{Marshal.FreeHGlobal(memory);}
@@ -165,13 +174,18 @@ namespace CodexProxyTray {
   static IntPtr MediumToken() {
    IntPtr linked=IntPtr.Zero,restricted=IntPtr.Zero,admin=IntPtr.Zero,medium=IntPtr.Zero;
    try {using(var user=WindowsIdentity.GetCurrent()){
-    IntPtr source=user.Token;uint elevationType,returned;if(!GetTokenInformation(source,18,out elevationType,4,out returned))throw new Win32Exception();
-    if(elevationType==2){IntPtr memory=TokenBuffer(source,19);try{linked=Marshal.ReadIntPtr(memory);}finally{Marshal.FreeHGlobal(memory);}source=linked;}
+    TokenPreparationStage="source_token";SourceTokenInfo=ReadToken(user.Token);LinkedTokenInfo=null;RestrictedTokenInfo=null;LinkedTokenPresent=false;LinkedTokenError=0;
+    IntPtr source=user.Token;uint elevationType=SourceTokenInfo.ElevationType,returned;IntPtr linkBuffer=Marshal.AllocHGlobal(IntPtr.Size);
+    try {if(GetTokenInformationBuffer(source,19,linkBuffer,(uint)IntPtr.Size,out returned)){linked=Marshal.ReadIntPtr(linkBuffer);LinkedTokenPresent=linked!=IntPtr.Zero;if(LinkedTokenPresent)LinkedTokenInfo=ReadToken(linked);}else LinkedTokenError=Marshal.GetLastWin32Error();}finally{Marshal.FreeHGlobal(linkBuffer);}
+    if(elevationType==2){if(!LinkedTokenPresent)throw new Win32Exception(LinkedTokenError);source=linked;}
     if(!ConvertStringSidToSidW("S-1-5-32-544",out admin)||!ConvertStringSidToSidW("S-1-16-8192",out medium))throw new Win32Exception();
-    if(!CreateRestrictedToken(source,1,1,new[]{new SidAndAttributes {Sid=admin}},0,IntPtr.Zero,0,IntPtr.Zero,out restricted))throw new Win32Exception();
+    TokenPreparationStage="create_restricted_token";
+    if(!CreateRestrictedToken(source,RestrictedTokenFlags,1,new[]{new SidAndAttributes {Sid=admin}},0,IntPtr.Zero,0,IntPtr.Zero,out restricted))throw new Win32Exception();
     var label=new MandatoryLabel {Label=new SidAndAttributes {Sid=medium,Attributes=0x20}};
+    TokenPreparationStage="set_medium_integrity";
     if(!SetTokenInformation(restricted,25,ref label,(uint)Marshal.SizeOf(typeof(MandatoryLabel))+GetLengthSid(medium)))throw new Win32Exception();
-    var actual=ReadToken(restricted);if(actual.Elevated||actual.AdminEnabled||actual.IntegrityRid!=8192||actual.UserSid!=user.User.Value)throw new InvalidOperationException("restricted_token_not_unelevated_medium_owner");
+    TokenPreparationStage="verify_restricted_token";var actual=ReadToken(restricted);RestrictedTokenInfo=actual;if(actual.Elevated||actual.AdminEnabled||actual.IntegrityRid!=8192||actual.UserSid!=user.User.Value)throw new InvalidOperationException("restricted_token_not_unelevated_medium_owner");
+    TokenPreparationStage="verified";
     IntPtr result=restricted;restricted=IntPtr.Zero;return result;
    }} finally {if(linked!=IntPtr.Zero)CloseHandle(linked);if(restricted!=IntPtr.Zero)CloseHandle(restricted);if(admin!=IntPtr.Zero)LocalFree(admin);if(medium!=IntPtr.Zero)LocalFree(medium);}
   }
@@ -546,6 +560,7 @@ try {
     $report.status='passed'
 } catch {$failure=$true;$report.status='failed';$report.failure_case=$currentCase;$report.failure_code=Failure-Code $_}
 finally {
+    $report['token_preparation']=[ordered]@{stage=[CodexProxyTray.ServiceQaNative]::TokenPreparationStage;restricted_flags=[CodexProxyTray.ServiceQaNative]::RestrictedTokenFlags;source=(Token-Evidence ([CodexProxyTray.ServiceQaNative]::SourceTokenInfo));linked_token_present=[CodexProxyTray.ServiceQaNative]::LinkedTokenPresent;linked_token_error=[CodexProxyTray.ServiceQaNative]::LinkedTokenError;linked=(Token-Evidence ([CodexProxyTray.ServiceQaNative]::LinkedTokenInfo));restricted=(Token-Evidence ([CodexProxyTray.ServiceQaNative]::RestrictedTokenInfo))}
     try {
         if($installAttempted){
             $present=($null -ne (Inspect-Service)) -or (Test-Path -LiteralPath $serviceDirectory)
