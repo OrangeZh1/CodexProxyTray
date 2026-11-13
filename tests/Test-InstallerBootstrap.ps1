@@ -73,7 +73,7 @@ try{
     $archive=[IO.Compression.ZipFile]::OpenRead($zip);try{Require ($archive.Entries.Count -eq 0 -and (Get-Item -LiteralPath $zip).Length -eq 22) 'synthetic_valid_empty_zip_only'}finally{$archive.Dispose()}
     foreach($name in @('install_application.ps1','install_update.ps1')){[IO.File]::WriteAllText((Join-Path $work $name),[IO.File]::ReadAllText((Join-Path $repo ('src-tauri/src/'+$name)),[Text.Encoding]::UTF8),[Text.UTF8Encoding]::new($true))}
     $setup=Join-Path $work 'bootstrap-probe.exe'
-    $arguments=@('/V2',"/DRELEASE_DIR=$work","/DOUTPUT_FILE=$setup","/DAPP_VERSION=$version","/DSOURCE_COMMIT=$env:GITHUB_SHA","/DZIP_SHA256=$(Hash $zip)","/DENGINE_PATH=$(Join-Path $work 'install_application.ps1')","/DUPDATE_ENGINE_PATH=$(Join-Path $work 'install_update.ps1')","/DICON_PATH=$(Join-Path $repo 'src-tauri/icons/icon.ico')",(Join-Path $repo 'scripts/windows-installer.nsi'))
+    $arguments=@('/V2','/WX',"/DRELEASE_DIR=$work","/DOUTPUT_FILE=$setup","/DAPP_VERSION=$version","/DSOURCE_COMMIT=$env:GITHUB_SHA","/DZIP_SHA256=$(Hash $zip)","/DENGINE_PATH=$(Join-Path $work 'install_application.ps1')","/DUPDATE_ENGINE_PATH=$(Join-Path $work 'install_update.ps1')","/DICON_PATH=$(Join-Path $repo 'src-tauri/icons/icon.ico')",(Join-Path $repo 'scripts/windows-installer.nsi'))
     & $compilerPath @arguments
     Require ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $setup -PathType Leaf)) 'current_nsis_with_all_eight_macros_compiled'
     $file=[IO.File]::OpenRead($setup);$reader=[IO.BinaryReader]::new($file)

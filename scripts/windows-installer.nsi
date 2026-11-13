@@ -240,7 +240,7 @@ install_quiet:
 install_interactive:
   !insertmacro WriteApplicationPlan Install 0
 install_plan_ready:
-  StrCpy $BackendCommand '$"$SystemPowerShell$" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $"$PLUGINSDIR\install_application.ps1$" -PlanPath $"$PLUGINSDIR\plan.ini$"'
+  StrCpy $BackendCommand '"$SystemPowerShell" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$PLUGINSDIR\install_application.ps1" -PlanPath "$PLUGINSDIR\plan.ini"'
   StrCpy $BootstrapText "stage=plan-ready;launcher=sysnative64"
   Call BootstrapDiagnostic
   !insertmacro EmitLauncherCheck ""
@@ -291,7 +291,7 @@ Section "Uninstall"
   File /oname=install_update.ps1 "${UPDATE_ENGINE_PATH}"
   !insertmacro CaptureOriginalEnvironment "un."
   !insertmacro WriteApplicationPlan Uninstall 1
-  StrCpy $BackendCommand '$"$SystemPowerShell$" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $"$PLUGINSDIR\install_application.ps1$" -PlanPath $"$PLUGINSDIR\plan.ini$"'
+  StrCpy $BackendCommand '"$SystemPowerShell" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$PLUGINSDIR\install_application.ps1" -PlanPath "$PLUGINSDIR\plan.ini"'
   StrCpy $BootstrapText "stage=plan-ready;launcher=sysnative64"
   Call un.BootstrapDiagnostic
   !insertmacro EmitLauncherCheck "un."
