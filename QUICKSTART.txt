@@ -1,4 +1,4 @@
-CodexProxyTray v0.2.3 · Windows x64
+CodexProxyTray v0.2.4 · Windows x64
 
 用途
 为 ChatGPT 桌面端和 Windows Codex CLI 提供指定的本地 HTTP 代理环境，
@@ -10,7 +10,9 @@ CodexProxyTray v0.2.3 · Windows x64
 本项目为社区工具，与 OpenAI 无隶属关系，不提供代理节点。
 
 开始使用
-1. 推荐运行 Windows x64 Setup EXE，按向导完成当前用户安装。
+1. 推荐运行 Windows x64 Setup EXE，依次点击下一步，选择安装目录和是否创建桌面快捷方式，再确认安装。
+   默认安装到当前用户的 AppData\Local\Programs\CodexProxyTray，可在新安装时选择其他本机目录。
+   已有安装升级沿用原位置；配置、日志和用量数据继续保存在 AppData\Local\CodexProxyTray。
    安装后从开始菜单的 CodexProxyTray 打开，在“已安装的应用”中可卸载。
    也可选择便携 ZIP 并完整解压到固定目录；便携运行不等于标准安装。
    请保留 CodexProxyTray.exe、codex-proxy-cli.exe、WebView2Loader.dll、

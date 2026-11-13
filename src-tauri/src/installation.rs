@@ -2,11 +2,12 @@
 //! portable notifications share the product shortcut without registering an app.
 use std::{collections::HashSet,ffi::{c_void,OsString},fs::{self,File},io::Read,mem::size_of,os::windows::fs::MetadataExt,path::{Component,Path,PathBuf},ptr};
 use serde::{Deserialize,Serialize};
-use windows::{core::{GUID,Interface,PCWSTR,PWSTR},Win32::{Foundation::{CloseHandle,HANDLE,HLOCAL,LocalFree,PROPERTYKEY,WAIT_ABANDONED,WAIT_OBJECT_0},Security::{GetTokenInformation,TokenUser,TOKEN_QUERY,TOKEN_USER,Authorization::ConvertSidToStringSidW,Cryptography::*},System::{Com::{CoCreateInstance,CoInitializeEx,CoTaskMemFree,CoUninitialize,IPersistFile,CLSCTX_INPROC_SERVER,COINIT_MULTITHREADED,STGM_READ,StructuredStorage::{PROPVARIANT,PropVariantClear,InitPropVariantFromCLSID}},Threading::{CreateMutexW,GetCurrentProcess,OpenProcessToken,ReleaseMutex,WaitForSingleObject},Variant::{VT_CLSID,VT_LPWSTR}},UI::{Shell::{IShellLinkW,ShellLink,SHGetKnownFolderPath,FOLDERID_Programs,KF_FLAG_DEFAULT,SHChangeNotify,SHCNE_CREATE,SHCNE_DELETE,SHCNE_UPDATEITEM,SHCNF_PATHW,SetCurrentProcessExplicitAppUserModelID,PropertiesSystem::IPropertyStore},WindowsAndMessaging::SW_SHOWNORMAL}}};
+use windows::{core::{GUID,Interface,PCWSTR,PWSTR},Win32::{Foundation::{CloseHandle,HANDLE,HLOCAL,LocalFree,PROPERTYKEY,WAIT_ABANDONED,WAIT_OBJECT_0},Security::{GetTokenInformation,TokenUser,TOKEN_QUERY,TOKEN_USER,Authorization::ConvertSidToStringSidW,Cryptography::*},System::{Com::{CoCreateInstance,CoInitializeEx,CoTaskMemFree,CoUninitialize,IPersistFile,CLSCTX_INPROC_SERVER,COINIT_MULTITHREADED,STGM_READ,StructuredStorage::{PROPVARIANT,PropVariantClear,InitPropVariantFromCLSID}},Threading::{CreateMutexW,GetCurrentProcess,OpenProcessToken,ReleaseMutex,WaitForSingleObject},Variant::{VT_CLSID,VT_LPWSTR}},UI::{Shell::{IShellLinkW,ShellLink,SHGetKnownFolderPath,FOLDERID_Desktop,FOLDERID_Programs,KF_FLAG_CREATE,KF_FLAG_DEFAULT,SHChangeNotify,SHCNE_CREATE,SHCNE_DELETE,SHCNE_UPDATEITEM,SHCNF_PATHW,SetCurrentProcessExplicitAppUserModelID,PropertiesSystem::IPropertyStore},WindowsAndMessaging::SW_SHOWNORMAL}}};
 use crate::{core,native::wide};
 
 pub const APP_ID:&str="OrangeZh1.CodexProxyTray";
 const PRODUCT:&str="CodexProxyTray.Installation";
+const PREFERENCES_PRODUCT:&str="CodexProxyTray.InstallationPreferences";
 const GUI:&str="CodexProxyTray.exe";
 const REGISTRY:&str=r"Software\Microsoft\Windows\CurrentVersion\Uninstall\CodexProxyTray";
 const REG_OWNER:&str="CodexProxyTrayOwner";
@@ -19,6 +20,8 @@ const PACKAGE_FILES:[&str;6]=[GUI,"codex-proxy-cli.exe","WebView2Loader.dll","LI
 
 #[derive(Clone,Serialize,Deserialize)]#[serde(deny_unknown_fields)]
 struct Receipt{schema:u32,product:String,install_id:String,owner_sid:String,root:String,uninstaller_sha256:String}
+#[derive(Deserialize)]#[serde(deny_unknown_fields)]
+struct Preferences{schema:u32,product:String,install_id:String,root:String,desktop_shortcut:bool}
 #[derive(Deserialize)]#[serde(deny_unknown_fields)]struct FileHash{name:String,sha256:String}
 #[derive(Deserialize)]struct ActiveSlot{path:String,version:String,files:Vec<FileHash>}
 #[derive(Deserialize)]struct Active{schema:u32,state:String,current:ActiveSlot}
@@ -92,6 +95,25 @@ impl Installation{
         plain(&exe)?;let root=exe.parent().and_then(Path::parent).ok_or("安装目录结构无效。")?;let installation=Self::load(root,owner,Some(env!("CARGO_PKG_VERSION")))?;if !same_path(&exe.canonicalize().map_err(|_|"当前程序无法验证。")?,&installation.exe){return Err("当前程序不属于已登记安装。".into())}Ok(installation)
     }
 }
+fn validate_preferences(value:&Preferences,installation:&Installation)->Result<bool,String>{
+    if value.schema!=1||value.product!=PREFERENCES_PRODUCT||value.install_id!=installation.receipt.install_id||!absolute(Path::new(&value.root))||!same_path(Path::new(&value.root),&installation.root){return Err("桌面图标偏好与当前安装身份不匹配，原记录已保留。".into())}Ok(value.desktop_shortcut)
+}
+fn preferences_at(data:&Path,installation:&Installation)->Result<bool,String>{
+    if !absolute(data){return Err("当前用户的安装偏好目录不是有效绝对路径。".into())}
+    let path=data.join("installation-preferences-v1").join(format!("{}.json",installation.receipt.install_id));
+    match fs::symlink_metadata(&path){
+        Ok(_)=>{let value:Preferences=read_json(&path,16384).map_err(|error|format!("桌面图标偏好未能验证：{error}"))?;validate_preferences(&value,installation)},
+        Err(error)if error.kind()==std::io::ErrorKind::NotFound=>{
+            // A genuinely absent file means the legacy default. An existing
+            // redirected or unreadable ancestor must not masquerade as absence.
+            for parent in path.ancestors().skip(1){match fs::symlink_metadata(parent){Ok(metadata)=>{if !metadata.is_dir(){return Err("安装偏好目录类型无效，原内容已保留。".into())}plain(parent)?;return Ok(false)},Err(error)if error.kind()==std::io::ErrorKind::NotFound=>{},Err(_)=>return Err("安装偏好目录无法验证，原内容已保留。".into())}}Err("安装偏好目录无法验证。".into())
+        },
+        Err(_)=>Err("桌面图标偏好无法读取，原记录已保留。".into()),
+    }
+}
+fn desktop_preference(installation:&Installation)->Result<bool,String>{
+    let local=PathBuf::from(std::env::var_os("LOCALAPPDATA").ok_or("无法确定当前用户的安装偏好目录。")?);preferences_at(&local.join("CodexProxyTray"),installation)
+}
 fn reg_key()->Result<Option<OwnedKey>,String>{unsafe{let name=wide(REGISTRY);let mut raw=ptr::null_mut();match RegOpenKeyExW(HKCU,name.as_ptr(),0,1,&mut raw){0=>Ok(Some(OwnedKey(raw))),2=>Ok(None),status=>Err(format!("无法读取用户安装注册项（{status}）。"))}}}
 fn reg_string(key:&OwnedKey,name:&str)->Result<Option<String>,String>{unsafe{
     let name=wide(name);let mut length=0;let status=RegGetValueW(key.0,ptr::null(),name.as_ptr(),2,ptr::null_mut(),ptr::null_mut(),&mut length);if status==2{return Ok(None)}if status!=0||length<2||length>65536||length%2!=0{return Err("安装注册字段无法验证，原值已保留。".into())}
@@ -106,19 +128,20 @@ fn registration(owner:&str)->Result<Option<Receipt>,String>{
     if reg_string(&key,"DisplayName")?.is_some_and(|value|value!="CodexProxyTray")||reg_string(&key,"InstallLocation")?.is_some_and(|value|!same_path(Path::new(&value),Path::new(&receipt.root)))||reg_string(&key,"UninstallString")?.is_some_and(|value|value!=command){return Err("同名安装注册项与已登记产品不匹配，已保留。".into())}Ok(Some(receipt))
 }
 fn same_installation(first:&Receipt,second:&Receipt)->bool{first.product==second.product&&first.install_id==second.install_id&&first.owner_sid==second.owner_sid&&same_path(Path::new(&first.root),Path::new(&second.root))}
-fn register(installation:&Installation)->Result<(),String>{unsafe{
+fn register(installation:&Installation,desktop:bool)->Result<(),String>{unsafe{
     if let Some(previous)=registration(&installation.receipt.owner_sid)?{if !same_installation(&previous,&installation.receipt){return Err("当前用户已有另一处 CodexProxyTray 安装，未接管它。".into())}}
     let name=wide(REGISTRY);let mut raw=ptr::null_mut();let mut disposition=0;if RegCreateKeyExW(HKCU,name.as_ptr(),0,ptr::null(),0,3,ptr::null(),&mut raw,&mut disposition)!=0{return Err("无法创建当前用户的安装注册项。".into())}let key=OwnedKey(raw);
     if disposition!=1&&registration(&installation.receipt.owner_sid)?.is_none_or(|previous|!same_installation(&previous,&installation.receipt)){return Err("安装注册项在写入前发生变化，已保留。".into())}
     let values=[(REG_OWNER,serde_json::to_string(&installation.receipt).map_err(|_|"无法编码安装身份。")?),("DisplayName","CodexProxyTray".into()),("DisplayVersion",installation.version.clone()),("InstallLocation",path_text(&installation.root)?),("UninstallString",uninstall_command(&installation.root)?),("Publisher","OrangeZh1".into()),("URLInfoAbout",crate::update::SOURCE.into()),("DisplayIcon",format!("\"{}\",0",path_text(&installation.exe)?))];
     for(name,value)in values{let name=wide(name);let value=wide(&value);if RegSetValueExW(key.0,name.as_ptr(),0,1,value.as_ptr().cast(),(value.len()*2)as u32)!=0{return Err("当前用户的安装注册尚未完整写入。".into())}}
-    for name in ["NoModify","NoRepair"]{let name=wide(name);let one=1u32.to_le_bytes();if RegSetValueExW(key.0,name.as_ptr(),0,4,one.as_ptr(),4)!=0{return Err("当前用户的卸载入口选项未能保存。".into())}}if RegFlushKey(key.0)!=0{return Err("当前用户的安装注册尚未确认保存。".into())}Ok(())
+    for(name,value)in [("NoModify",1u32),("NoRepair",1),("DesktopShortcut",u32::from(desktop))]{let name=wide(name);let value=value.to_le_bytes();if RegSetValueExW(key.0,name.as_ptr(),0,4,value.as_ptr(),4)!=0{return Err("当前用户的安装入口选项未能保存。".into())}}if RegFlushKey(key.0)!=0{return Err("当前用户的安装注册尚未确认保存。".into())}Ok(())
 }}
 fn unregister(installation:&Installation)->Result<(),String>{unsafe{
     let Some(previous)=registration(&installation.receipt.owner_sid)?else{return Ok(())};if !same_installation(&previous,&installation.receipt){return Err("当前用户的产品注册项属于其他安装，已保留。".into())}let name=wide(REGISTRY);let status=RegDeleteKeyW(HKCU,name.as_ptr());if status!=0&&status!=2{return Err("安装注册项仍有未知子项或无法删除，已保留。".into())}Ok(())
 }}
 fn apartment()->Result<Apartment,String>{unsafe{CoInitializeEx(None,COINIT_MULTITHREADED).ok().map_err(|error|windows_error("无法初始化产品入口",error))?;}Ok(Apartment)}
-fn programs()->Result<PathBuf,String>{unsafe{let raw=SHGetKnownFolderPath(&FOLDERID_Programs,KF_FLAG_DEFAULT,None).map_err(|error|windows_error("无法确定本用户的开始菜单",error))?;let value=raw.to_string();CoTaskMemFree(Some(raw.0.cast()));let path=PathBuf::from(value.map_err(|_|"开始菜单路径无法编码。")?);plain(&path)?;Ok(path)}}
+fn shortcut_folder(folder:&GUID,create:bool)->Result<PathBuf,String>{unsafe{let raw=SHGetKnownFolderPath(folder,if create{KF_FLAG_CREATE}else{KF_FLAG_DEFAULT},None).map_err(|error|windows_error("无法确定当前用户的快捷方式目录",error))?;let value=raw.to_string();CoTaskMemFree(Some(raw.0.cast()));let path=PathBuf::from(value.map_err(|_|"快捷方式目录无法编码。")?);plain(&path)?;Ok(path)}}
+fn programs()->Result<PathBuf,String>{shortcut_folder(&FOLDERID_Programs,false)}
 fn link_identity(path:&Path)->Result<Option<PathBuf>,String>{unsafe{
     if !path.exists(){return Ok(None)}plain(path)?;if fs::metadata(path).map_err(|_|"产品入口无法读取。")?.len()>65536{return Err("产品入口超过验证范围，原入口已保留。".into())}
     let link:IShellLinkW=CoCreateInstance(&ShellLink,None,CLSCTX_INPROC_SERVER).map_err(|error|windows_error("无法读取产品入口",error))?;let persist:IPersistFile=link.cast().map_err(|_|"产品入口无法验证。")?;let path=wide(&path_text(path)?);persist.Load(PCWSTR(path.as_ptr()),STGM_READ).map_err(|_|"产品入口无法验证，原入口已保留。")?;let store:IPropertyStore=link.cast().map_err(|_|"产品入口归属不明。")?;
@@ -161,6 +184,16 @@ fn remove_shortcuts(installation:&Installation)->Result<(),String>{
     for name in ["CodexProxyTray.lnk","CodexProxyTray 更新通知.lnk","CodexProxyTray更新通知.lnk"]{let path=folder.join(name);if let Some(target)=link_identity(&path)?{if controlled_target(&target,&installation.root){remove.push(path);}}}
     for path in remove{fs::remove_file(&path).map_err(|_|"当前安装的产品入口无法移除。")?;changed(&path,true,true);}Ok(())
 }
+fn desktop_shortcut(installation:&Installation,enabled:bool)->Result<(),String>{
+    let _apartment=match apartment(){Ok(value)=>value,Err(_)if !enabled=>return Ok(()),Err(error)=>return Err(error)};
+    let folder=match shortcut_folder(&FOLDERID_Desktop,enabled){Ok(value)=>value,Err(_)if !enabled=>return Ok(()),Err(error)=>return Err(error)};
+    let path=folder.join("CodexProxyTray.lnk");
+    let target=match link_identity(&path){Ok(value)=>value,Err(_)if !enabled=>return Ok(()),Err(error)=>return Err(error)};
+    if let Some(target)=&target{if !controlled_target(target,&installation.root){return if enabled{Err("同名桌面入口不属于当前安装，未覆盖它。".into())}else{Ok(())}}}
+    if enabled{write_link(&path,&installation.exe,target.is_some())}
+    else if target.is_some(){fs::remove_file(&path).map_err(|_|"当前安装的桌面入口未能移除，已保留。")?;changed(&path,true,true);Ok(())}
+    else{Ok(())}
+}
 /// Used only on an explicit notification attempt, never at portable startup.
 pub fn ensure_notification_shortcut()->Result<(),String>{
     let owner=current_sid()?;let _lock=identity_lock(&owner)?;
@@ -171,12 +204,21 @@ pub fn set_process_identity()->Result<(),String>{unsafe{let id=wide(APP_ID);SetC
 pub fn entry(args:&[OsString])->Option<i32>{
     if !args.iter().any(|value|value=="--register-installation"||value=="--unregister-installation"){return None}let action=args.first().and_then(|value|value.to_str()).unwrap_or("");
     Some(match (||{if args.len()!=1||!matches!(action,"--register-installation"|"--unregister-installation"){return Err("安装注册参数无效。".to_owned())}let owner=current_sid()?;let _lock=identity_lock(&owner)?;let installation=Installation::own(&owner)?;
-        if action=="--register-installation"{register(&installation)?;shortcut(&installation.exe,Some(&installation.root),true)}else{if let Some(previous)=registration(&owner)?{if !same_installation(&previous,&installation.receipt){return Err("产品注册项属于其他安装，未移除任何入口。".into())}}remove_shortcuts(&installation)?;crate::platform::remove_autostart_for(&PathBuf::from(path_text(&installation.exe)?))?;unregister(&installation)}
+        if action=="--register-installation"{let desktop=desktop_preference(&installation)?;register(&installation,desktop)?;shortcut(&installation.exe,Some(&installation.root),true)?;desktop_shortcut(&installation,desktop)}else{if let Some(previous)=registration(&owner)?{if !same_installation(&previous,&installation.receipt){return Err("产品注册项属于其他安装，未移除任何入口。".into())}}remove_shortcuts(&installation)?;desktop_shortcut(&installation,false)?;crate::platform::remove_autostart_for(&PathBuf::from(path_text(&installation.exe)?))?;unregister(&installation)}
     })(){Ok(())=>0,Err(error)=>{eprintln!("{error}");2}})
 }
 
 #[cfg(test)]mod tests{
     use super::*;
+    #[test]fn desktop_preferences_are_scoped_strict_and_read_only(){
+        let root=PathBuf::from(r"C:\Custom Apps\CodexProxyTray");let receipt=Receipt{schema:1,product:PRODUCT.into(),install_id:"a".repeat(32),owner_sid:"S-1-5-21-1".into(),root:root.display().to_string(),uninstaller_sha256:"b".repeat(64)};let installation=Installation{exe:root.join("current").join(GUI),root,receipt,version:env!("CARGO_PKG_VERSION").into()};
+        let data=std::env::temp_dir().join(format!("codex-installation-preferences-{}-{}",std::process::id(),crate::settings::now()));fs::create_dir(&data).unwrap();assert!(!preferences_at(&data,&installation).unwrap());
+        let directory=data.join("installation-preferences-v1");fs::write(&directory,b"unknown directory replacement").unwrap();assert!(preferences_at(&data,&installation).is_err());assert_eq!(fs::read(&directory).unwrap(),b"unknown directory replacement");fs::remove_file(&directory).unwrap();fs::create_dir(&directory).unwrap();
+        let path=directory.join(format!("{}.json",installation.receipt.install_id));let valid=serde_json::json!({"schema":1,"product":PREFERENCES_PRODUCT,"install_id":&installation.receipt.install_id,"root":&installation.receipt.root,"desktop_shortcut":true});fs::write(&path,serde_json::to_vec(&valid).unwrap()).unwrap();assert!(preferences_at(&data,&installation).unwrap());
+        let mut disabled=valid.clone();disabled["desktop_shortcut"]=serde_json::json!(false);fs::write(&path,serde_json::to_vec(&disabled).unwrap()).unwrap();assert!(!preferences_at(&data,&installation).unwrap());
+        for(key,value)in [("schema",serde_json::json!(2)),("product",serde_json::json!("Other")),("install_id",serde_json::json!("c".repeat(32))),("root",serde_json::json!(r"C:\Other")),("desktop_shortcut",serde_json::json!("true")),("unknown",serde_json::json!(true))]{let mut invalid=valid.clone();invalid[key]=value;let bytes=serde_json::to_vec(&invalid).unwrap();fs::write(&path,&bytes).unwrap();assert!(preferences_at(&data,&installation).is_err());assert_eq!(fs::read(&path).unwrap(),bytes);}
+        for bytes in [b"{corrupt".to_vec(),vec![b'x';16385]]{fs::write(&path,&bytes).unwrap();assert!(preferences_at(&data,&installation).is_err());assert_eq!(fs::read(&path).unwrap(),bytes);}fs::remove_dir_all(&data).unwrap();
+    }
     #[test]fn installation_identity_and_payload_manifest_are_strict(){
         let root=Path::new(r"C:\CodexProxyTray");let mut receipt=Receipt{schema:1,product:PRODUCT.into(),install_id:"a".repeat(32),owner_sid:"S-1-5-21-1".into(),root:root.display().to_string(),uninstaller_sha256:"b".repeat(64)};
         assert!(validate_receipt(&receipt,root,"S-1-5-21-1").is_ok());assert!(validate_receipt(&receipt,root,"S-1-5-21-2").is_err());receipt.install_id="A".repeat(32);assert!(validate_receipt(&receipt,root,"S-1-5-21-1").is_err());receipt.install_id="a".repeat(64);assert!(validate_receipt(&receipt,root,"S-1-5-21-1").is_ok());

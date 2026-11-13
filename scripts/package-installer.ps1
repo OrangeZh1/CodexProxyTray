@@ -39,7 +39,7 @@ try {
     $setupName="CodexProxyTray-v$version-windows-x64-setup.exe"
     $setup=Join-Path $release $setupName
     Require (-not (Test-Path -LiteralPath $setup)) 'new_installer_output'
-    $compilerArguments=@('/V2','/WX',"/DRELEASE_DIR=$release","/DOUTPUT_FILE=$setup","/DAPP_VERSION=$version","/DSOURCE_COMMIT=$env:GITHUB_SHA","/DZIP_SHA256=$zipHash","/DENGINE_PATH=$(Join-Path $stage 'install_application.ps1')","/DUPDATE_ENGINE_PATH=$(Join-Path $stage 'install_update.ps1')","/DICON_PATH=$(Join-Path $repo 'src-tauri/icons/icon.ico')",(Join-Path $repo 'scripts/windows-installer.nsi'))
+    $compilerArguments=@('/V2','/WX','/INPUTCHARSET','UTF8',"/DRELEASE_DIR=$release","/DOUTPUT_FILE=$setup","/DAPP_VERSION=$version","/DSOURCE_COMMIT=$env:GITHUB_SHA","/DZIP_SHA256=$zipHash","/DENGINE_PATH=$(Join-Path $stage 'install_application.ps1')","/DUPDATE_ENGINE_PATH=$(Join-Path $stage 'install_update.ps1')","/DICON_PATH=$(Join-Path $repo 'src-tauri/icons/icon.ico')",(Join-Path $repo 'scripts/windows-installer.nsi'))
     & $compilerPath @compilerArguments
     Require ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $setup -PathType Leaf)) 'nsis_installer_compiled'
     $fileVersion=[Diagnostics.FileVersionInfo]::GetVersionInfo($setup)

@@ -5,6 +5,7 @@ SetCompressor /SOLID lzma
 Name "CodexProxyTray"
 OutFile "${OUTPUT_FILE}"
 InstallDir "$LOCALAPPDATA\Programs\CodexProxyTray"
+InstallDirRegKey HKCU64 "Software\Microsoft\Windows\CurrentVersion\Uninstall\CodexProxyTray" "InstallLocation"
 ShowInstDetails show
 ShowUninstDetails show
 VIProductVersion "${APP_VERSION}.0"
@@ -19,14 +20,20 @@ VIAddVersionKey /LANG=2052 "LegalCopyright" "Copyright (c) 2026 OrangeZh1"
 !include "LogicLib.nsh"
 !include "x64.nsh"
 !include "WinVer.nsh"
+!include "FileFunc.nsh"
+!include "nsDialogs.nsh"
 !define MUI_ICON "${ICON_PATH}"
 !define MUI_UNICON "${ICON_PATH}"
 !define MUI_ABORTWARNING
-!define MUI_WELCOMEPAGE_TEXT "将为当前 Windows 用户安装 CodexProxyTray。配置、历史和日志保存在程序目录之外。可选流量辅助服务独立管理，本安装器不请求其管理员授权。"
+!define MUI_WELCOMEPAGE_TEXT "此向导将引导你安装 CodexProxyTray。点击“下一步”选择安装位置和快捷方式。"
 !define MUI_FINISHPAGE_RUN "$INSTDIR\current\CodexProxyTray.exe"
 !define MUI_FINISHPAGE_RUN_TEXT "运行 CodexProxyTray"
 !define MUI_UNCONFIRMPAGE_TEXT_TOP "将移除当前用户的 CodexProxyTray、开始菜单和软件列表入口。配置、历史及日志会保留。可选流量辅助服务独立管理。"
 !insertmacro MUI_PAGE_WELCOME
+!define MUI_PAGE_CUSTOMFUNCTION_SHOW DirectoryShow
+!define MUI_PAGE_CUSTOMFUNCTION_LEAVE DirectoryLeave
+!insertmacro MUI_PAGE_DIRECTORY
+Page custom IconOptionsShow IconOptionsLeave
 !insertmacro MUI_PAGE_INSTFILES
 !insertmacro MUI_PAGE_FINISH
 !insertmacro MUI_UNPAGE_CONFIRM
@@ -40,6 +47,10 @@ Var SystemPowerShell
 Var BootstrapText
 Var BootstrapCount
 Var BootstrapBom
+Var RegisteredRoot
+Var DesktopChoice
+Var DesktopCheckbox
+Var OptionsDialog
 
 !macro DefineBootstrapDiagnostic Prefix
 Function ${Prefix}BootstrapDiagnostic
@@ -194,7 +205,53 @@ FunctionEnd
   WriteINIStr "$PLUGINSDIR\plan.ini" "Application" "UpdateEnginePath" "$PLUGINSDIR\install_update.ps1"
   WriteINIStr "$PLUGINSDIR\plan.ini" "Application" "ResultPath" "$PLUGINSDIR\result.json"
   WriteINIStr "$PLUGINSDIR\plan.ini" "Application" "Silent" "${Quiet}"
+  WriteINIStr "$PLUGINSDIR\plan.ini" "Application" "DesktopShortcut" "$DesktopChoice"
 !macroend
+
+Function DirectoryShow
+  ${If} $RegisteredRoot != ""
+    !insertmacro MUI_HEADER_TEXT "安装位置" "此版本将沿用已安装目录。更换位置前，请先卸载现有版本。"
+  ${Else}
+    !insertmacro MUI_HEADER_TEXT "安装位置" "默认安装到当前用户目录，也可选择其他本机目录或磁盘。"
+  ${EndIf}
+FunctionEnd
+
+Function DirectoryLeave
+  ${If} $RegisteredRoot != ""
+    StrCmp $INSTDIR $RegisteredRoot directory_unchanged
+      MessageBox MB_ICONEXCLAMATION "升级将沿用原安装目录。更换位置前，请先卸载现有版本。"
+      Abort
+directory_unchanged:
+  ${EndIf}
+FunctionEnd
+
+Function IconOptionsShow
+  !insertmacro MUI_HEADER_TEXT "图标选项" "选择常用入口。"
+  nsDialogs::Create 1018
+  Pop $OptionsDialog
+  ${If} $OptionsDialog == error
+    SetErrorLevel 2
+    Abort
+  ${EndIf}
+  ${NSD_CreateLabel} 0 0 100% 30u "程序将安装到：$\r$\n$INSTDIR"
+  Pop $0
+  ${NSD_CreateCheckbox} 0 42u 100% 14u "创建桌面快捷方式"
+  Pop $DesktopCheckbox
+  ${NSD_SetState} $DesktopCheckbox $DesktopChoice
+  ${NSD_OnClick} $DesktopCheckbox DesktopChoiceChanged
+  ${NSD_CreateLabel} 0 66u 100% 30u "开始菜单快捷方式将始终创建。配置、历史和日志仍保存在当前用户的数据目录。"
+  Pop $0
+  nsDialogs::Show
+FunctionEnd
+
+Function DesktopChoiceChanged
+  Pop $0
+  ${NSD_GetState} $DesktopCheckbox $DesktopChoice
+FunctionEnd
+
+Function IconOptionsLeave
+  ${NSD_GetState} $DesktopCheckbox $DesktopChoice
+FunctionEnd
 
 Function .onInit
   SetShellVarContext current
@@ -208,6 +265,41 @@ Function .onInit
     SetErrorLevel 2
     Abort
   ${EndIf}
+  SetRegView 64
+  ReadRegStr $RegisteredRoot HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\CodexProxyTray" "InstallLocation"
+  StrCpy $DesktopChoice 1
+  ${If} $RegisteredRoot != ""
+    StrCpy $DesktopChoice 0
+    ClearErrors
+    ReadRegDWORD $0 HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\CodexProxyTray" "DesktopShortcut"
+    ${IfNot} ${Errors}
+      ${If} $0 == 1
+        StrCpy $DesktopChoice 1
+      ${EndIf}
+    ${EndIf}
+  ${EndIf}
+  ${GetParameters} $0
+  ClearErrors
+  ${GetOptions} $0 "/DESKTOP=" $1
+  ${If} ${Errors}
+    ClearErrors
+    ${GetOptions} $0 "/DESKTOP" $1
+    ${IfNot} ${Errors}
+      SetErrorLevel 2
+      IfSilent +2
+        MessageBox MB_ICONSTOP "桌面图标参数无效，请使用 /DESKTOP=0 或 /DESKTOP=1。"
+      Abort
+    ${EndIf}
+  ${Else}
+    ${If} $1 != 0
+    ${AndIf} $1 != 1
+      SetErrorLevel 2
+      IfSilent +2
+        MessageBox MB_ICONSTOP "桌面图标参数无效，请使用 /DESKTOP=0 或 /DESKTOP=1。"
+      Abort
+    ${EndIf}
+    StrCpy $DesktopChoice $1
+  ${EndIf}
   StrCpy $SystemPowerShell "$WINDIR\Sysnative\WindowsPowerShell\v1.0\powershell.exe"
 FunctionEnd
 
@@ -217,10 +309,8 @@ Function un.onInit
     SetErrorLevel 2
     Abort
   ${EndIf}
-  StrCmp $INSTDIR "$LOCALAPPDATA\Programs\CodexProxyTray" +4
-    MessageBox MB_ICONSTOP "卸载目录与当前用户的固定安装目录不一致，未删除任何文件。"
-    SetErrorLevel 2
-    Abort
+  SetRegView 64
+  StrCpy $DesktopChoice 0
   StrCpy $SystemPowerShell "$WINDIR\Sysnative\WindowsPowerShell\v1.0\powershell.exe"
 FunctionEnd
 

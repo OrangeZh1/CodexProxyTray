@@ -12,6 +12,7 @@ $machineReg='HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\CodexProx
 $startMenu=[Environment]::GetFolderPath('Programs')
 $shortcut=Join-Path $startMenu 'CodexProxyTray.lnk'
 $legacyShortcut=Join-Path $startMenu 'CodexProxyTray 更新通知.lnk'
+$desktopShortcut=Join-Path ([Environment]::GetFolderPath('DesktopDirectory')) 'CodexProxyTray.lnk'
 if(Test-Path -LiteralPath $EvidenceDirectory){throw 'Existing installer evidence is preserved.'}
 [void][IO.Directory]::CreateDirectory($EvidenceDirectory)
 $work=Join-Path $env:RUNNER_TEMP ('CodexProxyTray-install-qa-'+[Guid]::NewGuid().ToString('N'))
@@ -25,12 +26,17 @@ function WriteJson([string]$Path,$Value){[IO.File]::WriteAllText($Path,($Value|C
 function RunInstaller([string]$File,[string[]]$Arguments=@('/S')){
     $info=[Diagnostics.ProcessStartInfo]::new($File);$info.UseShellExecute=$false;$info.CreateNoWindow=$true;$info.WindowStyle='Hidden';$info.WorkingDirectory=[IO.Path]::GetDirectoryName($File)
     $info.RedirectStandardOutput=$true;$info.RedirectStandardError=$true;$info.StandardOutputEncoding=[Text.Encoding]::Unicode
-    foreach($argument in $Arguments){$info.ArgumentList.Add($argument)}
-    $process=[Diagnostics.Process]::Start($info)
+    if($Arguments.Count -gt 0 -and $Arguments[-1] -cmatch '^(?:/D=|_\?=)'){
+        # NSIS consumes its final directory override as an unquoted command-line tail.
+        $tail=$Arguments[-1];$prefix=@($Arguments|Select-Object -SkipLast 1)
+        if($tail -match '[\r\n\x00"]' -or $tail.Length -le 3 -or @($prefix|Where-Object {$_ -cnotmatch '^(?:/S|/DESKTOP=[01])$'}).Count){throw 'invalid_controlled_nsis_directory_arguments'}
+        $info.Arguments=$Arguments -join ' '
+    }else{foreach($argument in $Arguments){$info.ArgumentList.Add($argument)}}
+    $started=[DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds();$process=[Diagnostics.Process]::Start($info)
     $stdout=$process.StandardOutput.ReadToEndAsync();$stderr=$process.StandardError.ReadToEndAsync()
     try{
         if(-not $process.WaitForExit(120000)){throw 'installer_timeout_preserved'}
-        CaptureOutcome $process.ExitCode
+        CaptureOutcome $process.ExitCode $started
         # A resident child must not make diagnostic collection wait indefinitely.
         [void][Threading.Tasks.Task]::WaitAll(@($stdout,$stderr),2000)
         $diagnostic=(@($stdout,$stderr)|ForEach-Object {if($_.IsCompletedSuccessfully){$_.Result}else{'<diagnostic stream not completed>'}}) -join "`n"
@@ -39,11 +45,12 @@ function RunInstaller([string]$File,[string[]]$Arguments=@('/S')){
         return $process.ExitCode
     }finally{$process.Dispose()}
 }
-function CaptureOutcome([int]$ExitCode){
+function CaptureOutcome([int]$ExitCode,[long]$Started){
     $path=Join-Path $data 'installation-result-v1.json'
     if(Test-Path -LiteralPath $path){
         if((Get-Item -LiteralPath $path).Length -gt 16384){throw 'installer_result_too_large'}
         $value=Get-Content -LiteralPath $path -Raw|ConvertFrom-Json
+        if($value.completed_at -lt $Started){$report.outcomes.Add(@{exit_code=$ExitCode;result_present=$false;stale_previous_result_preserved=$true});return}
         $text=[string]$value.error;foreach($prefix in @($installRoot,$data,$work)){if($prefix){$text=$text.Replace($prefix,'<owned-path>')}};$text=[regex]::Replace($text,'S-\d-(?:\d+-)*\d+','<SID>')
         $report.outcomes.Add([ordered]@{action=$value.action;status=$value.status;phase=$value.phase;version=$value.version;exit_code=$ExitCode;error=$text;completed_at=$value.completed_at})
     }else{$report.outcomes.Add(@{exit_code=$ExitCode;result_present=$false})}
@@ -60,19 +67,22 @@ function RunUninstaller {
     Require ((Hash $copy) -ceq (Hash $source)) 'owned_uninstaller_copy_verified'
     RunInstaller $copy @('/S',('_?='+$installRoot))
 }
-function RegisteredUpgradeFixture {
+function RegisteredUpgradeFixture([switch]$UnknownDesktopOff) {
     # v0.2.2 shipped as a portable ZIP. This is a synthetic registered layout
     # using its real, immutable code, not a claim that v0.2.2 had a Setup EXE.
     $oldVersion='0.2.2';$oldSource='568789e7e3e9d1096725e682e5da4f5a210b0530'
-    $archive=Join-Path $work 'official-v0.2.2.zip'
+    $fixture=Join-Path $work ('registered-upgrade-'+[Guid]::NewGuid().ToString('N'));[void][IO.Directory]::CreateDirectory($fixture)
+    $archive=Join-Path $fixture 'official-v0.2.2.zip'
     $uri='https://github.com/OrangeZh1/CodexProxyTray/releases/download/v0.2.2/CodexProxyTray-v0.2.2-windows-x64.zip'
     Invoke-WebRequest -Uri $uri -OutFile $archive -TimeoutSec 60
     Require ((Hash $archive) -ceq 'ce4cb875325eda9f0872ef304bd156c6baa99d0908b67021e79dc0952dc2ca2f') 'registered_upgrade_fixture_uses_pinned_real_old_code'
-    $current=Join-Path $installRoot 'current';$old=Join-Path $work 'old-payload'
+    $current=Join-Path $installRoot 'current';$old=Join-Path $fixture 'old-payload'
     [IO.Compression.ZipFile]::ExtractToDirectory($archive,$old)
     $oldReceipt=Get-Content -LiteralPath (Join-Path $old 'package-receipt.json') -Raw|ConvertFrom-Json
     Require ($oldReceipt.version -ceq $oldVersion -and $oldReceipt.source_commit -ceq $oldSource -and (Get-Item -LiteralPath (Join-Path $old 'CodexProxyTray.exe')).VersionInfo.ProductVersion -ceq $oldVersion) 'registered_upgrade_fixture_has_real_old_pe_version'
     $oldActive=Get-Content -LiteralPath (Join-Path $installRoot 'active-version.json') -Raw|ConvertFrom-Json
+    $uninstallerHash=Hash (Join-Path $installRoot 'uninstall.exe')
+    if($UnknownDesktopOff){AssertDesktop $true}
     $oldHelper=Get-Process -Id ([int]$oldActive.readiness.helper_pid) -ErrorAction Stop
     try {
         Require ($oldHelper.Path -ieq (Join-Path $current 'CodexProxyTray.exe')) 'registered_upgrade_fixture_quits_only_its_helper'
@@ -80,7 +90,7 @@ function RegisteredUpgradeFixture {
     }finally{$oldHelper.Dispose()}
     # RUNNER_TEMP and LocalApplicationData can be on different volumes. Only
     # this synthetic fixture copies files; production switches remain atomic.
-    $saved=Join-Path $work 'pre-fixture-current';[void][IO.Directory]::CreateDirectory($saved)
+    $saved=Join-Path $fixture 'pre-fixture-current';[void][IO.Directory]::CreateDirectory($saved)
     $files=@(Get-ChildItem -LiteralPath $current -Force)
     Require ($files.Count -eq 10 -and $oldActive.current.files.Count -eq 10 -and @($files|Where-Object {$_.PSIsContainer -or $_.Attributes -band [IO.FileAttributes]::ReparsePoint}).Count -eq 0) 'registered_fixture_current_exact_file_boundary'
     foreach($file in $files){$expected=@($oldActive.current.files|Where-Object name -CEQ $file.Name);Require ($expected.Count -eq 1 -and (Hash $file.FullName) -ceq $expected[0].sha256) 'registered_fixture_current_owned_hash';[IO.File]::Copy($file.FullName,(Join-Path $saved $file.Name),$false)}
@@ -99,10 +109,14 @@ function RegisteredUpgradeFixture {
         $oldActive.readiness.helper_pid=$helper.Id;$oldActive.committed_at=[DateTime]::UtcNow.ToString('o')
         WriteJson (Join-Path $installRoot 'active-version.json') $oldActive
         Set-ItemProperty -LiteralPath $reg -Name DisplayVersion -Value $oldVersion
-        Require ((RunInstaller $setup) -eq 0 -and $helper.WaitForExit(10000)) 'registered_layout_upgrade_uses_real_handoff_and_restart'
+        if($UnknownDesktopOff){[IO.File]::WriteAllText($desktopShortcut,'Synthetic unknown desktop retained while turning preference off.');$unknownDesktopHash=Hash $desktopShortcut}
+        $setupArguments=if($UnknownDesktopOff){@('/S','/DESKTOP=0')}else{@('/S')}
+        Require ((RunInstaller $setup $setupArguments) -eq 0 -and $helper.WaitForExit(10000)) 'registered_layout_upgrade_uses_real_handoff_and_restart'
+        if($UnknownDesktopOff){Require ((Hash $desktopShortcut) -ceq $unknownDesktopHash) 'upgrade_off_applies_new_choice_before_registration_and_retains_unknown_desktop';[IO.File]::Delete($desktopShortcut);AssertDesktop $false;Require ((RunInstaller $setup @('/S','/DESKTOP=1')) -eq 0) 'restore_owned_desktop_after_upgrade_off_fixture';AssertDesktop $true}
     }finally{$helper.Dispose()}
     $active=Get-Content -LiteralPath (Join-Path $installRoot 'active-version.json') -Raw|ConvertFrom-Json
     Require ($active.current.version -ceq $manifest.version -and $active.current.source_commit -ceq $env:GITHUB_SHA -and $active.previous.source_commit -ceq $oldSource -and (Get-Item -LiteralPath (Join-Path $installRoot 'previous\CodexProxyTray.exe')).VersionInfo.ProductVersion -ceq $oldVersion) 'registered_upgrade_commits_new_version_and_one_real_previous'
+    Require ((Hash (Join-Path $installRoot 'uninstall.exe')) -ceq $uninstallerHash) 'registered_upgrade_preserves_existing_uninstaller_and_marker_contract'
     AssertRegistration
 }
 function RootSnapshot {
@@ -118,12 +132,54 @@ function AssertRegistration {
     Require (-not (Test-Path -LiteralPath $legacyShortcut)) 'no_second_notification_start_menu_entry'
     Require (-not (Test-Path -LiteralPath (Join-Path $startMenu 'codex-proxy-cli.lnk'))) 'private_cli_has_no_start_menu_entry'
 }
+function AssertDesktop([bool]$Wanted){
+    $marker=Get-Content -LiteralPath (Join-Path $installRoot 'installation.json') -Raw|ConvertFrom-Json
+    $preferencePath=Join-Path $data ('installation-preferences-v1\'+$marker.install_id+'.json')
+    $preference=Get-Content -LiteralPath $preferencePath -Raw|ConvertFrom-Json
+    Require (@($marker.PSObject.Properties.Name).Count -eq 6 -and @($preference.PSObject.Properties.Name).Count -eq 5 -and $preference.schema -eq 1 -and $preference.product -ceq 'CodexProxyTray.InstallationPreferences' -and $preference.install_id -ceq $marker.install_id -and $preference.root -ieq $installRoot -and $preference.desktop_shortcut -is [bool] -and $preference.desktop_shortcut -eq $Wanted) 'strict_data_sidecar_preserves_six_field_marker'
+    if($Wanted){$shell=New-Object -ComObject WScript.Shell;$link=$shell.CreateShortcut($desktopShortcut);Require ((Test-Path -LiteralPath $desktopShortcut) -and $link.TargetPath -ieq (Join-Path $installRoot 'current\CodexProxyTray.exe') -and [string]::IsNullOrEmpty($link.Arguments)) 'desktop_shortcut_is_normal_current_helper'}else{Require (-not(Test-Path -LiteralPath $desktopShortcut)) 'desktop_choice_off_removes_only_owned_entry'}
+}
+function DesktopChoices {
+    AssertDesktop $true
+    Require ((RunInstaller $setup @('/S','/DESKTOP=0')) -eq 0) 'same_root_desktop_choice_off_is_idempotent';AssertDesktop $false
+    Require ((RunInstaller $setup @('/S','/DESKTOP=1')) -eq 0) 'same_root_desktop_choice_on_is_idempotent';AssertDesktop $true
+    Require ((RunInstaller $setup @('/S','/DESKTOP=0')) -eq 0) 'owned_desktop_can_be_removed_before_unknown_fixture'
+    $unknown='Synthetic unknown desktop shortcut bytes; must never be overwritten.';[IO.File]::WriteAllText($desktopShortcut,$unknown,[Text.UTF8Encoding]::new($false));$unknownHash=Hash $desktopShortcut
+    try{
+        $before=RootSnapshot;$regBefore=(Get-ItemProperty -LiteralPath $reg).CodexProxyTrayOwner
+        Require ((RunInstaller $setup @('/S','/DESKTOP=0')) -eq 0 -and (Hash $desktopShortcut) -ceq $unknownHash) 'desktop_off_retains_unknown_entry'
+        Require ((RunInstaller $setup @('/S','/DESKTOP=1')) -ne 0 -and (Hash $desktopShortcut) -ceq $unknownHash -and (RootSnapshot) -ceq $before -and (Get-ItemProperty -LiteralPath $reg).CodexProxyTrayOwner -ceq $regBefore) 'desktop_on_refuses_unknown_entry_without_replacing_code'
+    }finally{if((Test-Path -LiteralPath $desktopShortcut) -and (Hash $desktopShortcut) -ceq $unknownHash){[IO.File]::Delete($desktopShortcut)}}
+    Require ((RunInstaller $setup @('/S','/DESKTOP=1')) -eq 0) 'desktop_choice_recovers_after_owned_fixture_cleanup';AssertDesktop $true
+    $marker=Get-Content -LiteralPath (Join-Path $installRoot 'installation.json') -Raw|ConvertFrom-Json;$path=Join-Path $data ('installation-preferences-v1\'+$marker.install_id+'.json');$original=[IO.File]::ReadAllBytes($path)
+    try{$value=[Text.Encoding]::UTF8.GetString($original)|ConvertFrom-Json;$value|Add-Member -NotePropertyName unknown -NotePropertyValue $true;WriteJson $path $value;$unknownHash=Hash $path;$before=RootSnapshot;Require ((RunInstaller $setup @('/S','/DESKTOP=0')) -ne 0 -and (Hash $path) -ceq $unknownHash -and (RootSnapshot) -ceq $before) 'unknown_installation_preference_is_retained_and_refused'}finally{[IO.File]::WriteAllBytes($path,$original)}
+}
+function RefuseOtherRoot {
+    $other=Join-Path $work ('forbidden-second-install-'+[Guid]::NewGuid().ToString('N'));$before=RootSnapshot;$entry=Get-ItemProperty -LiteralPath $reg
+    $rejected=RunInstaller $setup @('/S',('/D='+$other));$outcome=$report.outcomes[-1]
+    Require ($rejected -ne 0 -and $outcome.phase -ceq 'error' -and $outcome.error -match '原安装目录升级' -and -not(Test-Path -LiteralPath $other) -and (RootSnapshot) -ceq $before -and (Get-ItemProperty -LiteralPath $reg).CodexProxyTrayOwner -ceq $entry.CodexProxyTrayOwner -and (Get-ItemProperty -LiteralPath $reg).InstallLocation -ceq $entry.InstallLocation) 'registered_installation_cannot_move_or_create_second_root'
+}
+function PathBoundaries {
+    # Load only the existing path guards, not either installation entry point.
+    $repo=[IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'));$tokens=$null;$errors=$null
+    foreach($source in @(@{file='install_update.ps1';names=@('Plain')},@{file='install_application.ps1';names=@('AppFail','Full','Within','PlainParent','InstallDirectory')})){
+        $ast=[Management.Automation.Language.Parser]::ParseFile((Join-Path $repo ('src-tauri/src/'+$source.file)),[ref]$tokens,[ref]$errors);Require (-not $errors.Count) 'path_guard_source_parses'
+        foreach($name in $source.names){$definition=$ast.Find({param($node)$node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq $name},$true);if(-not $definition){throw 'missing_production_path_guard'};. ([scriptblock]::Create($definition.Extent.Text))}
+    }
+    $driveRoot=[IO.Path]::GetPathRoot($local)
+    $invalid=@($driveRoot,($driveRoot.Substring(0,2)+'relative'),'\\server\share\app',('\\?\'+$driveRoot+'app'),('\\.\'+$driveRoot+'app'),(Join-Path $work 'app:stream'),(Join-Path $work 'trailing.'),(Join-Path $work 'NUL\app'),(Join-Path $work '..\escape'),(Join-Path $work ('bad'+[char]10+'path')),(Join-Path $work 'bad"path'),$data,(Join-Path $data 'code'),$local)
+    foreach($path in $invalid){$rejected=$false;try{[void](InstallDirectory $path)}catch{$rejected=$true};Require $rejected 'unsafe_installation_path_rejected_before_mutation'}
+    $target=Join-Path $work ('junction-target-'+[Guid]::NewGuid().ToString('N'));$junction=Join-Path $work ('junction-link-'+[Guid]::NewGuid().ToString('N'));[void][IO.Directory]::CreateDirectory($target)
+    [void](New-Item -ItemType Junction -Path $junction -Target $target);$rejected=$false;try{[void](InstallDirectory (Join-Path $junction 'app'))}catch{$rejected=$true}
+    Require ($rejected -and @(Get-ChildItem -LiteralPath $target -Force).Count -eq 0 -and ((Get-Item -LiteralPath $junction -Force).Attributes -band [IO.FileAttributes]::ReparsePoint)) 'reparse_installation_parent_refused_without_following_link'
+    [IO.Directory]::Delete($junction);[IO.Directory]::Delete($target)
+}
 function RefuseAndRetain([string]$Name,[string]$Path,[string]$Value,[switch]$Uninstall){
     [IO.File]::WriteAllText($Path,$Value);$before=RootSnapshot
     try{$exitCode=if($Uninstall){RunUninstaller}else{RunInstaller $setup};Require ($exitCode -ne 0 -and (Test-Path -LiteralPath $Path) -and (RootSnapshot) -ceq $before) $Name}finally{if([IO.File]::ReadAllText($Path) -ceq $Value){[IO.File]::Delete($Path)}}
 }
 try {
-    Require ((Test-Path -LiteralPath $setup -PathType Leaf) -and -not (Test-Path -LiteralPath $installRoot) -and -not (Test-Path -LiteralPath $data) -and -not (Test-Path -LiteralPath $reg) -and -not (Test-Path -LiteralPath $shortcut) -and -not (Test-Path -LiteralPath $legacyShortcut)) 'fresh_per_user_install_preflight'
+    Require ((Test-Path -LiteralPath $setup -PathType Leaf) -and -not (Test-Path -LiteralPath $installRoot) -and -not (Test-Path -LiteralPath $data) -and -not (Test-Path -LiteralPath $reg) -and -not (Test-Path -LiteralPath $shortcut) -and -not (Test-Path -LiteralPath $legacyShortcut) -and -not (Test-Path -LiteralPath $desktopShortcut)) 'fresh_per_user_install_preflight'
     Require (@(Get-Process -Name CodexProxyTray -ErrorAction SilentlyContinue).Count -eq 0) 'no_preexisting_gui_touched'
     [void][IO.Directory]::CreateDirectory($data);$ownedData=$true
     WriteJson (Join-Path $data 'config.json') @{launch_target='none';network_enabled=$false;auto_check_updates=$false;connectivity_enabled=$false;traffic_enabled=$false}
@@ -143,13 +199,15 @@ try {
     $active=Get-Content -LiteralPath (Join-Path $installRoot 'active-version.json') -Raw|ConvertFrom-Json
     Require ($active.schema -eq 1 -and $active.current.version -ceq $manifest.version -and $active.current.path -ieq (Join-Path $installRoot 'current') -and $active.readiness.main_rendered -and $active.readiness.tray_rendered) 'initial_active_receipt_after_real_health'
     AssertRegistration
+    DesktopChoices
+    RefuseOtherRoot
     $before=RootSnapshot;$installId=(Get-Content -LiteralPath (Join-Path $installRoot 'installation.json') -Raw|ConvertFrom-Json).install_id
     Require ((RunInstaller $setup) -eq 0 -and (RootSnapshot) -ceq $before -and (Get-Content -LiteralPath (Join-Path $installRoot 'installation.json') -Raw|ConvertFrom-Json).install_id -ceq $installId) 'same_version_install_is_idempotent'
     Set-ItemProperty -LiteralPath $reg -Name DisplayVersion -Value '0.0.1'
     $sync=RunApp (Join-Path $installRoot 'current\CodexProxyTray.exe') @('--register-installation')
     try{Require ($sync.WaitForExit(10000) -and $sync.ExitCode -eq 0) 'explicit_owned_registration_sync'}finally{$sync.Dispose()}
     AssertRegistration
-    RegisteredUpgradeFixture
+    RegisteredUpgradeFixture -UnknownDesktopOff
     RefuseAndRetain 'unknown_current_file_refused' (Join-Path $installRoot 'current\user-notes.txt') 'synthetic unknown current file'
     RefuseAndRetain 'unknown_root_file_refused' (Join-Path $installRoot 'user-notes.txt') 'synthetic unknown root file'
     foreach($file in @('installation.json','install-journal.json')){
@@ -189,9 +247,39 @@ try {
     }finally{[IO.File]::WriteAllBytes($journalPath,$journalBytes)}
     RefuseAndRetain 'uninstall_unknown_code_retained' (Join-Path $installRoot 'current\user-notes.txt') 'synthetic unknown current file' -Uninstall
     $configHash=Hash (Join-Path $data 'config.json')
+    $marker=Get-Content -LiteralPath (Join-Path $installRoot 'installation.json') -Raw|ConvertFrom-Json;$badPreferencePath=Join-Path $data ('installation-preferences-v1\'+$marker.install_id+'.json');$badPreference=Get-Content -LiteralPath $badPreferencePath -Raw|ConvertFrom-Json;$badPreference|Add-Member -NotePropertyName unknown -NotePropertyValue 'preserve during uninstall';WriteJson $badPreferencePath $badPreference;$badPreferenceHash=Hash $badPreferencePath
     Require ((RunUninstaller) -eq 0) 'owned_uninstall_succeeds'
-    Require (-not (Test-Path -LiteralPath $installRoot) -and -not (Test-Path -LiteralPath $reg) -and -not (Test-Path -LiteralPath $shortcut)) 'owned_code_and_registration_removed'
+    Require ((Hash $badPreferencePath) -ceq $badPreferenceHash) 'malformed_external_preferences_do_not_block_uninstall_or_get_deleted'
+    Require (-not (Test-Path -LiteralPath $installRoot) -and -not (Test-Path -LiteralPath $reg) -and -not (Test-Path -LiteralPath $shortcut) -and -not (Test-Path -LiteralPath $desktopShortcut)) 'owned_code_and_registration_removed'
     Require ([IO.File]::ReadAllText($sentinel) -ceq 'synthetic preserve-user-data' -and (Hash (Join-Path $data 'config.json')) -ceq $configHash -and (Hash $logSentinel) -ceq $logHash -and (Hash $usageSentinel) -ceq $usageHash) 'uninstall_preserves_exact_configuration_log_and_usage_bytes'
+    PathBoundaries
+    $defaultRoot=$installRoot;$installRoot=Join-Path $work '自选安装 目录'
+    $report.custom_install_cross_drive=[IO.Path]::GetPathRoot($installRoot) -ine [IO.Path]::GetPathRoot($defaultRoot)
+    Require (-not(Test-Path -LiteralPath $installRoot) -and $installRoot.Contains('自选安装 目录')) 'fresh_custom_directory_is_chinese_space_path_on_local_drive'
+    Require ((RunInstaller $setup @('/S','/DESKTOP=1',('/D='+$installRoot))) -eq 0) 'custom_directory_real_install_succeeds'
+    AssertRegistration;AssertDesktop $true;RefuseOtherRoot
+    RegisteredUpgradeFixture
+    AssertDesktop $true
+    Require ((RunUninstaller) -eq 0 -and -not(Test-Path -LiteralPath $installRoot) -and -not(Test-Path -LiteralPath $reg) -and -not(Test-Path -LiteralPath $shortcut) -and -not(Test-Path -LiteralPath $desktopShortcut)) 'custom_directory_upgrade_and_owned_desktop_uninstall_succeed'
+    Require ((Hash (Join-Path $data 'config.json')) -ceq $configHash -and (Hash $logSentinel) -ceq $logHash -and (Hash $usageSentinel) -ceq $usageHash) 'custom_directory_uninstall_preserves_exact_user_data'
+    # Exercise the actual published installer and its own generated uninstaller,
+    # rather than substituting a legacy payload into a new installer layout.
+    $installRoot=$defaultRoot
+    Require (-not(Test-Path -LiteralPath $installRoot) -and -not(Test-Path -LiteralPath $reg) -and -not(Test-Path -LiteralPath $shortcut) -and -not(Test-Path -LiteralPath $desktopShortcut) -and @(Get-Process -Name CodexProxyTray -ErrorAction SilentlyContinue).Count -eq 0) 'genuine_v023_installation_starts_from_fresh_default_code_root'
+    $oldSetup=Join-Path $work 'official-v0.2.3-setup.exe'
+    Invoke-WebRequest -Uri 'https://github.com/OrangeZh1/CodexProxyTray/releases/download/v0.2.3/CodexProxyTray-v0.2.3-windows-x64-setup.exe' -OutFile $oldSetup -TimeoutSec 60
+    Require ((Hash $oldSetup) -ceq '4f30ab45c5ab2e7b94e6660fff889ccf1d1b858612387bb5e5a363627cd845f2' -and (Get-Item -LiteralPath $oldSetup).VersionInfo.ProductVersion -ceq '0.2.3') 'genuine_v023_setup_is_pinned_official_release'
+    Require ((RunInstaller $oldSetup) -eq 0) 'genuine_v023_setup_installs_its_real_uninstaller'
+    $oldActive=Get-Content -LiteralPath (Join-Path $installRoot 'active-version.json') -Raw|ConvertFrom-Json
+    Require ($oldActive.current.version -ceq '0.2.3' -and $oldActive.current.source_commit -ceq '5eca4970518f0b8801fa959fc1fb4955f74e6c23' -and (Get-Item -LiteralPath (Join-Path $installRoot 'current\CodexProxyTray.exe')).VersionInfo.ProductVersion -ceq '0.2.3' -and -not(Test-Path -LiteralPath $desktopShortcut)) 'genuine_v023_code_is_healthy_and_has_no_desktop_shortcut'
+    $legacyUninstallerHash=Hash (Join-Path $installRoot 'uninstall.exe');$legacyMarkerHash=Hash (Join-Path $installRoot 'installation.json')
+    Require ((RunInstaller $setup @('/S','/DESKTOP=1')) -eq 0) 'genuine_v023_installation_upgrades_with_desktop_choice'
+    $upgraded=Get-Content -LiteralPath (Join-Path $installRoot 'active-version.json') -Raw|ConvertFrom-Json
+    Require ($upgraded.current.version -ceq $manifest.version -and $upgraded.current.source_commit -ceq $env:GITHUB_SHA -and $upgraded.previous.source_commit -ceq $oldActive.current.source_commit -and (Hash (Join-Path $installRoot 'uninstall.exe')) -ceq $legacyUninstallerHash -and (Hash (Join-Path $installRoot 'installation.json')) -ceq $legacyMarkerHash) 'genuine_v023_uninstaller_and_exact_marker_survive_new_version_upgrade'
+    AssertRegistration;AssertDesktop $true
+    Require ((RunUninstaller) -eq 0) 'genuine_v023_uninstaller_removes_upgraded_installation'
+    Require (-not(Test-Path -LiteralPath $installRoot) -and -not(Test-Path -LiteralPath $reg) -and -not(Test-Path -LiteralPath $shortcut) -and -not(Test-Path -LiteralPath $desktopShortcut)) 'genuine_v023_uninstaller_removes_new_desktop_menu_code_and_registration'
+    Require ((Hash (Join-Path $data 'config.json')) -ceq $configHash -and (Hash $logSentinel) -ceq $logHash -and (Hash $usageSentinel) -ceq $usageHash) 'genuine_v023_uninstall_preserves_exact_synthetic_user_data'
     $report.status='passed'
 }catch{$report.status='failed';$report.error=$_.Exception.Message;$report.diagnostic_root=$work;throw}
 finally {

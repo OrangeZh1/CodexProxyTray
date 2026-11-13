@@ -9,6 +9,7 @@ param(
     [string]$UpdateEnginePath,
     [string]$ResultPath,
     [string]$PlanPath,
+    [ValidateSet('0','1')][string]$DesktopShortcut='0',
     [switch]$Silent
 )
 $ErrorActionPreference='Stop'
@@ -17,6 +18,12 @@ function AppFail([string]$Text){throw $Text}
 function Full([string]$Path){if(-not $Path -or $Path.Contains([char]0) -or $Path.Contains('"')){AppFail '安装路径无效。'};[IO.Path]::GetFullPath($Path).TrimEnd('\')}
 function Within([string]$Path,[string]$Directory){$Path.StartsWith($Directory.TrimEnd('\')+'\',[StringComparison]::OrdinalIgnoreCase)}
 function PlainParent([string]$Path){$cursor=Full $Path;while(-not(Test-Path -LiteralPath $cursor)){$parent=[IO.Path]::GetDirectoryName($cursor);if(-not $parent -or $parent -eq $cursor){AppFail '安装目录的上级路径无效。'};$cursor=$parent};Plain $cursor}
+function InstallDirectory([string]$Path){
+    $value=$Path.Replace('/','\');if($value -cnotmatch '^[A-Za-z]:\\' -or $value -match '[\x00-\x1f\x7f"<>|?*]' -or $value.Substring(2).Contains(':')){AppFail '安装目录必须是本机盘符下的绝对路径，不能使用网络、设备路径或控制字符。'}
+    foreach($part in $value.Substring(3).TrimEnd('\').Split('\')){if(-not $part -or $part -in @('.','..') -or $part.EndsWith('.') -or $part.EndsWith(' ') -or $part -match '^(CON|PRN|AUX|NUL|COM[1-9¹²³]|LPT[1-9¹²³])(?:\.|$)'){AppFail '安装目录包含无效路径片段。'}}
+    $resolved=Full $value;$drive=[IO.DriveInfo]::new([IO.Path]::GetPathRoot($resolved));if(-not $drive.IsReady -or $drive.DriveType -notin @([IO.DriveType]::Fixed,[IO.DriveType]::Removable,[IO.DriveType]::Ram) -or $resolved.Length -le 3){AppFail '安装目录必须位于可用本机磁盘且不能是磁盘根目录。'}
+    if((Within $data $resolved) -or (Within $resolved $data) -or $data -ieq $resolved){AppFail '代码目录与用户数据目录不得重叠。'};PlainParent $resolved;$resolved
+}
 function Event([string]$State){if(-not $applicationJob){return};$record=@{at=[DateTime]::UtcNow.ToString('o');action=$Action;phase=$State};[IO.File]::AppendAllText((Join-Path $applicationJob 'events.jsonl'),(($record|ConvertTo-Json -Compress)+"`r`n"),[Text.UTF8Encoding]::new($false));Durable (Join-Path $applicationJob 'phase.json') $record}
 function SaveOutcome([string]$State,[string]$Message){
     $status=if($State -in @('installed','idempotent','uninstalled')){'passed'}elseif($State -like '*cleanup_pending'){'partial'}else{'failed'}
@@ -37,7 +44,7 @@ function StartUpdate([string]$PhaseValue,[string]$JobPath){StartOwned (SystemPow
 function InstallPlan([string]$Path){
     Plain $Path;if((Get-Item -LiteralPath $Path).Length -gt 16384){AppFail '安装调用计划超过读取上限。'};$values=@{};$section=$false
     foreach($line in ([IO.File]::ReadAllText($Path) -split '\r?\n')){if(-not $line.Trim()){continue};if($line -ceq '[Application]'){if($section){AppFail '安装调用计划含重复分节。'};$section=$true;continue};if(-not $section -or $line -cnotmatch '^([A-Za-z][A-Za-z0-9]*)=(.*)$' -or $values.ContainsKey($Matches[1])){AppFail '安装调用计划格式无效。'};$values[$Matches[1]]=$Matches[2]}
-    $keys=@('Action','InstallRoot','PayloadZip','ZipSha256','Version','SourceCommit','UninstallerPath','UpdateEnginePath','ResultPath','Silent');if($values.Count -ne $keys.Count -or @($values.Keys|Where-Object {$_ -cnotin $keys}).Count -or $values.Action -cnotin @('Install','Uninstall') -or $values.Silent -cnotin @('0','1') -or (Full $values.UpdateEnginePath) -ine $UpdateEnginePath){AppFail '安装调用计划与当前处理程序不匹配。'};$values
+    $keys=@('Action','InstallRoot','PayloadZip','ZipSha256','Version','SourceCommit','UninstallerPath','UpdateEnginePath','ResultPath','Silent');if($values.Count -notin @(10,11) -or @($keys|Where-Object {-not $values.ContainsKey($_)}).Count -or @($values.Keys|Where-Object {$_ -cnotin ($keys+@('DesktopShortcut'))}).Count -or $values.Action -cnotin @('Install','Uninstall') -or $values.Silent -cnotin @('0','1') -or ($values.ContainsKey('DesktopShortcut') -and $values.DesktopShortcut -cnotin @('0','1')) -or (Full $values.UpdateEnginePath) -ine $UpdateEnginePath){AppFail '安装调用计划与当前处理程序不匹配。'};if(-not $values.ContainsKey('DesktopShortcut')){$values.DesktopShortcut='0'};$values
 }
 function ExactGone([int]$ProcessId,[long]$Created,[int]$Seconds){$end=[DateTime]::UtcNow.AddSeconds($Seconds);do{$process=Get-Process -Id $ProcessId -ErrorAction SilentlyContinue;try{if(-not $process -or $process.StartTime.ToUniversalTime().ToFileTimeUtc() -ne $Created){return $true}}finally{if($process){$process.Dispose()}};Start-Sleep -Milliseconds 100}while([DateTime]::UtcNow -lt $end);return $false}
 function Helpers([switch]$RejectForeign){
@@ -53,6 +60,25 @@ function ReleaseCodeLock {if($codeLock){$codeLock.Dispose();$script:codeLock=$nu
 function Marker {
     $value=Json (Join-Path $installRoot 'installation.json');$keys=@('schema','product','install_id','owner_sid','root','uninstaller_sha256');$names=@($value.PSObject.Properties.Name)
     if($names.Count -ne $keys.Count -or @($names|Where-Object {$_ -cnotin $keys}).Count -or $value.schema -ne 1 -or $value.product -cne 'CodexProxyTray.Installation' -or $value.install_id -cnotmatch '^[a-f0-9]{32}$' -or $value.owner_sid -cne $ownerSid -or (Full $value.root) -ine $installRoot -or $value.uninstaller_sha256 -cnotmatch '^[a-f0-9]{64}$' -or (Hash $uninstaller) -cne $value.uninstaller_sha256){AppFail '安装归属记录不匹配，原目录已保留。'};$value
+}
+function ReadPreferences($Marker){
+    $folder=Join-Path $data 'installation-preferences-v1';PlainParent $folder;$path=Join-Path $folder ($Marker.install_id+'.json');if(-not(Test-Path -LiteralPath $path)){return $null};if((Get-Item -LiteralPath $path).Length -gt 16384){AppFail '安装偏好超过读取上限，原文件已保留。'}
+    $value=Json $path;$keys=@('schema','product','install_id','root','desktop_shortcut');$names=@($value.PSObject.Properties.Name)
+    if($names.Count -ne 5 -or @($names|Where-Object {$_ -cnotin $keys}).Count -or -not ($value.schema -is [int] -or $value.schema -is [long]) -or $value.schema -ne 1 -or $value.product -cne 'CodexProxyTray.InstallationPreferences' -or $value.install_id -cne $Marker.install_id -or $value.root -isnot [string] -or (Full $value.root) -ine $installRoot -or $value.desktop_shortcut -isnot [bool]){AppFail '安装偏好归属或格式无效，原文件已保留。'};$value
+}
+function WritePreferences($Marker){
+    [void](ReadPreferences $Marker);$folder=Join-Path $data 'installation-preferences-v1';PlainParent $folder;[void][IO.Directory]::CreateDirectory($folder);Plain $folder
+    Durable (Join-Path $folder ($Marker.install_id+'.json')) @{schema=1;product='CodexProxyTray.InstallationPreferences';install_id=$Marker.install_id;root=$installRoot;desktop_shortcut=($DesktopShortcut -ceq '1')}
+}
+function RegisteredRoot {
+    $key='HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\CodexProxyTray';if(-not(Test-Path -LiteralPath $key)){return $null};$entry=Get-ItemProperty -LiteralPath $key
+    if($entry.CodexProxyTrayOwner -isnot [string] -or $entry.CodexProxyTrayOwner.Length -gt 16384 -or $entry.InstallLocation -isnot [string]){AppFail '现有产品注册项缺少可验证归属，未创建另一份安装。'}
+    $receipt=$entry.CodexProxyTrayOwner|ConvertFrom-Json;$keys=@('schema','product','install_id','owner_sid','root','uninstaller_sha256');$names=@($receipt.PSObject.Properties.Name)
+    if($names.Count -ne 6 -or @($names|Where-Object {$_ -cnotin $keys}).Count -or $receipt.schema -ne 1 -or $receipt.product -cne 'CodexProxyTray.Installation' -or $receipt.owner_sid -cne $ownerSid -or $receipt.root -isnot [string]){AppFail '现有产品注册归属无效，未创建另一份安装。'}
+    # Dynamic function scope lets the unchanged Owned checks inspect the registered root.
+    $installRoot=InstallDirectory $receipt.root;$target=Join-Path $installRoot 'current';$previous=Join-Path $installRoot 'previous';$exe=Join-Path $target 'CodexProxyTray.exe';$uninstaller=Join-Path $installRoot 'uninstall.exe';$activePath=Join-Path $installRoot 'active-version.json';$journalPath=Join-Path $installRoot 'install-journal.json'
+    if((Full $entry.InstallLocation) -ine $installRoot -or $entry.DisplayName -cne 'CodexProxyTray'){AppFail '产品注册位置与归属记录不一致，原安装已保留。'};$owned=Owned
+    foreach($name in $keys){if([string]$receipt.$name -cne [string]$owned.marker.$name){AppFail '产品注册归属与实际文件不一致，原安装已保留。'}};$installRoot
 }
 function Slot([string]$Path,$Files,[switch]$Partial){
     if(@($Files).Count -ne $payload.Count -or @(Compare-Object ($payload|Sort-Object) (@($Files.name)|Sort-Object)).Count){AppFail '代码版本的精确文件清单无效。'}
@@ -86,7 +112,7 @@ function Owned([switch]$Removing){
     Slot $target $active.current.files -Partial:$resumeRemoval
     if(Test-Path -LiteralPath $previous){if((Full $active.previous.path) -ine $previous){AppFail '上一版本的目录归属不明。'};Slot $previous $active.previous.files -Partial:$resumeRemoval}
     if(-not $resumeRemoval){$receipt=Json (Join-Path $target 'package-receipt.json');if($receipt.schema -ne 1 -or $receipt.product -cne 'CodexProxyTray' -or $receipt.version -cne $active.current.version -or $receipt.source_commit -cne $active.current.source_commit -or (Get-Item -LiteralPath $exe).VersionInfo.ProductVersion -cne $active.current.version){AppFail '当前程序来源或版本与回执不一致。'}}
-    References $active;[pscustomobject]@{marker=$marker;active=$active;journal=$journal;removing=[bool]$resumeRemoval}
+    References $active;if(-not $Removing){[void](ReadPreferences $marker)};[pscustomobject]@{marker=$marker;active=$active;journal=$journal;removing=[bool]$resumeRemoval}
 }
 function Register {Event 'registering';RunOwned $exe @('--register-installation') 20}
 function InitialRecord {
@@ -120,17 +146,19 @@ function Initialise {
     }
     $script:healthy=$true
     $marker=@{schema=1;product='CodexProxyTray.Installation';install_id=$journal.install_id;owner_sid=$ownerSid;root=$installRoot;uninstaller_sha256=$journal.uninstaller_sha256};Durable (Join-Path $installRoot 'installation.json') $marker
-    try{Register;$journal.state='installed';Durable $journalPath $journal;SaveOutcome 'installed' $null;$script:exitCode=0}catch{$journal.state='registration-pending';Durable $journalPath $journal;throw}
+    try{WritePreferences $marker;Register;$journal.state='installed';Durable $journalPath $journal;SaveOutcome 'installed' $null;$script:exitCode=0}catch{$journal.state='registration-pending';Durable $journalPath $journal;throw}
 }
 function Upgrade($OwnedState){
     NoCliUse
     if([version]$Version -lt [version]$OwnedState.active.current.version){AppFail '目标版本低于当前健康版本，未执行降级。'}
     if($Version -ceq $OwnedState.active.current.version){
-        if($SourceCommit -cne $OwnedState.active.current.source_commit){AppFail '同版本的编译来源不同，未覆盖已安装程序。'};$script:healthy=$true;Register;$journal=$OwnedState.journal;$journal.state='installed';Durable $journalPath $journal;SaveOutcome 'idempotent' $null;$script:exitCode=0;return
+        if($SourceCommit -cne $OwnedState.active.current.source_commit){AppFail '同版本的编译来源不同，未覆盖已安装程序。'};$script:healthy=$true;WritePreferences $OwnedState.marker;Register;$journal=$OwnedState.journal;$journal.state='installed';Durable $journalPath $journal;SaveOutcome 'idempotent' $null;$script:exitCode=0;return
     }
     NoCliUse;$parent=$null;$apply=$null;$updateJob=$null
     try{
         $running=@(Helpers -RejectForeign);$parent=if($running.Count){Get-Process -Id $running[0].ProcessId -ErrorAction Stop}else{StartHelper '--background --after-update'};if(-not(Ready $parent)){AppFail '原健康助手未能就绪，未开始升级。'}
+        # This explicit user preference survives a failed update; code/config rollback is independent.
+        WritePreferences $OwnedState.marker
         $updateJob=Join-Path (Join-Path $data 'updates') ($PID.ToString()+'-'+[DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds());[void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($updateJob));[void][IO.Directory]::CreateDirectory($updateJob)
         CopyDurable $PayloadZip (Join-Path $updateJob 'package.zip');CopyDurable $UpdateEnginePath (Join-Path $updateJob 'installer.ps1');Durable (Join-Path $updateJob 'manifest.json') @{schema=1;product='CodexProxyTray';version=$Version;notes='Windows 安装器提供的已校验更新包。'}
         Durable (Join-Path $updateJob 'plan.json') @{schema=1;product='CodexProxyTray';version=$Version;zip_sha256=$ZipSha256;manifest_sha256=(Hash (Join-Path $updateJob 'manifest.json'));executable=$exe;data_root=$data;parent_pid=$parent.Id;parent_created=$parent.StartTime.ToUniversalTime().ToFileTimeUtc().ToString();launch_background=[bool]$Silent}
@@ -164,17 +192,17 @@ try {
     if(-not $UpdateEnginePath){$UpdateEnginePath=Join-Path $PSScriptRoot 'install_update.ps1'};$UpdateEnginePath=Full $UpdateEnginePath
     . $UpdateEnginePath -Phase Library
     $bootstrapPhase='parse_plan'
-    if($PlanPath){$values=InstallPlan (Full $PlanPath);foreach($name in @('Action','InstallRoot','PayloadZip','ZipSha256','Version','SourceCommit','UninstallerPath','ResultPath')){Set-Variable -Name $name -Value ([string]$values[$name]) -Scope Script};$Silent=$values.Silent -ceq '1'}
+    if($PlanPath){$values=InstallPlan (Full $PlanPath);foreach($name in @('Action','InstallRoot','PayloadZip','ZipSha256','Version','SourceCommit','UninstallerPath','ResultPath','DesktopShortcut')){Set-Variable -Name $name -Value ([string]$values[$name]) -Scope Script};$Silent=$values.Silent -ceq '1'}
     $bootstrapPhase='resolve_local_appdata'
     if(-not $env:LOCALAPPDATA -or -not [IO.Path]::IsPathRooted($env:LOCALAPPDATA)){AppFail '当前用户 LOCALAPPDATA 无效。'}
     $localBase=Full $env:LOCALAPPDATA;if($localBase.StartsWith('\\') -or $localBase.StartsWith('\\?\')){AppFail '安装仅支持本机用户目录。'};Plain $localBase
-    $defaultRoot=Join-Path $localBase 'Programs\CodexProxyTray';$installRoot=if($InstallRoot){Full $InstallRoot}else{Full $defaultRoot};if($installRoot -ine (Full $defaultRoot)){AppFail '安装根目录必须是当前用户 Programs\CodexProxyTray，未接受其他目录。'}
-    $data=Join-Path $localBase 'CodexProxyTray';if((Within $data $installRoot) -or (Within $installRoot $data) -or $data -ieq $installRoot){AppFail '代码目录与用户数据目录不得重叠。'}
+    $data=Join-Path $localBase 'CodexProxyTray';$defaultRoot=Join-Path $localBase 'Programs\CodexProxyTray';$installRoot=InstallDirectory $(if($InstallRoot){$InstallRoot}else{$defaultRoot})
     $bootstrapPhase='create_data_root';PlainParent $data;[void][IO.Directory]::CreateDirectory($data);Plain $data;$ownerSid=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value
     $outerLock=[IO.File]::Open((Join-Path $data 'application-install.lock'),'OpenOrCreate','ReadWrite','None')
     $jobs=Join-Path $data 'installations';PlainParent $jobs;[void][IO.Directory]::CreateDirectory($jobs);$applicationJob=Join-Path $jobs ($PID.ToString()+'-'+[DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds());[void][IO.Directory]::CreateDirectory($applicationJob);$bootstrapPhase='preflight';Event 'preflight'
     $target=Join-Path $installRoot 'current';$previous=Join-Path $installRoot 'previous';$exe=Join-Path $target 'CodexProxyTray.exe';$uninstaller=Join-Path $installRoot 'uninstall.exe';$activePath=Join-Path $installRoot 'active-version.json';$journalPath=Join-Path $installRoot 'install-journal.json';$plan=@{version=$Version;launch_background=[bool]$Silent}
     if($Action -ceq 'Install'){
+        $registered=RegisteredRoot;if($registered -and $registered -ine $installRoot){AppFail '已存在经过验证的安装，请使用原安装目录升级；未搬迁或创建第二份安装。'}
         [void](Helpers -RejectForeign);if($Version -cnotmatch '^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$' -or $SourceCommit -cnotmatch '^[a-f0-9]{40}$' -or $ZipSha256 -cnotmatch '^[a-f0-9]{64}$'){AppFail '安装器版本或来源参数无效。'}
         $PayloadZip=Full $PayloadZip;$UninstallerPath=Full $UninstallerPath;Plain $PayloadZip;Plain $UninstallerPath;if((Get-Item -LiteralPath $PayloadZip).Length -gt 67108864 -or (Hash $PayloadZip) -cne $ZipSha256 -or (Get-Item -LiteralPath $UninstallerPath).Length -gt 33554432){AppFail '安装器载荷校验失败。'}
         $rootInitiallyEmpty=(-not(Test-Path -LiteralPath $installRoot)) -or @(Get-ChildItem -LiteralPath $installRoot -Force).Count -eq 0
