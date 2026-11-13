@@ -1,4 +1,4 @@
-param([ValidateSet('Prepare','Apply')][string]$Phase,[Parameter(Mandatory=$true)][string]$Job)
+param([ValidateSet('Prepare','Apply','Library')][string]$Phase,[string]$Job)
 $ErrorActionPreference='Stop'
 # The helper uses only protected Windows modules, independent of a PowerShell 7 parent.
 $originalModulePath=$env:PSModulePath
@@ -24,9 +24,24 @@ function Result([string]$State,[string]$ErrorText){$value=@{schema=1;completed_a
 function SameParent($Process){$Process -and $Process.StartTime.ToUniversalTime().ToFileTimeUtc().ToString() -ceq $plan.parent_created -and $Process.MainModule.FileName -ieq $exe}
 function OwnProcesses([string]$Image){@(Get-CimInstance Win32_Process -Filter "name='CodexProxyTray.exe'"|Where-Object {$_.ExecutablePath -ieq $Image})}
 function WaitGone([int]$Id,[string]$Created,[int]$Seconds){$end=[DateTime]::UtcNow.AddSeconds($Seconds);do{if(Test-Path -LiteralPath (Join-Path $Job 'cancelled.json')){return $false};$process=Get-Process -Id $Id -ErrorAction SilentlyContinue;if(-not $process -or $process.StartTime.ToUniversalTime().ToFileTimeUtc().ToString() -cne $Created){return $true};Start-Sleep -Milliseconds 200}while([DateTime]::UtcNow -lt $end);return $false}
-function StartHelper([string]$Arguments='--after-update'){$start=[Diagnostics.ProcessStartInfo]::new($exe);$start.Arguments=$Arguments;$start.UseShellExecute=$false;$start.CreateNoWindow=$true;$start.WindowStyle='Hidden';$start.WorkingDirectory=$target;if($originalModulesPresent){$start.EnvironmentVariables['PSModulePath']=$originalModulePath}else{$start.EnvironmentVariables.Remove('PSModulePath')};if($originalPolicyPresent){$start.EnvironmentVariables['PSExecutionPolicyPreference']=$originalPolicy}else{$start.EnvironmentVariables.Remove('PSExecutionPolicyPreference')};$start.EnvironmentVariables.Remove('CODEX_PROXY_UPDATER_POLICY');$start.EnvironmentVariables.Remove('CODEX_PROXY_UPDATER_POLICY_PRESENT');$start.EnvironmentVariables.Remove('CODEX_PROXY_UPDATER_MODULES');$start.EnvironmentVariables.Remove('CODEX_PROXY_UPDATER_MODULES_PRESENT');[Diagnostics.Process]::Start($start)}
+function StartHelper([string]$Arguments='--after-update'){if($Arguments -ceq '--after-update' -and $plan.launch_background -eq $true){$Arguments='--background --after-update'};$start=[Diagnostics.ProcessStartInfo]::new($exe);$start.Arguments=$Arguments;$start.UseShellExecute=$false;$start.CreateNoWindow=$true;$start.WindowStyle='Hidden';$start.WorkingDirectory=$target;if($originalModulesPresent){$start.EnvironmentVariables['PSModulePath']=$originalModulePath}else{$start.EnvironmentVariables.Remove('PSModulePath')};if($originalPolicyPresent){$start.EnvironmentVariables['PSExecutionPolicyPreference']=$originalPolicy}else{$start.EnvironmentVariables.Remove('PSExecutionPolicyPreference')};$start.EnvironmentVariables.Remove('CODEX_PROXY_UPDATER_POLICY');$start.EnvironmentVariables.Remove('CODEX_PROXY_UPDATER_POLICY_PRESENT');$start.EnvironmentVariables.Remove('CODEX_PROXY_UPDATER_MODULES');$start.EnvironmentVariables.Remove('CODEX_PROXY_UPDATER_MODULES_PRESENT');[Diagnostics.Process]::Start($start)}
 function Ready($Process){$end=[DateTime]::UtcNow.AddSeconds(40);do{if($Process.HasExited){return $false};$ok=$true;foreach($window in @('main','tray')){try{$ready=Json (Join-Path $data "ui-ready-$window.json");if($ready.helper_pid -ne $Process.Id -or $ready.rendered -ne $true -or $ready.at -lt ([DateTimeOffset]$Process.StartTime.ToUniversalTime()).ToUnixTimeMilliseconds()){$ok=$false}}catch{$ok=$false}};if($ok){$errorFile=Join-Path $data 'ui-error.json';if(Test-Path -LiteralPath $errorFile){$errorRecord=Json $errorFile;if($errorRecord.helper_pid -eq $Process.Id){return $false}};return $true};Start-Sleep -Milliseconds 250}while([DateTime]::UtcNow -lt $end);return $false}
+function ExpandPayload([string]$ZipPath,[string]$Destination,[string]$ExpectedVersion,[string]$ExpectedSource=''){
+    Plain $ZipPath;Plain $Destination;if(@(Get-ChildItem -LiteralPath $Destination -Force).Count){throw '安装暂存目录非空，原内容已保留。'}
+    $zip=[IO.Compression.ZipFile]::OpenRead($ZipPath)
+    try{if($zip.Entries.Count -ne $payload.Count){throw '安装包文件数量无效。'};$seen=@{};$expanded=0L;$writtenTotal=0L;foreach($entry in $zip.Entries){if($entry.FullName -cnotin $payload -or $seen.ContainsKey($entry.FullName) -or $entry.Length -gt 134217728 -or (($entry.ExternalAttributes -shr 16) -band 0xF000) -eq 0xA000){throw '安装包含未知路径、重复项或链接。'};$seen[$entry.FullName]=$true;$expanded+=$entry.Length;if($expanded -gt 134217728){throw '解包大小超过允许范围。'};$sourceStream=$entry.Open();$output=[IO.File]::Open((Join-Path $Destination $entry.FullName),'CreateNew','Write','None');try{$buffer=New-Object byte[] 65536;$written=0L;while(($count=$sourceStream.Read($buffer,0,$buffer.Length)) -gt 0){$written+=$count;$writtenTotal+=$count;if($writtenTotal -gt 134217728 -or $written -gt $entry.Length){throw '解包内容超过声明大小。'};$output.Write($buffer,0,$count)};if($written -ne $entry.Length){throw '安装包条目不完整。'};$output.Flush($true)}finally{$output.Dispose();$sourceStream.Dispose()}}}finally{$zip.Dispose()}
+    $sums=@();foreach($line in Get-Content -LiteralPath (Join-Path $Destination 'SHA256SUMS.txt')){if($line -cnotmatch '^([a-f0-9]{64})  ([A-Za-z0-9_.-]+)$' -or $Matches[2] -cnotin $payload -or $Matches[2] -ceq 'SHA256SUMS.txt'){throw '包内校验清单无效。'};$sums+=@{name=$Matches[2];sha256=$Matches[1]}}
+    $sums+=@{name='SHA256SUMS.txt';sha256=Hash (Join-Path $Destination 'SHA256SUMS.txt')};Verify $Destination $sums
+    $receipt=Json (Join-Path $Destination 'package-receipt.json');if($receipt.schema -ne 1 -or $receipt.product -cne 'CodexProxyTray' -or $receipt.version -cne $ExpectedVersion -or $receipt.source_commit -cnotmatch '^[a-f0-9]{40}$' -or $receipt.files.Count -ne 6){throw '程序来源记录无效。'}
+    foreach($file in $receipt.files){if($file.name -cnotin $payload -or (Hash (Join-Path $Destination $file.name)) -cne $file.sha256){throw '核心程序校验失败。'}}
+    if((Get-Item -LiteralPath (Join-Path $Destination 'CodexProxyTray.exe')).VersionInfo.ProductVersion -cne $ExpectedVersion){throw '程序版本与发布版本不一致。'}
+    if($ExpectedSource -and $receipt.source_commit -cne $ExpectedSource){throw '程序来源与安装器编译来源不一致。'}
+    $coreNames=@('CodexProxyTray.exe','codex-proxy-cli.exe','WebView2Loader.dll','LICENSE','THIRD_PARTY_NOTICES.md','flag-icons-license.txt');if(@(Compare-Object ($coreNames|Sort-Object) (@($receipt.files.name)|Sort-Object)).Count -ne 0){throw '核心程序清单不完整或含未知文件。'}
+    [pscustomobject]@{files=@($sums);receipt=$receipt;source_commit=$receipt.source_commit}
+}
 $payload=@('CodexProxyTray.exe','codex-proxy-cli.exe','WebView2Loader.dll','LICENSE','THIRD_PARTY_NOTICES.md','flag-icons-license.txt','package-receipt.json','QUICKSTART.txt','fluent-icons-license.txt','SHA256SUMS.txt')
+if($Phase -eq 'Library'){return}
+if($Phase -notin @('Prepare','Apply') -or -not $Job){throw '更新阶段或任务目录缺失。'}
 $Job=[IO.Path]::GetFullPath($Job);Plain $Job
 $plan=Json (Join-Path $Job 'plan.json');$data=[IO.Path]::GetFullPath($plan.data_root);$exe=[IO.Path]::GetFullPath($plan.executable);$target=[IO.Path]::GetDirectoryName($exe);$installRoot=[IO.Path]::GetDirectoryName($target)
 if($plan.schema -ne 1 -or $plan.product -cne 'CodexProxyTray' -or $plan.version -cnotmatch '^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$' -or [IO.Path]::GetFileName($exe) -cne 'CodexProxyTray.exe' -or [IO.Path]::GetDirectoryName($Job) -ine (Join-Path $data 'updates') -or $data -ine (Join-Path $env:LOCALAPPDATA 'CodexProxyTray') -or $target.StartsWith($data+'\',[StringComparison]::OrdinalIgnoreCase) -or $data.StartsWith($target+'\',[StringComparison]::OrdinalIgnoreCase)){throw '安装计划与本机助手不匹配。'}
@@ -54,13 +69,8 @@ try {
         if(@(Get-ChildItem -LiteralPath $installRoot -Directory -Force|Where-Object {$_.Name -like '.candidate-update-*' -or $_.Name -like '.obsolete-update-*'}).Count){throw '已有更新暂存恢复目录，请先核实上次结果。'}
         if((Test-Path -LiteralPath $candidate) -or (Test-Path -LiteralPath $obsolete)){throw '更新暂存目录已存在，未覆盖。'}
         [void](New-Item -ItemType Directory -Path $candidate)
-        $zip=[IO.Compression.ZipFile]::OpenRead((Join-Path $Job 'package.zip'))
-        try{if($zip.Entries.Count -ne $payload.Count){throw '安装包文件数量无效。'};$seen=@{};$expanded=0L;$writtenTotal=0L;foreach($entry in $zip.Entries){if($entry.FullName -cnotin $payload -or $seen.ContainsKey($entry.FullName) -or $entry.Length -gt 134217728 -or (($entry.ExternalAttributes -shr 16) -band 0xF000) -eq 0xA000){throw '安装包含未知路径、重复项或链接。'};$seen[$entry.FullName]=$true;$expanded+=$entry.Length;if($expanded -gt 134217728){throw '解包大小超过允许范围。'};$sourceStream=$entry.Open();$output=[IO.File]::Open((Join-Path $candidate $entry.FullName),'CreateNew','Write','None');try{$buffer=New-Object byte[] 65536;$written=0L;while(($count=$sourceStream.Read($buffer,0,$buffer.Length)) -gt 0){$written+=$count;$writtenTotal+=$count;if($writtenTotal -gt 134217728 -or $written -gt $entry.Length){throw '解包内容超过声明大小。'};$output.Write($buffer,0,$count)};if($written -ne $entry.Length){throw '安装包条目不完整。'};$output.Flush($true)}finally{$output.Dispose();$sourceStream.Dispose()}}}finally{$zip.Dispose()}
-        $sums=@();foreach($line in Get-Content -LiteralPath (Join-Path $candidate 'SHA256SUMS.txt')){if($line -cnotmatch '^([a-f0-9]{64})  ([A-Za-z0-9_.-]+)$' -or $Matches[2] -cnotin $payload -or $Matches[2] -ceq 'SHA256SUMS.txt'){throw '包内校验清单无效。'};$sums+=@{name=$Matches[2];sha256=$Matches[1]}}
-        $sums+=@{name='SHA256SUMS.txt';sha256=Hash (Join-Path $candidate 'SHA256SUMS.txt')};Verify $candidate $sums
-        $receipt=Json (Join-Path $candidate 'package-receipt.json');if($receipt.schema -ne 1 -or $receipt.product -cne 'CodexProxyTray' -or $receipt.version -cne $plan.version -or $receipt.source_commit -cnotmatch '^[a-f0-9]{40}$' -or $receipt.files.Count -ne 6){throw '程序来源记录无效。'}
-        foreach($file in $receipt.files){if($file.name -cnotin $payload -or (Hash (Join-Path $candidate $file.name)) -cne $file.sha256){throw '核心程序校验失败。'}}
-        if((Get-Item -LiteralPath (Join-Path $candidate 'CodexProxyTray.exe')).VersionInfo.ProductVersion -cne $plan.version){throw '程序版本与发布版本不一致。'}
+        $package=ExpandPayload (Join-Path $Job 'package.zip') $candidate $plan.version
+        $sums=@($package.files);$receipt=$package.receipt
         Durable (Join-Path $Job 'verified.json') @{schema=1;before=$before;after=$sums;old_previous=$oldPrevious;source_commit=$receipt.source_commit;old_active=$oldActive;target=$target;previous=$previous;candidate=$candidate;obsolete=$obsolete}
         exit 0
     }
@@ -84,6 +94,9 @@ try {
     $journal.state='installed';$journal.obsolete=$null;$journal.candidate=$null;Durable $journalPath $journal
     if($movedPrevious){RemoveCode $obsolete $verified.old_previous}
     foreach($name in @('package.zip','release-sums.txt','manifest.json')){$download=Join-Path $Job $name;if(Test-Path -LiteralPath $download){Plain $download;Remove-Item -LiteralPath $download}}
+    if(Test-Path -LiteralPath (Join-Path $installRoot 'installation.json')){
+        $registration=StartHelper '--register-installation';try{if(-not $registration.WaitForExit(20000) -or $registration.ExitCode -ne 0){throw '新版本已健康运行，但 Windows 安装登记同步未完成；请重新运行安装器补登记。'}}finally{$registration.Dispose()}
+    }
     Result 'installed' $null
 } catch {
     $failure=$_.Exception.Message

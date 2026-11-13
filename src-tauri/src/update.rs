@@ -6,6 +6,30 @@ pub const SOURCE:&str="https://github.com/OrangeZh1/CodexProxyTray";
 pub const RELEASES:&str="https://github.com/OrangeZh1/CodexProxyTray/releases";
 const MANIFEST:&str="https://github.com/OrangeZh1/CodexProxyTray/releases/latest/download/CodexProxyTray-update.json";
 const VERSION:&str=env!("CARGO_PKG_VERSION");
+const GET_ATTEMPTS:u8=3;
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]enum SendFailure{Connect,Timeout,Other}
+fn network_allowed()->Result<(),String>{
+    let config=settings::load(&settings::root()).map_err(|_|"更新配置无法读取，请检查设置。".to_owned())?;
+    if config.network_enabled{Ok(())}else{Err("联网检测已关闭，更新请求已停止。".into())}
+}
+fn retry_send<T>(mut allowed:impl FnMut()->Result<(),String>,mut send:impl FnMut()->Result<T,SendFailure>,mut wait:impl FnMut(Duration))->Result<T,String>{
+    for attempt in 1..=GET_ATTEMPTS{
+        allowed()?;
+        match send(){Ok(response)=>{allowed()?;return Ok(response)},Err(kind)=>{
+            allowed()?;
+            if kind==SendFailure::Other||attempt==GET_ATTEMPTS{return Err(match kind{SendFailure::Connect=>format!("未能建立 GitHub 更新连接（已尝试 {attempt} 次），请稍后重试。"),SendFailure::Timeout=>format!("GitHub 更新请求超时（已尝试 {attempt} 次），请稍后重试。"),SendFailure::Other=>"GitHub 更新请求未能完成，请重试。".into()})}
+            wait(Duration::from_millis(if attempt==1{200}else{500}));allowed()?;
+        }}
+    }unreachable!()
+}
+pub(crate)fn official_get(client:&reqwest::blocking::Client,url:&str)->Result<reqwest::blocking::Response,String>{
+    let parsed=reqwest::Url::parse(url).map_err(|_|"官方更新地址无效。")?;
+    if !official_url(&parsed){return Err("官方更新地址不受支持。".into())}
+    // Only GET send failures before a response are retried. Status, body, checksum and disk handling stay with the caller.
+    retry_send(network_allowed,||client.get(url).send().map_err(|error|if error.is_timeout(){SendFailure::Timeout}else if error.is_connect(){SendFailure::Connect}else{SendFailure::Other}),thread::sleep)
+}
+fn official_url(url:&reqwest::Url)->bool{url.scheme()=="https"&&url.host_str()==Some("github.com")&&url.username().is_empty()&&url.password().is_none()&&url.port_or_known_default()==Some(443)&&url.query().is_none()&&url.fragment().is_none()&&url.path().starts_with("/OrangeZh1/CodexProxyTray/releases/")}
+pub(crate)fn official_redirect()->reqwest::redirect::Policy{reqwest::redirect::Policy::custom(|attempt|{let url=attempt.url();if attempt.previous().len()<5&&url.scheme()=="https"&&url.username().is_empty()&&url.password().is_none()&&url.port_or_known_default()==Some(443)&&matches!(url.host_str(),Some("github.com"|"release-assets.githubusercontent.com")){attempt.follow()}else{attempt.error("Unexpected update redirect")}})}
 #[derive(Clone,Serialize)] pub struct Update {pub status:String,pub current:String,pub latest:Option<String>,pub url:String,pub notes:String,pub checked_at:u64}
 #[derive(Deserialize)] struct Manifest {schema:u32,product:String,version:String,notes:String}
 #[derive(Clone,Serialize,Deserialize)] #[serde(default)] pub struct UpdateState {pub checking:bool,pub checked_at:Option<u64>,pub last_success_at:Option<u64>,pub status:String,pub latest:Option<String>,pub notes:String,pub error:Option<String>}
@@ -58,8 +82,8 @@ pub fn maybe_automatic(config:&Config){
 }
 fn fetch(config:&Config)->Result<Update,String>{
     let client=reqwest::blocking::Client::builder().no_proxy().timeout(Duration::from_secs(12)).user_agent(format!("CodexProxyTray/{VERSION}"))
-        .proxy(reqwest::Proxy::all(&config.proxy_url).map_err(|_|"代理设置无效。")?).build().map_err(|_|"更新检查暂不可用。")?;
-    let response=client.get(MANIFEST).send().map_err(|error|if error.is_timeout(){"连接 GitHub 更新服务器超时，请重试。"}else if error.is_connect(){"未能建立 GitHub 更新连接，请重试或查看本机代理状态。"}else{"GitHub 更新请求未能完成，请重试。"})?;
+        .proxy(reqwest::Proxy::all(&config.proxy_url).map_err(|_|"代理设置无效。")?).redirect(official_redirect()).build().map_err(|_|"更新检查暂不可用。")?;
+    let response=official_get(&client,MANIFEST)?;
     if response.status()==reqwest::StatusCode::NOT_FOUND {return Ok(Update{status:"unpublished".into(),current:VERSION.into(),latest:None,url:RELEASES.into(),notes:"尚未发布 CodexProxyTray 正式安装包。".into(),checked_at:settings::now()})}
     if response.status()==reqwest::StatusCode::FORBIDDEN||response.status()==reqwest::StatusCode::TOO_MANY_REQUESTS{return Err("GitHub 暂时限制访问，请稍后重试。".into())}
     if !response.status().is_success(){return Err("GitHub 暂不可用，请稍后重试。".into())}
@@ -72,6 +96,18 @@ fn fetch(config:&Config)->Result<Update,String>{
 
 #[cfg(test)]mod tests{
     use super::*;
+    #[test]fn official_get_retries_only_transport_before_response_and_honors_network_disable(){
+        use std::cell::Cell;
+        let calls=Cell::new(0);let delays=std::cell::RefCell::new(Vec::new());let status=retry_send(||Ok(()),||{calls.set(calls.get()+1);if calls.get()<3{Err(SendFailure::Connect)}else{Ok(403)}},|delay|delays.borrow_mut().push(delay)).unwrap();
+        assert_eq!(status,403);assert_eq!(calls.get(),3);assert_eq!(*delays.borrow(),vec![Duration::from_millis(200),Duration::from_millis(500)]);
+        for(kind,expected)in[(SendFailure::Other,1),(SendFailure::Timeout,3)]{let calls=Cell::new(0);assert!(retry_send::<()>(||Ok(()),||{calls.set(calls.get()+1);Err(kind)},|_|{}).is_err());assert_eq!(calls.get(),expected);}
+        let calls=Cell::new(0);let waits=Cell::new(0);let stopped=retry_send::<()>(||if calls.get()==0{Ok(())}else{Err("network disabled".into())},||{calls.set(calls.get()+1);Err(SendFailure::Connect)},|_|waits.set(waits.get()+1));assert_eq!(stopped.unwrap_err(),"network disabled");assert_eq!(calls.get(),1);assert_eq!(waits.get(),0);
+        let enabled=Cell::new(true);let calls=Cell::new(0);assert!(retry_send::<()>(||if enabled.get(){Ok(())}else{Err("network disabled".into())},||{calls.set(calls.get()+1);Err(SendFailure::Connect)},|_|enabled.set(false)).is_err());assert_eq!(calls.get(),1);
+        // Once a response exists, even a failing HTTP status/body is returned once, never replayed.
+        let calls=Cell::new(0);let response=retry_send(||Ok(()),||{calls.set(calls.get()+1);Ok((503,Err::<(),_>("partial body")))},|_|panic!("response must not retry")).unwrap();assert_eq!(response.0,503);assert!(response.1.is_err());assert_eq!(calls.get(),1);
+        assert!(official_url(&reqwest::Url::parse(MANIFEST).unwrap()));
+        for url in ["http://github.com/OrangeZh1/CodexProxyTray/releases/latest/download/x","https://github.com.evil.test/OrangeZh1/CodexProxyTray/releases/x","https://name@github.com/OrangeZh1/CodexProxyTray/releases/x","https://github.com/other/repo/releases/x","https://github.com:444/OrangeZh1/CodexProxyTray/releases/x"]{assert!(!official_url(&reqwest::Url::parse(url).unwrap()));}
+    }
     #[test]fn failed_check_keeps_last_verified_release_and_manual_retry_bypasses_cache(){
         let mut view=UpdateState::default();
         let success=Update{status:"available".into(),current:VERSION.into(),latest:Some("9.0.0".into()),url:RELEASES.into(),notes:"release notes".into(),checked_at:10};

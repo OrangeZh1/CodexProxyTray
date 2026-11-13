@@ -6,6 +6,7 @@ mod core;
 #[cfg(windows)] mod cli_manager;
 #[cfg(windows)] mod runtime_details;
 #[cfg(windows)] mod update_notice;
+#[cfg(windows)] mod installation;
 #[cfg(windows)] mod usage;
 #[cfg(windows)] mod pricing;
 #[cfg(windows)] mod exchange_rate;
@@ -134,6 +135,7 @@ mod core;
     #[tauri::command]fn open_source()->Result<(),String>{crate::native::open(crate::update::SOURCE)}
     #[tauri::command]fn open_logs()->Result<(),String>{let path=crate::settings::root().join("logs");std::fs::create_dir_all(&path).map_err(|e|e.to_string())?;crate::native::open(&path.to_string_lossy())}
     pub fn run(){
+        if let Err(error)=crate::installation::set_process_identity(){eprintln!("{error}");std::process::exit(2)}
         let previous_hook=std::panic::take_hook();std::panic::set_hook(Box::new(move|info|{let root=crate::settings::root();let _=std::fs::create_dir_all(&root);let _=std::fs::write(root.join("startup-error.txt"),info.to_string());previous_hook(info);}));
         let quitting=std::env::args().any(|s|s=="--quit");
         let refreshing=std::env::args().any(|s|s=="--refresh");
@@ -161,5 +163,5 @@ mod core;
         app.run(|handle,event|{match event{tauri::RunEvent::ExitRequested{api,..}if crate::cli_manager::is_mutating()||crate::desktop_lifecycle::in_progress()=>api.prevent_exit(),tauri::RunEvent::Exit=>{if let Some(state)=handle.try_state::<Controller>(){state.stop();}},_=>{}}});
     }
 }
-#[cfg(windows)]fn main(){let raw=std::env::args_os().skip(1).collect::<Vec<_>>();if let Some(code)=traffic_service::service_entry(&raw){std::process::exit(code)}if let Some(code)=traffic::collector_entry(&raw){std::process::exit(code)}let args=raw.iter().map(|s|s.to_string_lossy().into_owned()).collect::<Vec<_>>();match core::resume_args(&args){Ok(Some(request))=>{if let Err(error)=native::resume(request){let root=settings::root();let _=std::fs::create_dir_all(&root);let _=std::fs::write(root.join("activation-error.txt"),error);std::process::exit(1)}},Err(_)=>std::process::exit(2),Ok(None)=>desktop::run()}}
+#[cfg(windows)]fn main(){let raw=std::env::args_os().skip(1).collect::<Vec<_>>();if let Some(code)=traffic_service::service_entry(&raw){std::process::exit(code)}if let Some(code)=traffic::collector_entry(&raw){std::process::exit(code)}if let Some(code)=installation::entry(&raw){std::process::exit(code)}let args=raw.iter().map(|s|s.to_string_lossy().into_owned()).collect::<Vec<_>>();match core::resume_args(&args){Ok(Some(request))=>{if let Err(error)=native::resume(request){let root=settings::root();let _=std::fs::create_dir_all(&root);let _=std::fs::write(root.join("activation-error.txt"),error);std::process::exit(1)}},Err(_)=>std::process::exit(2),Ok(None)=>desktop::run()}}
 #[cfg(not(windows))]fn main(){eprintln!("CodexProxyTray desktop targets Windows. Core checks can run on Linux.");}

@@ -23,6 +23,15 @@ fn reg_write(key:&str,name:&str,value:Option<&str>,kind:u32)->Result<(),String>{
 fn autostart_command(exe:&Path)->String{format!("\"{}\" --background",exe.display())}
 pub fn autostart()->bool{std::env::current_exe().ok().and_then(|exe|reg_read(RUN,"CodexProxyTray").ok().flatten().map(|(value,_)|value.eq_ignore_ascii_case(&autostart_command(&exe)))).unwrap_or(false)}
 pub fn set_autostart(enabled:bool,exe:&Path)->Result<(),String>{let command=enabled.then(||autostart_command(exe));reg_write(RUN,"CodexProxyTray",command.as_deref(),1)}
+fn owns_autostart(value:&str,image:&Path)->bool{value==autostart_command(image)}
+fn migrated_autostart(value:&str,previous:&Path,current:&Path)->Option<String>{let old=autostart_command(previous);let new=autostart_command(current);(owns_autostart(value,previous)&&old!=new).then_some(new)}
+/// Preserve an existing exact owned command; absence and unknown values never enable autostart.
+pub fn migrate_autostart(previous:&Path,current:&Path)->Result<bool,String>{
+    let Some((value,kind))=reg_read(RUN,"CodexProxyTray")?else{return Ok(false)};let Some(next)=migrated_autostart(&value,previous,current)else{return Ok(false)};reg_write(RUN,"CodexProxyTray",Some(&next),kind)?;Ok(true)
+}
+pub fn remove_autostart_for(image:&Path)->Result<bool,String>{
+    let Some((value,kind))=reg_read(RUN,"CodexProxyTray")?else{return Ok(false)};if !owns_autostart(&value,image){return Ok(false)}reg_write(RUN,"CodexProxyTray",None,kind)?;Ok(true)
+}
 pub fn ensure_user_cli_path(dir:&Path)->Result<(),String>{
     let(original,kind)=reg_read("Environment","Path")?.unwrap_or((String::new(),2));let directory=dir.to_string_lossy();
     if original.split(';').any(|entry|entry.trim().trim_matches('"').trim_end_matches('\\').eq_ignore_ascii_case(directory.trim_end_matches('\\'))||entry.trim().eq_ignore_ascii_case("%APPDATA%\\npm")){return Ok(())}
@@ -45,3 +54,4 @@ pub struct GuardEvent(Handle);
 impl GuardEvent{pub fn new(name:&str)->Result<Self,String>{unsafe{let n=wide(name);let h=CreateEventW(ptr::null_mut(),1,0,n.as_ptr());if h.is_null(){Err(std::io::Error::last_os_error().to_string())}else{Ok(Self(h))}}}pub fn set(&self,enabled:bool){unsafe{if enabled{SetEvent(self.0);}else{ResetEvent(self.0);}}}}
 impl Drop for GuardEvent{fn drop(&mut self){unsafe{ResetEvent(self.0);CloseHandle(self.0);}}}
 pub fn guard_active(name:&str)->bool{unsafe{let n=wide(name);let h=OpenEventW(0x00100000,0,n.as_ptr());if h.is_null(){return false}let active=WaitForSingleObject(h,0)==0;CloseHandle(h);active}}
+#[cfg(test)]mod tests{use super::*;#[test]fn autostart_migration_requires_the_exact_old_command(){let old=Path::new(r"C:\Old\CodexProxyTray.exe");let new=Path::new(r"C:\New\current\CodexProxyTray.exe");assert!(owns_autostart(&autostart_command(old),old));assert_eq!(migrated_autostart(&autostart_command(old),old,new),Some(autostart_command(new)));for value in ["",r"C:\Old\CodexProxyTray.exe --background",r#""C:\Old\CodexProxyTray.exe" --BACKGROUND"#,r#""C:\Other\CodexProxyTray.exe" --background"#]{assert!(!owns_autostart(value,old));assert!(migrated_autostart(value,old,new).is_none());}assert!(migrated_autostart(&autostart_command(old),old,old).is_none());}}

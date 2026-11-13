@@ -8,12 +8,74 @@ $root=Join-Path $env:RUNNER_TEMP ('CodexProxyTray-updater-'+[Guid]::NewGuid().To
 [void](New-Item -ItemType Directory -Path $root)
 $manifest=Get-Content -LiteralPath (Join-Path $release 'CodexProxyTray-update.json') -Raw|ConvertFrom-Json
 $zip=Join-Path $release ("CodexProxyTray-v$($manifest.version)-windows-x64.zip")
-$report=[ordered]@{schema=1;status='running';checks=@();scope='Isolated real helper restart, hash/path rejection, rollback and config/log preservation; no real user profiles, network or service changes';cleanup='pending'}
+$report=[ordered]@{schema=1;status='running';checks=@();scope='Isolated real helper restart and read-only verification of its committed new main window being visible and non-minimized, hash/path rejection, rollback and config/log preservation; no foreground requirement, real user profiles, network or service changes';cleanup='pending'}
 function Hash([string]$Path){(Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()}
 function WriteJson([string]$Path,$Value){[IO.File]::WriteAllText($Path,($Value|ConvertTo-Json -Depth 20),[Text.UTF8Encoding]::new($false))}
 function Require([bool]$Condition,[string]$Name){if(-not $Condition){foreach($case in $script:cases){if($case.job -and (Test-Path -LiteralPath (Join-Path $case.job 'result.json'))){Write-Output ('Installer outcome: '+(Get-Content -LiteralPath (Join-Path $case.job 'result.json') -Raw))}};throw $Name};$script:report.checks+=@{name=$Name;status='passed'}}
 function StartOwned($Case,[string]$File,[string[]]$Arguments){$info=[Diagnostics.ProcessStartInfo]::new($File);$info.UseShellExecute=$false;$info.CreateNoWindow=$true;$info.WindowStyle='Hidden';$info.WorkingDirectory=[IO.Path]::GetDirectoryName($File);$info.Environment['CODEX_PROXY_UPDATER_POLICY_PRESENT']=if($Case.policy_present){'1'}else{'0'};$info.Environment['CODEX_PROXY_UPDATER_POLICY']=$Case.policy_value;if($Case.policy_present){$info.Environment['PSExecutionPolicyPreference']=$Case.policy_value}else{[void]$info.Environment.Remove('PSExecutionPolicyPreference')};$info.Environment['CODEX_PROXY_UPDATER_MODULES_PRESENT']='1';$info.Environment['CODEX_PROXY_UPDATER_MODULES']=$env:PSModulePath;$info.Environment['LOCALAPPDATA']=$Case.profile;$info.Environment['APPDATA']=Join-Path $Case.profile 'Roaming';$info.Environment['WEBVIEW2_USER_DATA_FOLDER']=Join-Path $Case.profile 'webview';foreach($argument in $Arguments){$info.ArgumentList.Add($argument)};[Diagnostics.Process]::Start($info)}
 function WaitFor([scriptblock]$Check,[int]$Seconds,[string]$Name){$end=[DateTime]::UtcNow.AddSeconds($Seconds);do{if(& $Check){return};Start-Sleep -Milliseconds 200}while([DateTime]::UtcNow -lt $end);throw $Name}
+# Read-only native window inspection is restricted to the PID committed by this update.
+if(-not ('CodexProxyTray.UpdaterWindowQa' -as [type])){Add-Type -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using System.Text;
+namespace CodexProxyTray {
+ public sealed class UpdatedMainWindow {
+  public long Handle;
+  public uint ProcessId;
+  public string Title;
+  public bool Visible,Minimized;
+  public int Width,Height;
+ }
+ public static class UpdaterWindowQa {
+  delegate bool EnumWindowProc(IntPtr window,IntPtr parameter);
+  [StructLayout(LayoutKind.Sequential)] struct Rect {public int left,top,right,bottom;}
+  [DllImport("user32.dll",SetLastError=true)] static extern bool EnumWindows(EnumWindowProc callback,IntPtr parameter);
+  [DllImport("user32.dll",SetLastError=true)] static extern uint GetWindowThreadProcessId(IntPtr window,out uint processId);
+  [DllImport("user32.dll",CharSet=CharSet.Unicode,SetLastError=true)] static extern int GetWindowTextW(IntPtr window,StringBuilder title,int maximum);
+  [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr window);
+  [DllImport("user32.dll")] static extern bool IsIconic(IntPtr window);
+  [DllImport("user32.dll",SetLastError=true)] static extern bool GetWindowRect(IntPtr window,out Rect rectangle);
+  public static UpdatedMainWindow[] MainWindows(uint expectedPid){
+   var matches=new List<UpdatedMainWindow>();
+   if(!EnumWindows((window,parameter)=>{
+    uint pid;if(GetWindowThreadProcessId(window,out pid)==0||pid!=expectedPid)return true;
+    var title=new StringBuilder(256);if(GetWindowTextW(window,title,title.Capacity)==0||!String.Equals(title.ToString(),"CodexProxyTray",StringComparison.Ordinal))return true;
+    Rect rectangle;if(!GetWindowRect(window,out rectangle))return true;
+    matches.Add(new UpdatedMainWindow {Handle=window.ToInt64(),ProcessId=pid,Title=title.ToString(),Visible=IsWindowVisible(window),Minimized=IsIconic(window),Width=rectangle.right-rectangle.left,Height=rectangle.bottom-rectangle.top});return true;
+   },IntPtr.Zero))throw new Win32Exception();
+   return matches.ToArray();
+  }
+ }
+}
+'@}
+function RequireUpdatedMainVisible($Case){
+    $activePath=Join-Path $Case.directory 'app\active-version.json';$active=Get-Content -LiteralPath $activePath -Raw|ConvertFrom-Json
+    Require ($active.schema -eq 1 -and $active.state -ceq 'active' -and [IO.Path]::GetFullPath($active.current.path) -ieq $Case.target -and $active.current.version -ceq $manifest.version -and $active.readiness.native -ceq 'passed' -and $active.readiness.main_rendered -eq $true -and $active.readiness.tray_rendered -eq $true -and $active.readiness.helper_pid -gt 0 -and $active.readiness.helper_pid -ne $Case.parent.Id) 'visible_main_uses_committed_new_helper_receipt'
+    $newHelper=Get-Process -Id ([int]$active.readiness.helper_pid) -ErrorAction Stop
+    try {
+        $newCreated=$newHelper.StartTime.ToUniversalTime().ToFileTimeUtc();$newStartMs=([DateTimeOffset]$newHelper.StartTime.ToUniversalTime()).ToUnixTimeMilliseconds()
+        $committed=[DateTimeOffset]::Parse($active.committed_at).UtcDateTime.ToFileTimeUtc()
+        Require ($Case.parent.HasExited -and $newCreated -ge $Case.parent.ExitTime.ToUniversalTime().ToFileTimeUtc() -and $newCreated -le $committed -and [IO.Path]::GetFullPath($newHelper.Path) -ieq $Case.exe) 'visible_main_process_identity_matches_new_active_image'
+        $activeExe=@($active.current.files|Where-Object name -CEQ 'CodexProxyTray.exe')
+        Require ($activeExe.Count -eq 1 -and (Hash $Case.exe) -ceq $activeExe[0].sha256) 'visible_main_image_matches_committed_hash'
+        foreach($view in @('main','tray')){
+            $ready=Get-Content -LiteralPath (Join-Path $Case.data ('ui-ready-'+$view+'.json')) -Raw|ConvertFrom-Json
+            Require ($ready.window -ceq $view -and $ready.helper_pid -eq $newHelper.Id -and $ready.rendered -eq $true -and $ready.at -ge $newStartMs) ('visible_main_fresh_'+$view+'_readiness_matches_new_process')
+        }
+        $observed=[pscustomobject]@{window=$null}
+        WaitFor {
+            $newHelper.Refresh();if($newHelper.HasExited -or $newHelper.StartTime.ToUniversalTime().ToFileTimeUtc() -ne $newCreated -or [IO.Path]::GetFullPath($newHelper.Path) -ine $Case.exe){throw 'Updated helper identity changed before its main window became visible'}
+            $windows=@([CodexProxyTray.UpdaterWindowQa]::MainWindows([uint32]$newHelper.Id)|Where-Object {$_.Visible -and -not $_.Minimized -and $_.Width -gt 0 -and $_.Height -gt 0})
+            if($windows.Count -ne 1){return $false};$observed.window=$windows[0];return $true
+        } 15 'Updated helper did not automatically show a visible, non-minimized main window'
+        $newHelper.Refresh();$window=$observed.window
+        Require (-not $newHelper.HasExited -and $newHelper.StartTime.ToUniversalTime().ToFileTimeUtc() -eq $newCreated -and [IO.Path]::GetFullPath($newHelper.Path) -ieq $Case.exe -and $window.ProcessId -eq $newHelper.Id -and $window.Title -ceq 'CodexProxyTray' -and $window.Visible -and -not $window.Minimized) 'update_success_automatically_opens_new_main_window'
+        $script:report['updated_main_window']=[ordered]@{helper_pid=$newHelper.Id;created_filetime=$newCreated.ToString();image_sha256=$activeExe[0].sha256;main_title=$window.Title;visible=$window.Visible;minimized=$window.Minimized;width=$window.Width;height=$window.Height;identity_source='committed active-version receipt and fresh main/tray readiness';foreground_not_required=$true}
+    } finally {$newHelper.Dispose()}
+}
 function Case([string]$Name){
     $directory=Join-Path $root $Name;$profilePath=Join-Path $directory 'profile';$data=Join-Path $profilePath 'CodexProxyTray';$target=Join-Path $directory 'app\current'
     foreach($path in @($data,(Join-Path $data 'logs'),(Join-Path $data 'updates'),$target)){[void](New-Item -ItemType Directory -Path $path -Force)}
@@ -47,6 +109,7 @@ try {
     $configHash=Hash (Join-Path $good.data 'config.json');Quit $good
     Require ($installer.WaitForExit(60000) -and $installer.ExitCode -eq 0) 'real_update_restarted_and_passed_both_views'
     $result=Get-Content -LiteralPath (Join-Path $job 'result.json') -Raw|ConvertFrom-Json;Require ($result.phase -eq 'installed') 'success_receipt_committed'
+    RequireUpdatedMainVisible $good
     Require ((Hash (Join-Path $job 'config.json')) -eq $configHash) 'original_configuration_archived_exactly'
     $logs=Get-Content -LiteralPath (Join-Path $job 'events-v1.json') -Raw|ConvertFrom-Json;Require (@($logs.records|Where-Object message -eq 'preserve-this-record').Count -eq 1) 'all_pre_update_log_records_archived'
     Require ((Test-Path -LiteralPath (Join-Path $good.directory 'app\previous\CodexProxyTray.exe')) -and -not (Test-Path -LiteralPath (Join-Path $job 'package.zip'))) 'one_previous_version_and_download_cleanup'

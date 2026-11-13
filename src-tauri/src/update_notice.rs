@@ -5,16 +5,12 @@
 //! or custom URI handler is registered. A click opens only the fixed public release page.
 use std::{fs,io::Write,path::{Path,PathBuf},sync::{Mutex,OnceLock,atomic::{AtomicU64,Ordering}}};
 use serde::{Deserialize,Serialize};
-use windows::{core::{GUID,HSTRING,Interface,PCWSTR,PWSTR},Data::Xml::Dom::XmlDocument,Foundation::TypedEventHandler,UI::Notifications::{NotificationSetting,ToastFailedEventArgs,ToastNotification,ToastNotificationManager},Win32::{Foundation::PROPERTYKEY,System::{Com::{CoCreateInstance,CoTaskMemFree,IPersistFile,CLSCTX_INPROC_SERVER,STGM_READ,StructuredStorage::{PROPVARIANT,PropVariantClear,InitPropVariantFromCLSID}},Variant::{VT_LPWSTR,VT_CLSID},WinRT::{RoInitialize,RoUninitialize,RO_INIT_MULTITHREADED}},UI::Shell::{IShellLinkW,ShellLink,SHGetKnownFolderPath,FOLDERID_Programs,KF_FLAG_DEFAULT,SHChangeNotify,SHCNE_CREATE,SHCNE_UPDATEITEM,SHCNF_PATHW,PropertiesSystem::IPropertyStore}}};
-use crate::{core,settings,update::UpdateState};
+use windows::{core::HSTRING,Data::Xml::Dom::XmlDocument,Foundation::TypedEventHandler,UI::Notifications::{NotificationSetting,ToastFailedEventArgs,ToastNotification,ToastNotificationManager},Win32::System::WinRT::{RoInitialize,RoUninitialize,RO_INIT_MULTITHREADED}};
+use crate::{core,settings,update::UpdateState,installation::APP_ID};
 
-const APP_ID:&str="OrangeZh1.CodexProxyTray";
 const RELEASES:&str="https://github.com/OrangeZh1/CodexProxyTray/releases";
 const RECEIPT:&str="update-notice-v1.json";
-const STUB_ACTIVATOR:GUID=GUID::from_u128(0x22b3d738_35ef_4949_9b82_bc4c49fd96f8);
-const APP_MODEL:GUID=GUID::from_u128(0x9f4c2855_9f79_4b39_a8d0_e1d42de1d5f3);
-const APP_ID_KEY:PROPERTYKEY=PROPERTYKEY{fmtid:APP_MODEL,pid:5};
-const ACTIVATOR_KEY:PROPERTYKEY=PROPERTYKEY{fmtid:APP_MODEL,pid:26};
+
 
 #[derive(Clone,Default,Serialize)]
 pub struct NoticeSnapshot{pub submitted_version:Option<String>,pub submitted_at:Option<u64>,pub error:Option<String>}
@@ -81,7 +77,7 @@ struct Apartment;
 impl Drop for Apartment{fn drop(&mut self){unsafe{RoUninitialize();}}}
 fn send_to_windows(version:&str,generation:u64)->Result<(),String>{
     unsafe{RoInitialize(RO_INIT_MULTITHREADED).map_err(|error|windows_error("无法初始化 Windows 通知",error))?;}let _apartment=Apartment;
-    ensure_shortcut()?;
+    crate::installation::ensure_notification_shortcut()?;
     let notifier=ToastNotificationManager::CreateToastNotifierWithId(&HSTRING::from(APP_ID)).map_err(|error|windows_error("无法连接 Windows 通知服务",error))?;
     let setting=notifier.Setting().map_err(|error|windows_error("无法读取 Windows 通知状态",error))?;
     if setting!=NotificationSetting::Enabled{return Err(match setting{NotificationSetting::DisabledForApplication=>"Windows 已关闭本应用的通知。",NotificationSetting::DisabledForUser=>"Windows 已关闭当前用户的通知。",NotificationSetting::DisabledByGroupPolicy=>"Windows 策略禁用了通知。",_=>"Windows 当前不允许显示本应用通知。"}.into())}
@@ -97,31 +93,6 @@ fn send_to_windows(version:&str,generation:u64)->Result<(),String>{
     notifier.Show(&toast).map_err(|error|windows_error("Windows 未接受更新通知",error))?;
     if let Some(error)=LAST_FAILURE.lock().ok().and_then(|value|value.clone()){return Err(error)}Ok(())
 }
-fn ensure_shortcut()->Result<(),String>{unsafe{
-    let raw=SHGetKnownFolderPath(&FOLDERID_Programs,KF_FLAG_DEFAULT,None).map_err(|error|windows_error("无法确定本用户的开始菜单目录",error))?;
-    let folder=raw.to_string();CoTaskMemFree(Some(raw.0.cast()));let folder=PathBuf::from(folder.map_err(|error|windows_error("开始菜单目录无效",error.into()))?);
-    let path=folder.join("CodexProxyTray 更新通知.lnk");let wide=crate::native::wide(&path.to_string_lossy());
-    let link:IShellLinkW=CoCreateInstance(&ShellLink,None,CLSCTX_INPROC_SERVER).map_err(|error|windows_error("无法准备更新通知入口",error))?;
-    let persist:IPersistFile=link.cast().map_err(|error|windows_error("无法保存更新通知入口",error))?;
-    let exists=path.exists();if exists{persist.Load(PCWSTR(wide.as_ptr()),STGM_READ).map_err(|_|"通知快捷方式已存在但无法验证，未覆盖它。".to_owned())?;
-        let store:IPropertyStore=link.cast().map_err(|_|"无法验证通知快捷方式，未覆盖它。".to_owned())?;
-        let mut value=store.GetValue(&APP_ID_KEY).map_err(|_|"通知快捷方式归属不明，未覆盖它。".to_owned())?;
-        let owned=value.Anonymous.Anonymous.vt==VT_LPWSTR&&value.Anonymous.Anonymous.Anonymous.pwszVal.to_string().ok().as_deref()==Some(APP_ID);let _=PropVariantClear(&mut value);
-        if !owned{return Err("通知快捷方式归属不明，未覆盖它。".into())}
-        let mut activator=store.GetValue(&ACTIVATOR_KEY).map_err(|_|"通知快捷方式激活标识不明，未覆盖它。".to_owned())?;
-        let owned=activator.Anonymous.Anonymous.vt==VT_CLSID&&!activator.Anonymous.Anonymous.Anonymous.puuid.is_null()&&*activator.Anonymous.Anonymous.Anonymous.puuid==STUB_ACTIVATOR;let _=PropVariantClear(&mut activator);
-        if !owned{return Err("通知快捷方式激活标识不明，未覆盖它。".into())}
-    }
-    let executable=std::env::current_exe().map_err(|_|"无法确定更新通知所属程序。".to_owned())?;let executable=crate::native::wide(&executable.to_string_lossy());
-    link.SetPath(PCWSTR(executable.as_ptr())).map_err(|error|windows_error("无法设置通知所属程序",error))?;let arguments=crate::native::wide("--background");link.SetArguments(PCWSTR(arguments.as_ptr())).map_err(|error|windows_error("无法设置通知入口",error))?;link.SetIconLocation(PCWSTR(executable.as_ptr()),0).map_err(|error|windows_error("无法设置通知图标",error))?;
-    let store:IPropertyStore=link.cast().map_err(|error|windows_error("无法设置通知身份",error))?;
-    // SetValue copies this borrowed string synchronously; do not PropVariantClear it.
-    let mut id=crate::native::wide(APP_ID);let mut value=PROPVARIANT::default();(*value.Anonymous.Anonymous).vt=VT_LPWSTR;(*value.Anonymous.Anonymous).Anonymous.pwszVal=PWSTR(id.as_mut_ptr());store.SetValue(&APP_ID_KEY,&value).map_err(|error|windows_error("无法注册通知身份",error))?;
-    let mut activator=InitPropVariantFromCLSID(&STUB_ACTIVATOR).map_err(|error|windows_error("无法准备通知激活标识",error))?;let result=store.SetValue(&ACTIVATOR_KEY,&activator);let _=PropVariantClear(&mut activator);result.map_err(|error|windows_error("无法设置通知激活方式",error))?;store.Commit().map_err(|error|windows_error("无法保存通知身份",error))?;
-    let temporary=folder.join(format!(".CodexProxyTray-notice-{}-{}.tmp",std::process::id(),settings::now()));if temporary.exists(){return Err("通知入口临时路径已存在，未覆盖它。".into())}let temp_wide=crate::native::wide(&temporary.to_string_lossy());
-    let saved=persist.Save(PCWSTR(temp_wide.as_ptr()),false).map_err(|error|windows_error("无法保存本用户的通知快捷方式",error)).and_then(|_|fs::rename(&temporary,&path).map_err(|_|"无法更新本用户的通知快捷方式，原入口已保留。".to_owned()));if saved.is_err(){let _=fs::remove_file(&temporary);}saved?;
-    SHChangeNotify(if exists{SHCNE_UPDATEITEM}else{SHCNE_CREATE},SHCNF_PATHW,Some(wide.as_ptr().cast()),None);Ok(())
-}}
 
 #[cfg(test)]mod tests{
     use super::*;

@@ -118,6 +118,22 @@ jobs:
           $testExecutable=@($testExecutables)[0]
           if(-not (Test-Path -LiteralPath $testExecutable -PathType Leaf) -or $testExecutable.Contains("`n") -or $testExecutable.Contains("`r")){throw 'The current test executable is missing or invalid.'}
           "service_probe_executable=$testExecutable" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+      - name: 真实公开更新附件下载检查
+        timeout-minutes: 4
+        shell: pwsh
+        env:
+          CODEX_PROXY_PUBLIC_DOWNLOAD_PROBE_RESULT: ${{ runner.temp }}/public-download-probe.json
+        run: |
+          & '${{ steps.native-tests.outputs.service_probe_executable }}' app_update::tests::published_update_download_probe --ignored --exact --test-threads=1
+          if($LASTEXITCODE -ne 0){exit $LASTEXITCODE}
+      - name: 保存公开下载检查证据
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: public-download-evidence
+          path: ${{ runner.temp }}/public-download-probe.json
+          if-no-files-found: ignore
+          retention-days: 7
       - name: 真实 ETW 回环流量与会话收尾检查
         timeout-minutes: 3
         shell: pwsh
@@ -152,9 +168,25 @@ jobs:
       - name: 整理并校验 GitHub 正式发行附件
         shell: pwsh
         run: ./scripts/package-release.ps1 -PackageDirectory "${{ github.workspace }}/package" -OutputDirectory "${{ github.workspace }}/release" -EvidenceDirectory "$env:RUNNER_TEMP/CodexProxyTray-release-evidence"
+      - name: 构建并校验每用户 Windows 安装器
+        shell: pwsh
+        run: ./scripts/package-installer.ps1 -ReleaseDirectory "${{ github.workspace }}/release" -EvidenceDirectory "$env:RUNNER_TEMP/CodexProxyTray-installer-package-evidence"
       - name: 隔离验证助手安装更新与失败回退
         shell: pwsh
         run: ./tests/Test-AppUpdate.ps1 -ReleaseDirectory "${{ github.workspace }}/release" -EvidenceDirectory "$env:RUNNER_TEMP/CodexProxyTray-updater-evidence"
+      - name: 隔离验证标准安装与卸载注册
+        shell: pwsh
+        run: ./tests/Test-Installer.ps1 -ReleaseDirectory "${{ github.workspace }}/release" -EvidenceDirectory "$env:RUNNER_TEMP/CodexProxyTray-installer-evidence"
+      - name: 保存 Windows 安装器验收证据
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: installer-evidence
+          path: |
+            ${{ runner.temp }}/CodexProxyTray-installer-evidence/
+            ${{ runner.temp }}/CodexProxyTray-installer-package-evidence/
+          if-no-files-found: ignore
+          retention-days: 7
       - name: 保存助手更新验收证据
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

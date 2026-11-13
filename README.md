@@ -48,7 +48,9 @@ CodexProxyTray 为 ChatGPT 桌面端和 Windows Codex CLI 提供带代理的启�
 
 ### 下载正式版本
 
-打开 [最新正式 Release](https://github.com/OrangeZh1/CodexProxyTray/releases/latest)，下载其中的 Windows x64 发行 ZIP，例如 `CodexProxyTray-v0.2.2-windows-x64.zip`。这是解压运行的便携发行包，完整解压到固定目录后，双击 `CodexProxyTray.exe`。
+当前正式版本以 [最新正式 Release](https://github.com/OrangeZh1/CodexProxyTray/releases/latest) 为准。v0.2.3 开发版本新增 Windows x64 安装包，正式发布后推荐选择 `CodexProxyTray-v0.2.3-windows-x64-setup.exe`，完成当前用户安装后从开始菜单打开。安装器会注册“已安装的应用”和正常启动入口；代码位于用户程序目录，配置与日志单独保存。
+
+也提供 `CodexProxyTray-v0.2.3-windows-x64.zip` 便携包。完整解压到固定目录后运行 `CodexProxyTray.exe`，便携运行不等于标准安装。
 
 GitHub 自动生成的 Source code 是源码归档；日常使用请下载上面的 Windows x64 发行包。Release 同时提供 `SHA256SUMS.txt`、版本说明和 `CodexProxyTray-update.json`。包内 [QUICKSTART.txt](QUICKSTART.txt) 提供离线中文说明。
 
@@ -73,7 +75,7 @@ GitHub 自动生成的 Source code 是源码归档；日常使用请下载上面
 
 ## 界面与功能
 
-以下功能说明对应 [v0.2.2](https://github.com/OrangeZh1/CodexProxyTray/releases/tag/v0.2.2)，发行包内容以对应 Release 说明为准；旧版便携包需要更新后才能使用新增功能。
+以下功能说明对应 v0.2.3 开发版本（正式发行以 GitHub Releases 为准），发行包内容以对应 Release 说明为准；旧版便携包需要更新后才能使用新增功能。
 
 | 页面 | 可以做什么 |
 | --- | --- |
