@@ -18,7 +18,7 @@ if(Test-Path -LiteralPath $EvidenceDirectory){throw 'Existing installer evidence
 $work=Join-Path $env:RUNNER_TEMP ('CodexProxyTray-install-qa-'+[Guid]::NewGuid().ToString('N'))
 [void][IO.Directory]::CreateDirectory($work)
 $checks=[Collections.Generic.List[object]]::new()
-$report=[ordered]@{schema=1;status='running';scope='Fresh GitHub-hosted runner only; per-user setup, registration and exact owned uninstall. No real profiles, services, UAC automation or global proxy changes.';checks=$checks;cleanup='pending';outcomes=[Collections.Generic.List[object]]::new()}
+$report=[ordered]@{schema=1;status='running';scope='Fresh GitHub-hosted runner only; per-user setup, registration and exact owned uninstall. No real profiles, services, UAC automation or global proxy changes.';checks=$checks;cleanup='pending';outcomes=[Collections.Generic.List[object]]::new();shortcuts=[Collections.Generic.List[object]]::new()}
 $ownedData=$false;$ownedRoot=$false;$successfulInstall=$false
 function Require([bool]$Condition,[string]$Name){if(-not $Condition){throw $Name};$checks.Add(@{name=$Name;status='passed'})}
 function Hash([string]$Path){(Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()}
@@ -122,12 +122,74 @@ function RegisteredUpgradeFixture([switch]$UnknownDesktopOff) {
 function RootSnapshot {
     $result=[ordered]@{};foreach($file in Get-ChildItem -LiteralPath (Join-Path $installRoot 'current') -File|Sort-Object Name){$result[$file.Name]=Hash $file.FullName};$result|ConvertTo-Json -Compress
 }
+function ShortcutText([string]$Value){foreach($pair in @(@($work,'<fixture>'),@($local,'<LocalAppData>'),@($env:RUNNER_TEMP,'<RunnerTemp>'),@($env:USERPROFILE,'<UserProfile>'))){if($pair[0]){$Value=$Value.Replace($pair[0],$pair[1])}};$Value}
+function ReadNativeShortcut([string]$Path){
+    if(-not ('CodexProxyTray.InstallerShortcutNative' -as [type])){Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using System.Runtime.InteropServices.ComTypes;
+using System.Text;
+namespace CodexProxyTray {
+ [ComImport,Guid("000214F9-0000-0000-C000-000000000046"),InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+ interface IShortcutReadW {
+  [PreserveSig] int GetPath([Out,MarshalAs(UnmanagedType.LPWStr)] StringBuilder path,int characters,IntPtr findData,uint flags);
+  [PreserveSig] int GetIDList(out IntPtr idList);
+  [PreserveSig] int SetIDList(IntPtr idList);
+  [PreserveSig] int GetDescription([Out,MarshalAs(UnmanagedType.LPWStr)] StringBuilder description,int characters);
+  [PreserveSig] int SetDescription([MarshalAs(UnmanagedType.LPWStr)] string description);
+  [PreserveSig] int GetWorkingDirectory([Out,MarshalAs(UnmanagedType.LPWStr)] StringBuilder directory,int characters);
+  [PreserveSig] int SetWorkingDirectory([MarshalAs(UnmanagedType.LPWStr)] string directory);
+  [PreserveSig] int GetArguments([Out,MarshalAs(UnmanagedType.LPWStr)] StringBuilder arguments,int characters);
+ }
+ public sealed class NativeShortcutValues {
+  public int PathHResult,RawPathHResult,ArgumentsHResult,WorkingDirectoryHResult;
+  public string Path,RawPath,Arguments,WorkingDirectory;
+ }
+ public static class InstallerShortcutNative {
+  public static NativeShortcutValues Read(string file){
+   object root=null;
+   try {
+    root=Activator.CreateInstance(Type.GetTypeFromCLSID(new Guid("00021401-0000-0000-C000-000000000046"),true));
+    // Only load the existing file read-only. Do not Resolve, Save or invoke it.
+    ((IPersistFile)root).Load(file,0);
+    var link=(IShortcutReadW)root;var path=new StringBuilder(32768);var raw=new StringBuilder(32768);var arguments=new StringBuilder(32768);var directory=new StringBuilder(32768);
+    var result=new NativeShortcutValues();result.PathHResult=link.GetPath(path,path.Capacity,IntPtr.Zero,0);result.RawPathHResult=link.GetPath(raw,raw.Capacity,IntPtr.Zero,4);result.ArgumentsHResult=link.GetArguments(arguments,arguments.Capacity);result.WorkingDirectoryHResult=link.GetWorkingDirectory(directory,directory.Capacity);
+    result.Path=path.ToString();result.RawPath=raw.ToString();result.Arguments=arguments.ToString();result.WorkingDirectory=directory.ToString();return result;
+   } finally {if(root!=null&&Marshal.IsComObject(root))Marshal.FinalReleaseComObject(root);}
+  }
+ }
+}
+'@}
+    [CodexProxyTray.InstallerShortcutNative]::Read($Path)
+}
+function RecordShortcut([string]$Kind,[string]$Path,$Link){
+    $expected=Join-Path $installRoot 'current\CodexProxyTray.exe';$actual=[string]$Link.TargetPath;$arguments=[string]$Link.Arguments
+    $exists=Test-Path -LiteralPath $Path -PathType Leaf;$targetExists=$actual -and (Test-Path -LiteralPath $actual -PathType Leaf)
+    $expectedHash=if(Test-Path -LiteralPath $expected -PathType Leaf){Hash $expected}else{$null};$targetHash=if($targetExists){Hash $actual}else{$null}
+    $value=[ordered]@{kind=$Kind;source_root=(ShortcutText $installRoot);link_exists=[bool]$exists;target_path=(ShortcutText $actual);arguments=(ShortcutText $arguments);expected_target=(ShortcutText $expected);target_exists=[bool]$targetExists;target_sha256=$targetHash;expected_sha256=$expectedHash;target_hash_matches=($null -ne $targetHash -and $targetHash -ceq $expectedHash)}
+    $report.shortcuts.Add($value);$value
+}
 function AssertRegistration {
     $entry=Get-ItemProperty -LiteralPath $reg
     Require ($entry.DisplayName -ceq 'CodexProxyTray' -and $entry.DisplayVersion -ceq $manifest.version -and [IO.Path]::GetFullPath($entry.InstallLocation) -ieq $installRoot) 'per_user_installed_apps_registration'
     Require ($entry.UninstallString.Contains((Join-Path $installRoot 'uninstall.exe')) -and (Test-Path -LiteralPath (Join-Path $installRoot 'uninstall.exe'))) 'stable_uninstaller_outside_current'
     Require (-not (Test-Path -LiteralPath $machineReg)) 'no_machine_wide_registration'
     $shell=New-Object -ComObject WScript.Shell;$link=$shell.CreateShortcut($shortcut)
+    $diagnostic=RecordShortcut 'start_menu' $shortcut $link
+    if($diagnostic.link_exists -and -not($link.TargetPath -ieq (Join-Path $installRoot 'current\CodexProxyTray.exe') -and [string]::IsNullOrEmpty($link.Arguments))){
+        try{
+            $native=ReadNativeShortcut $shortcut
+            $diagnostic.native_get_path_hresult=('0x{0:X8}' -f $native.PathHResult);$diagnostic.native_get_path=(ShortcutText $native.Path)
+            $diagnostic.native_get_raw_path_hresult=('0x{0:X8}' -f $native.RawPathHResult);$diagnostic.native_get_raw_path=(ShortcutText $native.RawPath)
+            $diagnostic.native_get_arguments_hresult=('0x{0:X8}' -f $native.ArgumentsHResult);$diagnostic.native_arguments=(ShortcutText $native.Arguments)
+            $diagnostic.native_get_working_directory_hresult=('0x{0:X8}' -f $native.WorkingDirectoryHResult);$diagnostic.native_working_directory=(ShortcutText $native.WorkingDirectory)
+        }catch{$diagnostic.native_read_error=(ShortcutText $_.Exception.Message)}
+        try{
+            $fixedSource=Join-Path ([Environment]::GetFolderPath('Programs')) 'CodexProxyTray.lnk';$destination=Join-Path ([IO.Path]::GetFullPath($EvidenceDirectory)) 'custom-start-menu-link.lnk';$item=Get-Item -LiteralPath $shortcut -Force
+            if([IO.Path]::GetFullPath($shortcut) -ine [IO.Path]::GetFullPath($fixedSource) -or $item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -or $item.Length -gt 65536 -or (Test-Path -LiteralPath $destination)){throw 'shortcut_evidence_boundary_refused'}
+            $sourceHash=Hash $shortcut;[IO.File]::Copy($shortcut,$destination,$false);if((Hash $destination) -cne $sourceHash){throw 'shortcut_evidence_copy_hash_mismatch'};$diagnostic.evidence_name='custom-start-menu-link.lnk';$diagnostic.evidence_sha256=$sourceHash
+        }catch{$diagnostic.capture_error=ShortcutText $_.Exception.Message}
+    }
     Require ($link.TargetPath -ieq (Join-Path $installRoot 'current\CodexProxyTray.exe') -and [string]::IsNullOrEmpty($link.Arguments)) 'single_normal_start_menu_entry'
     Require (-not (Test-Path -LiteralPath $legacyShortcut)) 'no_second_notification_start_menu_entry'
     Require (-not (Test-Path -LiteralPath (Join-Path $startMenu 'codex-proxy-cli.lnk'))) 'private_cli_has_no_start_menu_entry'
@@ -137,7 +199,8 @@ function AssertDesktop([bool]$Wanted){
     $preferencePath=Join-Path $data ('installation-preferences-v1\'+$marker.install_id+'.json')
     $preference=Get-Content -LiteralPath $preferencePath -Raw|ConvertFrom-Json
     Require (@($marker.PSObject.Properties.Name).Count -eq 6 -and @($preference.PSObject.Properties.Name).Count -eq 5 -and $preference.schema -eq 1 -and $preference.product -ceq 'CodexProxyTray.InstallationPreferences' -and $preference.install_id -ceq $marker.install_id -and $preference.root -ieq $installRoot -and $preference.desktop_shortcut -is [bool] -and $preference.desktop_shortcut -eq $Wanted) 'strict_data_sidecar_preserves_six_field_marker'
-    if($Wanted){$shell=New-Object -ComObject WScript.Shell;$link=$shell.CreateShortcut($desktopShortcut);Require ((Test-Path -LiteralPath $desktopShortcut) -and $link.TargetPath -ieq (Join-Path $installRoot 'current\CodexProxyTray.exe') -and [string]::IsNullOrEmpty($link.Arguments)) 'desktop_shortcut_is_normal_current_helper'}else{Require (-not(Test-Path -LiteralPath $desktopShortcut)) 'desktop_choice_off_removes_only_owned_entry'}
+    $shell=New-Object -ComObject WScript.Shell;$link=$shell.CreateShortcut($desktopShortcut);[void](RecordShortcut 'desktop' $desktopShortcut $link)
+    if($Wanted){Require ((Test-Path -LiteralPath $desktopShortcut) -and $link.TargetPath -ieq (Join-Path $installRoot 'current\CodexProxyTray.exe') -and [string]::IsNullOrEmpty($link.Arguments)) 'desktop_shortcut_is_normal_current_helper'}else{Require (-not(Test-Path -LiteralPath $desktopShortcut)) 'desktop_choice_off_removes_only_owned_entry'}
 }
 function DesktopChoices {
     AssertDesktop $true
