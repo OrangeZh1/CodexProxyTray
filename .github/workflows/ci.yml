@@ -64,6 +64,16 @@ jobs:
         run: npm run check:ui
       - name: 生产界面客户端启动检查
         run: npm run check:client
+      - name: 实际浏览器界面与流量图检查
+        run: node scripts/capture-ui.mjs --evidence "$RUNNER_TEMP/CodexProxyTray-ui-evidence"
+      - name: 保存界面截图与交互证据
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ui-evidence
+          path: ${{ runner.temp }}/CodexProxyTray-ui-evidence/
+          if-no-files-found: ignore
+          retention-days: 7
       - name: 传递内嵌页面
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:

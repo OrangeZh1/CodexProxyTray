@@ -1,4 +1,4 @@
-CodexProxyTray v0.2.4 · Windows x64
+CodexProxyTray v0.2.5 · Windows x64
 
 用途
 为 ChatGPT 桌面端和 Windows Codex CLI 提供指定的本地 HTTP 代理环境，
@@ -23,6 +23,7 @@ CodexProxyTray v0.2.4 · Windows x64
    在“代理”页填写并应用地址，
    例如 http://127.0.0.1:7890，然后确认守护已开启。
    没有保存记录时默认暂停；手动开启或暂停后，下次启动会恢复该选择。
+   暂停代理守护时，流量采集也会暂停；恢复守护后按已保存的统计开关恢复采集。
 4. 打开 ChatGPT，或新开终端运行 codex；也可从助手中打开对应应用。
 5. 关闭主窗口后，助手继续在托盘运行；退出助手请使用托盘菜单。
    更新成功会重启并打开助手主窗口，ChatGPT 和 CLI 不随之重启。

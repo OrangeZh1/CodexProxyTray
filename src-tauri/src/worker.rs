@@ -35,7 +35,7 @@ impl Status {
         let collecting=sample.state==TrafficState::Collecting;
         let rate=|value:Option<f64>|value.filter(|value|value.is_finite()&&*value>=0.0).filter(|_|collecting);
         self.traffic_history.push(TrafficSample{at:sample.timestamp_ms,receive_bps:rate(sample.receive_bps),send_bps:rate(sample.send_bps),received_bytes:sample.received_bytes.filter(|_|collecting),sent_bytes:sample.sent_bytes.filter(|_|collecting)});
-        if self.traffic_history.len()>60{self.traffic_history.remove(0);}
+        if self.traffic_history.len()>61{self.traffic_history.remove(0);}
     }
     fn log(&mut self,level:&str,category:&str,message:impl Into<String>,details:impl Into<String>) {
         let at=settings::now();let id=self.logs.last().map_or(at,|last|last.id.saturating_add(1).max(at));
@@ -44,6 +44,9 @@ impl Status {
     }
 }
 type Reply=Sender<Result<Status,String>>;
+fn traffic_demand(guard:bool,preference:bool,valid_config:bool,service_paused:bool)->bool{guard&&preference&&valid_config&&!service_paused}
+fn traffic_action(desired:bool,applied:bool,stop_pending:bool,requested:bool)->Option<bool>{if stop_pending{Some(false)}else if requested||desired!=applied{Some(desired)}else{None}}
+fn traffic_action_finished(enable:bool,success:bool,applied:bool)->(bool,bool){if enable{(true,false)}else if success{(false,false)}else{(applied,true)}}
 #[derive(Default)]pub struct Preferences {pub autostart:Option<bool>,pub launch_target:Option<LaunchTarget>,pub cli_workdir:Option<String>,pub network_enabled:Option<bool>,pub auto_check_updates:Option<bool>,pub update_interval_hours:Option<u32>,pub connectivity_enabled:Option<bool>}
 pub enum Message {Enabled(bool,Option<Reply>),TrafficEnabled(bool,Reply),ServicePause(Reply),ServiceFinished(bool,Reply),Notice(String,String,String,String),Proxy(String,Reply),System(Preferences,Reply),Refresh(Reply),Launch(Reply),LaunchCli(Reply),Stop}
 pub struct Controller {pub status:Arc<Mutex<Status>>,pub tx:Sender<Message>,pub traffic:Arc<Mutex<crate::traffic::Coordinator>>,worker:Mutex<Option<JoinHandle<()>>>}
@@ -65,11 +68,11 @@ impl Controller {
             status.log("info","生命周期","守护进程已启动",format!("版本 {} · PID {}\n程序：{}\n配置：{}",env!("CARGO_PKG_VERSION"),status.helper_pid,exe.display(),root.display()));
             status.log("info","配置","已读取启动配置",format!("代理：{}\n登录自动启动：{} · 启动目标：{}",config.proxy_url,yes(status.autostart),target_name(config.launch_target)));
             if let Err(error)=platform::remove_legacy_cli_path(&root.join("cli")){status.log("warning","CLI","旧版命令入口的 PATH 项未能移除",error);}
-            let mut cli_error=None;let mut first=true;let restarting=std::env::args().any(|arg|arg=="--after-update");let mut auto_desktop_pending=!restarting&&config.launch_target.opens_desktop()&&config_error.is_none();let mut auto_cli_pending=!restarting&&config.launch_target.opens_cli()&&config_error.is_none();let mut cli_checked=Instant::now();let mut update_seen=status.update.checked_at;let mut traffic_applied=false;let mut service_paused=false;
+            let mut cli_error=None;let mut first=true;let restarting=std::env::args().any(|arg|arg=="--after-update");let mut auto_desktop_pending=!restarting&&config.launch_target.opens_desktop()&&config_error.is_none();let mut auto_cli_pending=!restarting&&config.launch_target.opens_cli()&&config_error.is_none();let mut cli_checked=Instant::now();let mut update_seen=status.update.checked_at;let mut traffic_applied=false;let mut traffic_stop_pending=false;let mut service_paused=false;
             loop {
                 let(mut pending,mut result,mut stopping,mut guard_action,mut manual)=(None,Ok(()),false,false,None);let mut traffic_requested=false;
                 if !first {match rx.recv_timeout(Duration::from_secs(2)) {
-                    Ok(Message::Enabled(enabled,reply))=>{pending=reply;if enabled&&config_error.is_some(){result=Err("请先保存有效的代理设置。".into());}else if let Err(error)=settings::save_guard_enabled(&root,enabled){result=Err(error);}else{guard_action=true;if enabled&&!status.enabled {guard_started=Instant::now();status.guard_uptime_ms=0;}if status.enabled&&!enabled {status.guard_uptime_ms=guard_started.elapsed().as_millis()as u64;}status.enabled=enabled;status.log("info","守护",if enabled{"已启用代理守护"}else{"已暂停代理守护"},"作用于 ChatGPT 与 Windows Codex CLI；已运行进程保留启动时的环境。");}},
+                    Ok(Message::Enabled(enabled,reply))=>{pending=reply;if enabled&&config_error.is_some(){result=Err("请先保存有效的代理设置。".into());}else if let Err(error)=settings::save_guard_enabled(&root,enabled){result=Err(error);}else{guard_action=true;traffic_requested=true;if enabled&&!status.enabled {guard_started=Instant::now();status.guard_uptime_ms=0;}if status.enabled&&!enabled {status.guard_uptime_ms=guard_started.elapsed().as_millis()as u64;}status.enabled=enabled;status.log("info","守护",if enabled{"已启用代理守护"}else{"已暂停代理守护"},"作用于 ChatGPT 与 Windows Codex CLI；已运行进程保留启动时的环境。");}},
                     Ok(Message::TrafficEnabled(enabled,reply))=>{pending=Some(reply);if config_error.is_some(){result=Err("配置无法读取，请先修复配置。".into());}else{let mut next=config.clone();next.traffic_enabled=enabled;match settings::save(&root,&next){Ok(())=>{config=next;traffic_requested=true;},Err(error)=>result=Err(error)}}},
                     Ok(Message::ServicePause(reply))=>{pending=Some(reply);service_paused=true;traffic_requested=true;},
                     Ok(Message::ServiceFinished(uninstalled,reply))=>{pending=Some(reply);service_paused=false;traffic_requested=true;if uninstalled{config.traffic_enabled=false;if config_error.is_none(){if let Err(error)=settings::save(&root,&config){status.log("warning","配置","辅助服务已卸载，但统计偏好未能保存",error);}}else{status.log("warning","配置","辅助服务已卸载，原配置文件已保留","配置原本无法读取，未覆盖它；本次运行已停止统计。");}}},
@@ -129,14 +132,20 @@ impl Controller {
                 status.tcp_connections=native::tcp_connections(desktop.as_ref().map_or(&[],|d|d.pids.as_slice()));status.helper_memory_bytes=native::memory_bytes();
                 if let Ok(mut sampler)=sampler.lock(){
                     let mut targets_valid=true;
-                    let desired_traffic=config.traffic_enabled&&config_error.is_none()&&!service_paused;
-                    if desired_traffic{match native::traffic_targets_held(&root,&config){Ok(targets)=>{if let Err(error)=sampler.set_targets(targets){targets_valid=false;sampler.fail_targets(error);}},Err(error)=>{targets_valid=false;sampler.fail_targets(format!("无法验证本轮目标进程：{error}"));}}}
-                    if traffic_requested||desired_traffic!=traffic_applied{
-                        if desired_traffic&&!targets_valid{result=Err("无法验证目标进程，未开始新的流量采样。".into());}
-                        else{let action=if desired_traffic{sampler.enable(crate::traffic::EnableMode::Normal)}else{sampler.disable()};traffic_applied=desired_traffic;if let Err(error)=action{result=Err(error)}}
+                    let desired_traffic=traffic_demand(status.enabled,config.traffic_enabled,config_error.is_none(),service_paused);
+                    if desired_traffic&&!traffic_stop_pending{match native::traffic_targets_held(&root,&config){Ok(targets)=>{if let Err(error)=sampler.set_targets(targets){targets_valid=false;sampler.fail_targets(error);}},Err(error)=>{targets_valid=false;sampler.fail_targets(format!("无法验证本轮目标进程：{error}"));}}}
+                    if let Some(enable)=traffic_action(desired_traffic,traffic_applied,traffic_stop_pending,traffic_requested){
+                        if enable&&!targets_valid{result=Err("无法验证目标进程，未开始新的流量采样。".into());}
+                        else{
+                            let action=if enable{sampler.enable(crate::traffic::EnableMode::Normal)}else{sampler.disable()};
+                            // Failed starts wait for an explicit request; unconfirmed STOP keeps retrying.
+                            (traffic_applied,traffic_stop_pending)=traffic_action_finished(enable,action.is_ok(),traffic_applied);
+                            if !enable&&action.is_ok(){status.traffic_history.clear();}
+                            if let Err(message)=action{if !enable{error=Some(format!("流量采样停止尚未确认：{message}"));}result=Err(message);}
+                        }
                     }
                     let next=sampler.snapshot();if next.state!=status.traffic.state{status.log(if next.state==crate::traffic::TrafficState::Unavailable{"warning"}else{"info"},"流量","流量采集状态已变化",format!("状态：{:?}\n{}",next.state,next.message.as_deref().unwrap_or("仅统计已验证的目标进程字节。")));}status.traffic=next;
-                }
+                }else{let message="流量采样状态不可访问，停止结果尚未确认。".to_owned();error=Some(message.clone());result=Err(message.clone());status.traffic=crate::traffic::TrafficSnapshot::disabled();status.traffic.state=crate::traffic::TrafficState::Unavailable;status.traffic.message=Some(message);}
                 crate::flow_log::maybe_sample(&status.traffic);status.traffic_enabled=config.traffic_enabled;status.traffic_service=crate::traffic_service::snapshot();
                 if status.error!=error {if let Some(e)=&error {status.log("error","守护","守护状态需要检查",e.clone());}else if status.error.is_some(){status.log("info","守护","守护状态已恢复","本轮检测未再出现此前错误。");}status.error=error;}
                 if !config.launch_target.opens_desktop() {auto_desktop_pending=false;}
@@ -204,6 +213,40 @@ fn install_cli(root:&Path,exe:&Path,config:&mut Config)->Result<bool,String> {
     use super::*;
     use crate::traffic::{TrafficSnapshot,TrafficState};
     fn traffic(at:u64,state:TrafficState,bytes:Option<u64>,rate:Option<f64>)->TrafficSnapshot{let mut sample=TrafficSnapshot::disabled();sample.timestamp_ms=at;sample.state=state;sample.received_bytes=bytes;sample.sent_bytes=bytes;sample.receive_bps=rate;sample.send_bps=rate;sample}
+    #[test]fn guard_and_statistics_preference_are_independent_requirements(){
+        for guard in [false,true]{for preference in [false,true]{assert_eq!(traffic_demand(guard,preference,true,false),guard&&preference);assert!(!traffic_demand(guard,preference,false,false));assert!(!traffic_demand(guard,preference,true,true));}}
+    }
+    #[test]fn unconfirmed_stop_retries_before_resume_but_failed_enable_waits_for_a_request(){
+        let(applied,pending)=traffic_action_finished(false,false,true);assert!(applied&&pending);assert_eq!(traffic_action(false,applied,pending,false),Some(false));assert_eq!(traffic_action(true,applied,pending,true),Some(false));
+        let(applied,pending)=traffic_action_finished(false,true,applied);assert!(!applied&&!pending);assert_eq!(traffic_action(true,applied,pending,false),Some(true));
+        let(applied,pending)=traffic_action_finished(true,false,applied);assert!(applied&&!pending);assert_eq!(traffic_action(true,applied,pending,false),None);assert_eq!(traffic_action(true,applied,pending,true),Some(true));assert_eq!(traffic_action(false,applied,pending,false),Some(false));
+    }
+    #[test]#[ignore="Requires a fresh isolated GitHub-hosted process and the installed service QA fixture"]
+    fn guard_pause_service_probe(){
+        use std::{collections::HashSet,io::Write,path::PathBuf};
+        #[derive(Serialize)]struct Probe{schema:u32,status:&'static str,marker:String,scope:&'static str,checks:Vec<&'static str>,samples:Vec<usize>,failure_code:Option<&'static str>,elapsed_ms:u64}
+        fn wait(controller:&Controller,condition:impl Fn(&Status)->bool)->Result<Status,&'static str>{let until=Instant::now()+Duration::from_secs(30);while Instant::now()<until{let status=controller.snapshot();if status.revision>0&&condition(&status){return Ok(status)}if !status.backend_ready{return Err("guard_probe_worker_stopped")}thread::sleep(Duration::from_millis(100));}Err("guard_probe_state_timeout")}
+        fn request(controller:&Controller,guard:bool,value:bool)->Result<Status,&'static str>{let(tx,rx)=mpsc::channel();controller.tx.send(if guard{Message::Enabled(value,Some(tx))}else{Message::TrafficEnabled(value,tx)}).map_err(|_|"guard_probe_send_failed")?;rx.recv_timeout(Duration::from_secs(15)).map_err(|_|"guard_probe_reply_timeout")?.map_err(|_|"guard_probe_action_failed")}
+        fn samples(controller:&Controller)->Result<usize,&'static str>{let until=Instant::now()+Duration::from_secs(30);let mut seen=HashSet::new();while Instant::now()<until{let value=controller.snapshot().traffic;if matches!(value.state,TrafficState::Unavailable|TrafficState::NeedsPermission|TrafficState::NeedsInstallation){return Err("guard_probe_sampling_unavailable")}if value.state==TrafficState::Collecting&&value.received_bytes.is_some()&&value.sent_bytes.is_some(){seen.insert(value.timestamp_ms);if seen.len()>=2{return Ok(seen.len())}}thread::sleep(Duration::from_millis(100));}Err("guard_probe_samples_missing")}
+        assert_eq!(std::env::var("GITHUB_ACTIONS").as_deref(),Ok("true"));assert_eq!(std::env::var("RUNNER_ENVIRONMENT").as_deref(),Ok("github-hosted"));
+        let marker=std::env::var("CODEX_PROXY_GUARD_TRAFFIC_PROBE_MARKER").expect("explicit probe marker");assert!(marker.len()==64&&marker.bytes().all(|value|value.is_ascii_digit()||(b'a'..=b'f').contains(&value)));
+        let result=PathBuf::from(std::env::var_os("CODEX_PROXY_GUARD_TRAFFIC_PROBE_RESULT").expect("explicit result"));let boundary=PathBuf::from(std::env::var_os("RUNNER_TEMP").unwrap()).canonicalize().unwrap();let parent=result.parent().unwrap().canonicalize().unwrap();let local=PathBuf::from(std::env::var_os("LOCALAPPDATA").unwrap()).canonicalize().unwrap();assert!(result.is_absolute()&&result.file_name()==Some(std::ffi::OsStr::new("result.json"))&&parent.starts_with(boundary)&&local.starts_with(&parent));
+        let root=settings::root();assert!(!root.exists());let mut output=fs::OpenOptions::new().create_new(true).write(true).open(result).unwrap();let started=Instant::now();let mut probe=Probe{schema:1,status:"failed",marker,scope:"isolated Controller guard/pref transitions and real service STOP/resume; no Tauri, business targets or UAC",checks:vec![],samples:vec![],failure_code:None,elapsed_ms:0};
+        let outcome=(||->Result<(),&'static str>{
+            if !native::packages().map_err(|_|"guard_probe_package_discovery_failed")?.is_empty()||native::desktop_info().is_some()||!settings::detect_cli(&root).is_empty(){return Err("guard_probe_requires_no_business_targets")}
+            fs::create_dir(&root).map_err(|_|"guard_probe_root_create_failed")?;let config=Config{launch_target:LaunchTarget::None,network_enabled:false,auto_check_updates:false,connectivity_enabled:false,traffic_enabled:true,..Config::default()};settings::save(&root,&config).map_err(|_|"guard_probe_config_failed")?;settings::save_guard_enabled(&root,false).map_err(|_|"guard_probe_guard_failed")?;
+            let controller=Controller::new(|_|{});wait(&controller,|status|!status.enabled&&status.traffic_enabled&&status.traffic.state==TrafficState::Disabled)?;probe.checks.push("cold_paused_guard_does_not_collect_enabled_preference");
+            request(&controller,true,true)?;probe.samples.push(samples(&controller)?);let paused=request(&controller,true,false)?;
+            if paused.enabled||!paused.traffic_enabled||paused.traffic.state!=TrafficState::Disabled||!paused.traffic_history.is_empty()||!settings::load(&root).map_err(|_|"guard_probe_config_read_failed")?.traffic_enabled{return Err("guard_probe_pause_stop_or_preference_failed")};probe.checks.push("pause_confirms_real_stop_and_preserves_user_preference");
+            request(&controller,false,false)?;request(&controller,true,true)?;wait(&controller,|status|status.enabled&&!status.traffic_enabled&&status.traffic.state==TrafficState::Disabled)?;controller.stop();probe.checks.push("resume_does_not_enable_opted_out_statistics");
+            let controller=Controller::new(|_|{});wait(&controller,|status|status.enabled&&!status.traffic_enabled&&status.traffic.state==TrafficState::Disabled)?;controller.stop();probe.checks.push("cold_enabled_guard_keeps_statistics_opted_out");
+            settings::save_guard_enabled(&root,false).map_err(|_|"guard_probe_guard_failed")?;let controller=Controller::new(|_|{});wait(&controller,|status|!status.enabled&&!status.traffic_enabled&&status.traffic.state==TrafficState::Disabled)?;request(&controller,false,true)?;wait(&controller,|status|!status.enabled&&status.traffic_enabled&&status.traffic.state==TrafficState::Disabled)?;probe.checks.push("changing_preference_while_paused_does_not_start_sampling");
+            let resumed_at=settings::now();request(&controller,true,true)?;probe.samples.push(samples(&controller)?);if controller.snapshot().traffic_history.iter().any(|sample|sample.at<resumed_at){return Err("guard_probe_history_crossed_pause")};probe.checks.push("resume_collects_new_session_without_cross_pause_history");
+            let paused=request(&controller,true,false)?;if paused.traffic.state!=TrafficState::Disabled{return Err("guard_probe_second_stop_unconfirmed")};controller.stop();
+            settings::save_guard_enabled(&root,true).map_err(|_|"guard_probe_guard_failed")?;let controller=Controller::new(|_|{});probe.samples.push(samples(&controller)?);probe.checks.push("cold_enabled_guard_restores_enabled_statistics");let paused=request(&controller,true,false)?;
+            if paused.traffic.state!=TrafficState::Disabled||!paused.traffic_enabled||settings::load_guard_enabled(&root).map_err(|_|"guard_probe_guard_read_failed")?||!settings::load(&root).map_err(|_|"guard_probe_config_read_failed")?.traffic_enabled{return Err("guard_probe_final_stop_or_preference_failed")};controller.stop();probe.checks.push("final_stop_confirmed_without_rewriting_statistics_preference");Ok(())
+        })();probe.failure_code=outcome.err();if probe.failure_code.is_none(){probe.status="passed"}probe.elapsed_ms=started.elapsed().as_millis().min(u128::from(u64::MAX))as u64;let bytes=serde_json::to_vec(&probe).unwrap();assert!(bytes.len()<=16384);output.write_all(&bytes).and_then(|_|output.sync_all()).unwrap();assert_eq!(probe.status,"passed","guard traffic probe failed: {:?}",probe.failure_code);
+    }
     #[test]fn traffic_samples_keep_real_timestamps_gaps_and_new_session_boundaries(){
         let mut status=Status::new();status.traffic=traffic(100,TrafficState::Collecting,Some(1000),Some(10.0));status.sample_traffic();status.sample_traffic();assert_eq!(status.traffic_history.len(),1);
         status.traffic=traffic(200,TrafficState::Unavailable,Some(2000),Some(20.0));status.sample_traffic();assert_eq!(status.traffic_history[1].receive_bps,None);assert_eq!(status.traffic_history[1].received_bytes,None);
@@ -212,7 +255,7 @@ fn install_cli(root:&Path,exe:&Path,config:&mut Config)->Result<bool,String> {
         status.traffic=traffic(500,TrafficState::Disabled,None,None);status.sample_traffic();assert!(status.traffic_history.is_empty());
     }
     #[test]fn history_is_bounded_and_invalid_rates_do_not_become_measured_zero(){
-        let mut status=Status::new();for at in 1..=100{status.traffic=traffic(at,TrafficState::Collecting,Some(at*100),Some(at as f64));status.sample_traffic();}assert_eq!(status.traffic_history.len(),60);assert_eq!(status.traffic_history[0].at,41);
+        let mut status=Status::new();for at in 1..=100{status.traffic=traffic(at,TrafficState::Collecting,Some(at*100),Some(at as f64));status.sample_traffic();}assert_eq!(status.traffic_history.len(),61);assert_eq!(status.traffic_history[0].at,40);
         status.traffic=traffic(101,TrafficState::Collecting,Some(10100),Some(f64::NAN));status.sample_traffic();assert_eq!(status.traffic_history.last().unwrap().receive_bps,None);
         status.traffic=traffic(90,TrafficState::Collecting,Some(10200),Some(10.0));status.sample_traffic();assert_eq!(status.traffic_history.len(),1,"A backwards timestamp starts a separate graph segment.");
     }

@@ -161,7 +161,7 @@ try {
   const previewUpdate=renderToStaticMarkup(React.createElement(UpdateSettings,{status:{update:{status:'available',latest:'9.0.0'}},version}));assert.doesNotMatch(previewUpdate,/请在桌面助手中下载和安装更新/);
   const completed=about({app_update:{busy:false,phase:'installed',version},update:{status:'error',latest:version,error:'连接超时'}});
   assert.doesNotMatch(completed,/app-update-progress|助手更新已完成/);assert.match(completed,/上次查到版本/);assert.match(completed,/本次检查失败/);assert.match(completed,/连接超时/);
-  assert.match(about({update:{status:'error',error:'连接超时'}}),/本次未获取/);
+  assert.match(about({update:{status:'error',error:'连接超时'}}),/尚未检查/);
   for(const phase of ['ready','error','rolled_back','installed_cleanup_pending'])assert.match(about({app_update:{phase,version,error:phase==='error'?'校验失败':null}}),/app-update-progress/);
   const release=renderToStaticMarkup(React.createElement(ReleaseNotes,{notes:'### 更新\n- **示例** `<tag>`\n<script>unsafe()</script>'}));
   assert.match(release,/<h3>更新<\/h3>/);assert.match(release,/<strong>示例<\/strong>/);assert.doesNotMatch(release,/<script>|###|\*\*示例/);assert.match(release,/&lt;script&gt;/);
@@ -234,13 +234,19 @@ try {
 
   const runningService={state:'running',version};
   const history=[{at:1000,receive_bps:2048,send_bps:1024},{at:3000,receive_bps:3072,send_bps:512}];
-  const traffic=(result,service=runningService,trafficEnabled=true)=>renderToStaticMarkup(React.createElement(TrafficCard,{result,service,trafficEnabled,observed:true,history}));
+  const traffic=(result,service=runningService,trafficEnabled=true,guardEnabled=true,points=history)=>renderToStaticMarkup(React.createElement(TrafficCard,{result,service,trafficEnabled,guardEnabled,observed:true,history:points}));
   const rateLabels=markup=>/<div class="traffic-rates">([\s\S]*?)<\/div>/.exec(markup)?.[1]||'';
   const collecting=traffic({state:'collecting',receive_bps:2048,send_bps:1024,received_bytes:4096,sent_bytes:0,target_count:2});
   assert.match(collecting,/2\.0 KB\/s/);assert.match(collecting,/1\.0 KB\/s/);assert.match(collecting,/4\.0 KB/);assert.match(collecting,/>0 B</);
   assert.match(collecting,/目标进程上传与下载速率趋势/);assert.match(collecting,/累计上传/);assert.match(collecting,/累计下载/);
-  const partial=traffic({state:'collecting',partial:true,message:'仅含已验证目标，累计可能不完整。',receive_bps:2048,send_bps:1024,received_bytes:4096,sent_bytes:0,target_count:2});
-  assert.match(partial,/采集中 · 累计不完整/);assert.match(partial,/累计可能不完整/);assert.match(partial,/2\.0 KB\/s/);
+  assert.match(collecting,/class="traffic-download-line" d="M0\.0,[^"]*L600\.0,/);assert.match(collecting,/2 秒前/);assert.doesNotMatch(collecting,/2 分钟前/);
+  const partial=traffic({state:'collecting',partial:true,missed_bindings:4,first_missed_at:1000,last_missed_at:3000,message:'仅含已验证目标，累计可能不完整。',receive_bps:2048,send_bps:1024,received_bytes:4096,sent_bytes:0,target_count:2});
+  assert.match(partial,/采集中 · 累计不完整/);assert.match(partial,/2\.0 KB\/s/);assert.doesNotMatch(partial,/<p\b|可能未覆盖|首次|最近|累计可能不完整/,'Partial diagnostics must not add a long footer or grow the dashboard row');
+  const singleTraffic=traffic({state:'collecting'},runningService,true,true,history.slice(0,1));assert.match(singleTraffic,/等待第二个有效样本/);assert.doesNotMatch(singleTraffic,/目标进程上传与下载速率趋势|2 分钟前/);
+  const pausedTraffic=traffic({state:'disabled'},runningService,true,false,[]);assert.match(pausedTraffic,/已随守护暂停|恢复守护后/);assert.doesNotMatch(pausedTraffic,/目标进程上传与下载速率趋势|采集中/);
+  const stopPending=traffic({state:'collecting',receive_bps:2048},runningService,true,false);assert.match(stopPending,/正在暂停采集/);assert.doesNotMatch(rateLabels(stopPending),/2\.0 KB\/s/);assert.doesNotMatch(stopPending,/已随守护暂停|目标进程上传与下载速率趋势/);
+  const stopFailed=traffic({state:'unavailable',message:'停止尚未确认'},{state:'error'},true,false);assert.match(stopFailed,/暂不可用/);assert.doesNotMatch(stopFailed,/已随守护暂停|采集中/);
+  const resuming=traffic({state:'disabled'},runningService,true,true,[]);assert.match(resuming,/正在恢复采集/);assert.doesNotMatch(resuming,/已随守护暂停|采集中/);
   for(const state of ['disabled','starting','needs_permission','unavailable']){
     const inactive=traffic({state,receive_bps:2048,send_bps:1024,received_bytes:4096,sent_bytes:0,target_count:2});
     assert.doesNotMatch(rateLabels(inactive),/2\.0 KB\/s|1\.0 KB\/s/);assert.doesNotMatch(inactive,/累计 0 B|授权采集/);
@@ -250,6 +256,7 @@ try {
   assert.match(trafficStarting,/正在启动/);assert.doesNotMatch(trafficStarting,/目标进程上传与下载速率趋势/);
   const missingService=traffic({state:'collecting',receive_bps:2048},{state:'not_installed'});
   assert.match(missingService,/暂不可用/);assert.doesNotMatch(rateLabels(missingService),/2\.0 KB\/s/);assert.doesNotMatch(missingService,/目标进程上传与下载速率趋势/);
+  const stoppedService=traffic({state:'collecting',receive_bps:2048,partial:true},{state:'stopped'});assert.match(stoppedService,/暂不可用/);assert.doesNotMatch(stoppedService,/采集中|目标进程上传与下载速率趋势/);
   const disabledTraffic=traffic({state:'collecting',receive_bps:2048},runningService,false);
   assert.match(disabledTraffic,/未开启/);assert.doesNotMatch(rateLabels(disabledTraffic),/2\.0 KB\/s/);assert.doesNotMatch(disabledTraffic,/目标进程上传与下载速率趋势/);
   assert.match(active(render('dashboard',sample),'仪表盘'),/aria-label="目标进程流量"/);
@@ -259,9 +266,9 @@ try {
   checks++;
 
   const cli=(data,pending=new Set(),networkEnabled=true)=>renderToStaticMarkup(React.createElement(CliManagement,{data,writable:true,networkEnabled,busy:name=>pending.has(name),onCheck:noop,onUpdate:noop,onUninstall:noop}));
-  const managed={source:'npm_user_global',supported:true,target_token:'isolated-token',current:'0.1.0',latest:'0.2.0',operation:null};
-  const managedCli=cli(managed);assert.match(managedCli,/npm · 当前用户/);assert.match(managedCli,/当前版本<\/small><strong>0\.1\.0/);assert.match(managedCli,/最新版本<\/small><strong>0\.2\.0/);for(const id of ['cli-check','cli-update','cli-uninstall'])assert.equal(disabled(control(managedCli,'button',id)),false);
-  const uncheckedCli=cli({...managed,latest:null});assert.match(uncheckedCli,/最新版本<\/small><strong>—/);assert.equal((uncheckedCli.match(/检查后显示最新版本/g)||[]).length,1);assert.doesNotMatch(uncheckedCli,/尚未检查/);
+  const managed={source:'npm_user_global',supported:true,target_token:'isolated-token',current:'0.1.0',latest:'0.2.0',checked_at:1,operation:null};
+  const managedCli=cli(managed);assert.match(managedCli,/npm · 当前用户/);assert.doesNotMatch(managedCli,/当前版本|cli-version-arrow|0\.1\.0/);assert.match(managedCli,/最新版本<\/small><strong>0\.2\.0/);for(const id of ['cli-check','cli-update','cli-uninstall'])assert.equal(disabled(control(managedCli,'button',id)),false);
+  const uncheckedCli=cli({...managed,latest:null});assert.match(uncheckedCli,/最新版本<\/small><strong>尚未检查/);assert.equal((uncheckedCli.match(/尚未检查/g)||[]).length,1);assert.doesNotMatch(uncheckedCli,/检查后显示最新版本|cli-version-result/);
   const firstCli=cli({source:'not_installed',install_token:'verified-npm-token'});assert.equal(disabled(control(firstCli,'button','cli-install')),false);assert.doesNotMatch(firstCli,/id="cli-uninstall"/);assert.match(cli({...managed,latest:managed.current}),/已是最新/);
   const unsupported=cli({source:'unmanaged',supported:false,current:'1.0.0',reason:'此安装来源不受支持，请使用原安装工具管理。'});assert.match(unsupported,/非托管安装/);assert.match(unsupported,/使用原安装工具管理/);for(const id of ['cli-check','cli-uninstall'])assert.equal(disabled(control(unsupported,'button',id)),true);
   const checkingCli=cli(managed,new Set(['cli-check']));assert.match(control(checkingCli,'button','cli-check'),/aria-busy="true"/);for(const id of ['cli-update','cli-uninstall']){assert.match(control(checkingCli,'button',id),/aria-busy="false"/);assert.equal(disabled(control(checkingCli,'button',id)),true);}

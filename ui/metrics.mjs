@@ -23,11 +23,30 @@ export function probePath(samples,width=600,height=80,maximum=probeScale(samples
 }
 
 export function appendTraffic(history,sample,enabled) {
-  if(!enabled)return [];
+  if(!enabled||sample?.state==='disabled')return [];
   if(!Number.isFinite(sample?.timestamp_ms))return history;
-  const point={at:sample.timestamp_ms,receive_bps:sample.state==='collecting'?sample.receive_bps:null,send_bps:sample.state==='collecting'?sample.send_bps:null,received_bytes:sample.received_bytes,sent_bytes:sample.sent_bytes};
+  const point={at:sample.timestamp_ms,receive_bps:sample.state==='collecting'?sample.receive_bps:null,send_bps:sample.state==='collecting'?sample.send_bps:null,received_bytes:sample.state==='collecting'?sample.received_bytes:null,sent_bytes:sample.state==='collecting'?sample.sent_bytes:null};
   const last=history.at(-1);
-  if(last&&point.at<last.at)return history;
-  const reset=last&&["received_bytes","sent_bytes"].some(key=>Number.isFinite(point[key])&&Number.isFinite(last[key])&&point[key]<last[key]);
-  return [...(reset?[]:history.filter(item=>item.at!==point.at)),point].slice(-60);
+  const reset=(last&&point.at<last.at)||["received_bytes","sent_bytes"].some(key=>{
+    const previous=history.findLast(item=>Number.isFinite(item[key]));
+    return previous&&Number.isFinite(point[key])&&point[key]<previous[key];
+  });
+  return [...(reset?[]:history.filter(item=>item.at!==point.at)),point].slice(-61);
+}
+
+const measuredTraffic=point=>['receive_bps','send_bps'].some(key=>Number.isFinite(point[key])&&point[key]>=0);
+export function trafficWindow(history,maximumSpan=120_000) {
+  const samples=history.filter(point=>Number.isFinite(point.at)),start=samples.find(measuredTraffic);
+  if(!start)return {first:0,last:0,span:0,points:[],measured:[]};
+  const last=samples.at(-1).at,first=Math.max(start.at,last-maximumSpan);
+  const points=samples.filter(point=>point.at>=first&&point.at<=last);
+  return {first,last,span:last-first,points,measured:points.filter(measuredTraffic)};
+}
+export function trafficPath(window,key,maximum) {
+  if(window.measured.length<2||window.span<=0)return '';
+  return probePath([{at:window.first,latency_ms:null},...window.points.map(point=>({at:point.at,latency_ms:point[key]})),{at:window.last,latency_ms:null}],600,80,maximum,10_000);
+}
+export function trafficAge(milliseconds) {
+  if(milliseconds<=0)return '现在';
+  return milliseconds>=60_000?`${Number((milliseconds/60_000).toFixed(1))} 分钟前`:`${Number((milliseconds/1000).toFixed(1))} 秒前`;
 }

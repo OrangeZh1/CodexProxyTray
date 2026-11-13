@@ -69,7 +69,7 @@ function Remove-Diagnostics {
     if(-not $diagnosticOwned){return}
     Require (Same-Path ((Get-Item -LiteralPath $diagnosticRoot -Force).FullName) $diagnosticRoot) 'diagnostic_directory_changed'
     No-Reparse $diagnosticRoot
-    foreach($ownedName in @('pipeline-data','service-client-data')){$ownedWork=Join-Path $diagnosticRoot $ownedName;if(Test-Path -LiteralPath $ownedWork){No-Reparse $ownedWork;Require ($report.status -eq 'failed') 'owned_work_directory_after_success';return 'retained_for_debugging'}}
+    foreach($ownedName in @('pipeline-data','service-client-data','guard-traffic-data')){$ownedWork=Join-Path $diagnosticRoot $ownedName;if(Test-Path -LiteralPath $ownedWork){No-Reparse $ownedWork;Require ($report.status -eq 'failed') 'owned_work_directory_after_success';return 'retained_for_debugging'}}
     $entries=@(Get-ChildItem -LiteralPath $diagnosticRoot -Force)
     foreach($entry in $entries){Require (-not $entry.PSIsContainer -and $diagnosticFiles.Contains($entry.FullName)) 'unknown_diagnostic_file_preserved';No-Reparse $entry.FullName}
     foreach($entry in $entries){[IO.File]::Delete($entry.FullName)}
@@ -396,6 +396,7 @@ function Run-ServicePipeline([string]$GuiBinary=$binary,[string]$ExpectedError) 
     Require (-not (Test-Path -LiteralPath $sandbox)) 'pipeline_sandbox_exists'
     [void][IO.Directory]::CreateDirectory((Join-Path $sandbox 'CodexProxyTray'))
     [IO.File]::WriteAllText((Join-Path $sandbox 'CodexProxyTray/config.json'),'{"launch_target":"none","network_enabled":false,"connectivity_enabled":false,"traffic_enabled":true,"auto_check_updates":false}')
+    [IO.File]::WriteAllText((Join-Path $sandbox 'CodexProxyTray/guard-v1.json'),'{"schema":1,"enabled":true}')
     $start={param([string]$Arguments)
         $info=[Diagnostics.ProcessStartInfo]::new();$info.FileName=$GuiBinary;$info.Arguments=$Arguments;$info.WorkingDirectory=[IO.Path]::GetDirectoryName($GuiBinary);$info.UseShellExecute=$false;$info.CreateNoWindow=$true;$info.WindowStyle='Hidden'
         $info.EnvironmentVariables['LOCALAPPDATA']=$sandbox;$info.EnvironmentVariables['WEBVIEW2_USER_DATA_FOLDER']=Join-Path $sandbox 'webview-data'
@@ -488,6 +489,33 @@ function Run-ServiceClientProbe {
         if($collectors.Count){$record.collector_cleanup='blocked';$record.status='failed';if(-not $probeFailure){$probeFailure='service_client_collectors_remain'}}else{$record.collector_cleanup='passed'}
         if($record.status -eq 'passed'){try{No-Reparse $sandbox;Require (Is-Within (Full-Path $sandbox) $diagnosticRoot) 'service_client_cleanup_boundary';Remove-Item -LiteralPath $sandbox -Recurse -Force}catch{$record.status='failed';$record['cleanup_code']=Failure-Code $_;$probeFailure=$_}}
         Write-NewJson (Join-Path $evidenceRoot 'non-elevated-service-client.json') $record;$report['non_elevated_service_client']=$record;$report['non_elevated_client_roundtrip_and_stop_verified']=($record.status -eq 'passed')
+    }
+    if($probeFailure){throw $probeFailure}
+}
+function Run-GuardTrafficProbe {
+    $sandbox=Join-Path $diagnosticRoot 'guard-traffic-data';Require (-not(Test-Path -LiteralPath $sandbox)) 'guard_traffic_sandbox_exists';$localData=Join-Path $sandbox 'local';[void][IO.Directory]::CreateDirectory($localData)
+    $resultPath=Join-Path $sandbox 'result.json';$random=[byte[]]::new(32);[Security.Cryptography.RandomNumberGenerator]::Fill($random);$marker=([BitConverter]::ToString($random)).Replace('-','').ToLowerInvariant()
+    $record=[ordered]@{status='running';scope='Fresh isolated Controller and same Enabled message path; no Tauri, target applications or UAC';native_exit_code=$null;result=$null;collector_cleanup='pending'};$process=$null;$started=$null;$probeFailure=$null
+    try{
+        Require ((Get-FileHash -LiteralPath $serviceProbe -Algorithm SHA256).Hash.ToLowerInvariant() -ceq $serviceProbeHash) 'guard_traffic_probe_binary_changed'
+        $info=[Diagnostics.ProcessStartInfo]::new($serviceProbe);$info.UseShellExecute=$false;$info.CreateNoWindow=$true;$info.WindowStyle='Hidden';$info.WorkingDirectory=[IO.Path]::GetDirectoryName($binary)
+        foreach($argument in @('worker::traffic_history_tests::guard_pause_service_probe','--ignored','--exact','--test-threads=1')){$info.ArgumentList.Add($argument)}
+        $info.Environment['LOCALAPPDATA']=$localData;$info.Environment['PATH']=[IO.Path]::GetDirectoryName($binary)+';'+$env:PATH;$info.Environment['CODEX_PROXY_GUARD_TRAFFIC_PROBE_RESULT']=$resultPath;$info.Environment['CODEX_PROXY_GUARD_TRAFFIC_PROBE_MARKER']=$marker
+        $process=[Diagnostics.Process]::Start($info);[CodexProxyTray.ServiceQaNative]::PinGui($process);$started=$process.StartTime.ToUniversalTime()
+        Require ($process.WaitForExit(120000)) 'guard_traffic_probe_timeout';$record.native_exit_code=[CodexProxyTray.ServiceQaNative]::GuiExitCode([uint32]$process.Id)
+        Require (Test-Path -LiteralPath $resultPath -PathType Leaf) 'guard_traffic_result_missing';No-Reparse $resultPath;Require ((Get-Item -LiteralPath $resultPath).Length -le 16384) 'guard_traffic_result_too_large';$result=Get-Content -LiteralPath $resultPath -Raw -Encoding utf8|ConvertFrom-Json
+        $expected=@('schema','status','marker','scope','checks','samples','failure_code','elapsed_ms');$fields=@($result.PSObject.Properties.Name);Require ($fields.Count -eq 8 -and @($fields|Where-Object {$_ -cnotin $expected}).Count -eq 0 -and $result.schema -eq 1 -and $result.marker -ceq $marker) 'guard_traffic_result_binding_invalid'
+        $record.result=@{status=$result.status;marker_matches=$true;checks=$result.checks;samples=$result.samples;failure_code=$result.failure_code;elapsed_ms=$result.elapsed_ms}
+        $required=@('cold_paused_guard_does_not_collect_enabled_preference','pause_confirms_real_stop_and_preserves_user_preference','resume_does_not_enable_opted_out_statistics','cold_enabled_guard_keeps_statistics_opted_out','changing_preference_while_paused_does_not_start_sampling','resume_collects_new_session_without_cross_pause_history','cold_enabled_guard_restores_enabled_statistics','final_stop_confirmed_without_rewriting_statistics_preference')
+        Require ($record.native_exit_code -eq 0 -and $result.status -ceq 'passed' -and $null -eq $result.failure_code -and @($result.checks).Count -eq 8 -and @(Compare-Object $required @($result.checks)).Count -eq 0 -and @($result.samples).Count -eq 3 -and @($result.samples|Where-Object {($_ -isnot [int] -and $_ -isnot [long]) -or $_ -lt 2 -or $_ -gt 1024}).Count -eq 0) 'guard_traffic_pause_resume_not_verified'
+        Require ((Assert-OwnedInstall).receipt_hash -ceq $firstReceipt) 'guard_traffic_changed_service_install';$record.status='passed'
+    }catch{$probeFailure=$_;$record.status='failed';$record.failure_code=Failure-Code $_}
+    finally{
+        if($process){try{if(-not $process.HasExited){Require ($null -ne $started -and $process.StartTime.ToUniversalTime() -eq $started -and (Same-Path $process.Path $serviceProbe)) 'guard_traffic_cleanup_identity_changed';$process.Kill($false);Require ($process.WaitForExit(10000)) 'guard_traffic_cleanup_exit_unconfirmed'};$record.native_exit_code=[CodexProxyTray.ServiceQaNative]::GuiExitCode([uint32]$process.Id)}catch{if(-not $probeFailure){$probeFailure=$_};$record.status='failed'}finally{[CodexProxyTray.ServiceQaNative]::ReleaseGui([uint32]$process.Id);$process.Dispose()}}
+        $until=[DateTime]::UtcNow.AddSeconds(12);do{$collectors=@(Get-CimInstance Win32_Process -Filter "Name = 'CodexProxyTrayTrafficService.exe'"|Where-Object {$_.CommandLine -like '*--traffic-collector*' -and (Same-Path $_.ExecutablePath $serviceImage)});if($collectors.Count){Start-Sleep -Milliseconds 100}}while($collectors.Count -and [DateTime]::UtcNow -lt $until)
+        if($collectors.Count){$record.collector_cleanup='blocked';$record.status='failed';if(-not $probeFailure){$probeFailure='guard_traffic_collectors_remain'}}else{$record.collector_cleanup='passed'}
+        if($record.status -eq 'passed'){try{No-Reparse $sandbox;Require (Is-Within (Full-Path $sandbox) $diagnosticRoot) 'guard_traffic_cleanup_boundary';Remove-Item -LiteralPath $sandbox -Recurse -Force}catch{$record.status='failed';$probeFailure=$_}}
+        Write-NewJson (Join-Path $evidenceRoot 'guard-traffic-client.json') $record;$report['guard_traffic_client']=$record
     }
     if($probeFailure){throw $probeFailure}
 }
@@ -593,6 +621,7 @@ try {
     }
     Run-Case 'service_backed_sampling_roundtrip_and_stop_ack' {Run-ServicePipeline}
     Run-Case 'non_elevated_medium_service_client_collects_and_stops' {Run-ServiceClientProbe}
+    Run-Case 'guard_pause_stops_and_resume_respects_statistics_preference' {Run-GuardTrafficProbe}
     Run-Case 'same_owner_non_gui_client_cannot_start_out_of_scope_targets' {Run-TargetScopeRejection}
     Run-Case 'same_owner_non_gui_client_cannot_add_out_of_scope_targets' {Run-TargetScopeRejection -AfterEmptyTargets}
     Run-Case 'different_gui_hash_reuses_installed_compatible_service' {

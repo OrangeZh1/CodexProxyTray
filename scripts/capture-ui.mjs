@@ -1,0 +1,81 @@
+// GitHub-hosted UI evidence only: real Chromium, synthetic loopback IPC, no native services.
+import assert from 'node:assert/strict';
+import {spawn,spawnSync} from 'node:child_process';
+import {createServer} from 'node:net';
+import {readFile,writeFile,mkdir,mkdtemp,lstat,realpath,rm} from 'node:fs/promises';
+import {resolve,join,dirname,relative,isAbsolute} from 'node:path';
+import {fileURLToPath} from 'node:url';
+
+if(process.env.GITHUB_ACTIONS!=='true'||process.env.RUNNER_ENVIRONMENT!=='github-hosted'||process.platform!=='linux'||Number(process.versions.node.split('.')[0])<24)throw Error('UI evidence requires GitHub-hosted Linux and Node 24+.');
+assert.equal(process.argv.length,4);assert.equal(process.argv[2],'--evidence');assert.ok(process.env.RUNNER_TEMP);
+const root=resolve(dirname(fileURLToPath(import.meta.url)),'..'),temporary=await realpath(process.env.RUNNER_TEMP),evidence=resolve(process.argv[3]);
+const within=(parent,path)=>{const part=relative(parent,path);return !!part&&!part.startsWith('..')&&!isAbsolute(part);};
+assert.ok(within(temporary,evidence),'Evidence must be a new directory under RUNNER_TEMP.');
+for(let path=dirname(evidence);path!==dirname(path);path=dirname(path))assert.ok(!(await lstat(path)).isSymbolicLink(),'Evidence ancestors must be plain directories.');
+await mkdir(evidence);const owned=await mkdtemp(join(temporary,'CodexProxyTray-ui-owned-'));
+const report={schema:1,status:'running',scope:'Actual browser UI with synthetic loopback fixture only; screenshots do not verify native ETW, services or user accounts.',pages:[],checks:[],browser_errors:[],blocked_requests:0,cleanup:'pending'};
+let server,browser,socket,failed,sequence=0,navigation=0;const pending=new Map(),sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms));
+const check=(condition,name)=>{assert.ok(condition,name);report.checks.push(name);};
+async function until(read,name,ms=15000){const end=Date.now()+ms;do{const value=await read();if(value)return value;await sleep(150);}while(Date.now()<end);throw Error(name);}
+async function freePort(){const listener=createServer();await new Promise((yes,no)=>listener.once('error',no).listen(0,'127.0.0.1',yes));const port=listener.address().port;await new Promise(yes=>listener.close(yes));return port===4173?freePort():port;}
+const live=child=>child&&child.exitCode===null&&child.signalCode===null;
+function child(file,args,env){const process=spawn(file,args,{cwd:root,env,stdio:['ignore','pipe','pipe'],windowsHide:true});process.on('error',error=>{process.qaError=error.message;});process.stdout.resume();process.stderr.on('data',chunk=>{process.qaLog=((process.qaLog||'')+chunk).slice(-1200);});return process;}
+async function stop(process){if(!live(process))return;process.kill('SIGTERM');for(let n=0;n<30&&live(process);n++)await sleep(100);if(live(process)){process.kill('SIGKILL');for(let n=0;n<20&&live(process);n++)await sleep(100);}assert.ok(!live(process),'Owned child did not exit.');}
+function call(method,params={}){return new Promise((yes,no)=>{const id=++sequence,timer=setTimeout(()=>{pending.delete(id);no(Error(`CDP timeout: ${method}`));},10000);pending.set(id,{yes,no,timer});socket.send(JSON.stringify({id,method,params}));});}
+async function evaluate(expression){const reply=await call('Runtime.evaluate',{expression,returnByValue:true,awaitPromise:true});if(reply.exceptionDetails)throw Error(reply.exceptionDetails.text);return reply.result.value;}
+const q=selector=>`document.querySelector(${JSON.stringify(selector)})`;
+const rect=element=>`(()=>{const e=${element};if(!e)return null;const r=e.getBoundingClientRect();return r.width&&r.height?{x:r.x,y:r.y,width:r.width,height:r.height}:null})()`;
+async function show(element){return until(async()=>{const r=await evaluate(rect(element));if(!r)return false;if(r.y>=35&&r.y+r.height<=1030)return r;await call('Input.dispatchMouseEvent',{type:'mouseWheel',x:1380,y:550,deltaX:0,deltaY:r.y<35?-600:600});return false;},'Element was not reachable with real scrolling.');}
+async function click(element){const r=await show(element),x=r.x+r.width/2,y=r.y+r.height/2;await call('Input.dispatchMouseEvent',{type:'mouseMoved',x,y});await call('Input.dispatchMouseEvent',{type:'mousePressed',x,y,button:'left',clickCount:1});await call('Input.dispatchMouseEvent',{type:'mouseReleased',x,y,button:'left',clickCount:1});}
+async function key(value){await call('Input.dispatchKeyEvent',{type:'keyDown',key:value,code:value,windowsVirtualKeyCode:value==='Tab'?9:27,nativeVirtualKeyCode:value==='Tab'?9:27});await call('Input.dispatchKeyEvent',{type:'keyUp',key:value,code:value});}
+const nav=text=>`[...document.querySelectorAll('.sidebar nav button')].find(e=>e.textContent.trim()===${JSON.stringify(text)})`;
+async function capture(name,details={}){await evaluate('document.fonts.ready.then(()=>new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(()=>r(true)))))');const {data}=await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:false,fromSurface:true});const bytes=Buffer.from(data,'base64');check(bytes.length>10000,`${name}: screenshot contains rendered content`);await writeFile(join(evidence,`${name}.png`),bytes);report.pages.push({name,image:`${name}.png`,bytes:bytes.length,...details});}
+try{
+  for(const candidate of [process.env.CHROME_PATH,'google-chrome','google-chrome-stable','chromium','chromium-browser'].filter(Boolean)){const result=spawnSync(candidate,['--version'],{encoding:'utf8',timeout:5000,windowsHide:true});if(result.status===0&&/Chrom(?:e|ium)/i.test(result.stdout)){report.browser=result.stdout.trim().slice(0,160);report.browser_binary=candidate;break;}}
+  check(!!report.browser,'Existing Chrome/Chromium --version preflight passed');await lstat(join(root,'dist/index.html'));
+  const port=await freePort(),origin=`http://127.0.0.1:${port}`;
+  server=child(process.execPath,['tests/frontend-fixture.mjs'],{...process.env,QA_PORT:String(port),QA_DIST:join(root,'dist'),QA_DEMO:'0',QA_WATCH:'0',QA_PRICE_CATALOG:''});
+  await until(async()=>{if(!live(server))throw Error(server.qaError||'Fixture exited.');return fetch(`${origin}/__qa/state`,{signal:AbortSignal.timeout(1500)}).then(r=>r.ok).catch(()=>false);},'Owned loopback fixture did not become ready.');
+  const profile=join(owned,'browser-profile');browser=child(report.browser_binary,['--headless=new','--remote-debugging-address=127.0.0.1','--remote-debugging-port=0',`--user-data-dir=${profile}`,'--window-size=1440,1040','--force-device-scale-factor=1','--disable-background-networking','--disable-component-update','--disable-domain-reliability','--disable-sync','--disable-client-side-phishing-detection','--no-first-run','--no-default-browser-check','--disable-extensions','--password-store=basic','--use-mock-keychain','--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE 127.0.0.1, EXCLUDE localhost','about:blank'],process.env);
+  const debugPort=await until(async()=>{if(!live(browser))throw Error(browser.qaError||'Browser exited.');try{return Number((await readFile(join(profile,'DevToolsActivePort'),'utf8')).split('\n')[0])||false;}catch{return false;}},'Browser CDP port was not created.');
+  const targets=await(await fetch(`http://127.0.0.1:${debugPort}/json/list`,{signal:AbortSignal.timeout(3000)})).json(),target=targets.find(item=>item.type==='page');check(!!target,'Owned browser page discovered');
+  const endpoint=new URL(target.webSocketDebuggerUrl);check(endpoint.hostname==='127.0.0.1'||endpoint.hostname==='localhost','CDP endpoint is loopback');socket=new WebSocket(endpoint);
+  await new Promise((yes,no)=>{socket.addEventListener('open',yes,{once:true});socket.addEventListener('error',()=>no(Error('CDP socket failed.')),{once:true});});
+  socket.addEventListener('message',event=>{const message=JSON.parse(event.data);if(message.id){const request=pending.get(message.id);if(request){clearTimeout(request.timer);pending.delete(message.id);message.error?request.no(Error(message.error.message)):request.yes(message.result);}return;}
+    if(message.method==='Runtime.exceptionThrown')report.browser_errors.push(String(message.params.exceptionDetails.text).slice(0,160));
+    if(message.method==='Fetch.requestPaused'){const {requestId,request}=message.params;const allowed=request.url.startsWith(origin+'/');if(!allowed)report.blocked_requests++;void call(allowed?'Fetch.continueRequest':'Fetch.failRequest',allowed?{requestId}:{requestId,errorReason:'BlockedByClient'}).catch(()=>{});}});
+  await call('Page.enable');await call('Runtime.enable');await call('Fetch.enable',{patterns:[{urlPattern:'*',requestStage:'Request'}]});await call('Emulation.setDeviceMetricsOverride',{width:1440,height:1040,deviceScaleFactor:1,mobile:false});
+  const control=async input=>{const response=await fetch(`${origin}/__qa/control`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(input),signal:AbortSignal.timeout(5000)});assert.equal(response.status,200);return response.json();};
+  const cli={detected:true,supported:true,source:'npm_user_global',current:'0.168.0',latest:'0.169.0',checked_at:Date.now(),target_token:'synthetic-install',operation:null,error:null,reason:null,progress:''};
+  const svg=q('.traffic-plot svg');
+  async function dashboard(seconds,count,patch={},expected='采集中'){
+    const now=Date.now(),points=Array.from({length:count},(_,i)=>({at:now-seconds*1000+i*seconds*1000/(count-1),receive_bps:2048+(i%5)*1600,send_bps:320+(i%3)*230,received_bytes:100000+i*10000,sent_bytes:20000+i*1000})),last=points.at(-1);
+    const traffic={...last,timestamp_ms:last.at,state:'collecting',target_count:4,partial:false,missed_bindings:0,message:null};
+    await control({reset:true,demo:false,state:{enabled:true,guard_ready:true,backend_ready:true,restart_required:false,cli_management:cli,traffic_enabled:true,traffic_service:{state:'running',version:'synthetic',error:null},traffic_history:points,traffic,...patch}});
+    const url=`${origin}/?qa=${++navigation}`;await call('Page.navigate',{url});await until(()=>evaluate(`location.href===${JSON.stringify(url)}&&document.readyState==='complete'&&${q('.traffic-chart-card .metric-label')}?.textContent.includes(${JSON.stringify(expected)})`),'Expected dashboard state was not rendered.');return points;
+  }
+  function extent(path){const xs=[...path.matchAll(/[ML]([\d.]+),/g)].map(m=>Number(m[1]));return Math.max(...xs)-Math.min(...xs);}
+  await dashboard(9,4);const warm=await evaluate(`${q('.traffic-download-line')}?.getAttribute('d')||''`);check(extent(warm)>=590,'Four valid samples across nine seconds fill the warm chart');await capture('01-dashboard-warm',{sample_count:4,span_seconds:9,path:warm});
+  await dashboard(120,61);const mature=await evaluate(`${q('.traffic-download-line')}?.getAttribute('d')||''`);check(extent(mature)>=590,'Mature chart covers the full 120-second window');await capture('02-dashboard-mature',{sample_count:61,span_seconds:120});
+  await dashboard(9,4,{enabled:false,guard_ready:false,traffic:{state:'disabled',timestamp_ms:Date.now(),partial:false}},'已随守护暂停');check(await evaluate(`[...document.querySelectorAll('.traffic-rates strong')].every(e=>e.textContent==='—')`),'Guard pause hides old rates while the preference remains enabled');await capture('03-dashboard-paused',{preference_enabled:true,guard_enabled:false,native_state:'disabled'});
+  await dashboard(120,61,{traffic:{state:'collecting',timestamp_ms:Date.now(),receive_bps:4400,send_bps:600,received_bytes:900000,sent_bytes:81000,target_count:4,partial:true,missed_bindings:2,first_missed_at:Date.now()-9000,last_missed_at:Date.now()}},'累计不完整');check(await evaluate(`!${q('.traffic-chart-card > p')}`),'Partial statistics have no duplicate long bottom paragraph');await capture('04-dashboard-partial');
+  await click(svg);await until(()=>evaluate(`document.activeElement===${svg}`),'Real pointer click did not focus the SVG.');
+  const outline=()=>evaluate(`(()=>{const e=${svg},s=getComputedStyle(e);return{style:s.outlineStyle,width:parseFloat(s.outlineWidth),color:s.outlineColor,ring:s.getPropertyValue('--focus-ring').trim(),modality:document.documentElement.dataset.inputModality}})()`);
+  const pointer=await outline();check(pointer.style==='none'&&pointer.modality==='pointer','Real pointer focus has no chart outline');await capture('05-dashboard-pointer-focus',{outline:pointer});
+  await click(nav('仪表盘'));for(let i=0;i<40;i++){await key('Tab');if(await evaluate(`document.activeElement===${svg}`))break;}
+  check(await evaluate(`document.activeElement===${svg}`),'Real Tab navigation reached the chart');const keyboard=await outline(),color=keyboard.ring.replace(/^#([a-f\d]{6})$/i,(_,h)=>`rgb(${[0,2,4].map(i=>parseInt(h.slice(i,i+2),16)).join(', ')})`);
+  check(keyboard.modality==='keyboard'&&keyboard.style==='solid'&&keyboard.width>=1&&keyboard.color===color,'Keyboard chart outline is visible and uses the theme focus ring');await capture('06-dashboard-keyboard-focus',{outline:keyboard});
+  await click(nav('代理'));const cliHeader="[...document.querySelectorAll('.target-accordion button')].find(e=>e.textContent.includes('Codex CLI'))";await click(cliHeader);await until(()=>evaluate(`${q('.cli-management')}?.getBoundingClientRect().height>0`),'CLI management panel did not open.');await show(q('.cli-management'));
+  const versions=await evaluate(`${q('.cli-version-comparison')}.textContent`);check((versions.match(/0\.169\.0/g)||[]).length===1&&!/0\.168\.0|当前版本|→/.test(versions),'CLI version area contains only one latest number');await capture('07-cli-latest',{text:versions});
+  const {version}=JSON.parse(await readFile(join(root,'package.json'),'utf8'));await control({state:{update:{status:'current',checking:true,latest:version,checked_at:Date.now(),notes:'',error:null}}});await click(nav('设置'));
+  await until(()=>evaluate(`${q('#settings-panel-home')}?.textContent.includes('正在检查更新')`),'Update checking state was not rendered.');const footer=q('.update-version-comparison');await show(footer);const before=await evaluate(rect(footer));await capture('08-update-checking',{footer:before});
+  await control({state:{update:{status:'current',checking:false,latest:version,checked_at:Date.now(),notes:'### 合成更新说明\n- 仅供界面验收。',error:null}}});await until(()=>evaluate(`${q('#release-notes')}?.getBoundingClientRect().height>0`),'Completed update notes action did not render.');const after=await evaluate(rect(footer));
+  check(Math.abs(before.height-after.height)<0.5,'Update footer height is stable before and after notes become available');check(await evaluate(`!${q('.update-notes-entry')}`),'Update notes do not add a second footer');await capture('09-update-current-notes',{footer:after});
+  check(report.browser_errors.length===0,'Browser reported no unhandled page exceptions');check(report.blocked_requests===0,'UI requested only the isolated fixture origin');report.status='passed';
+}catch(error){failed=error;report.status='failed';report.error=String(error.message).slice(0,500);report.browser_log=browser?.qaLog||browser?.qaError||null;if(socket?.readyState===WebSocket.OPEN)try{await capture('failure-state');}catch{}}
+finally{
+  try{if(socket?.readyState===WebSocket.OPEN)try{await call('Browser.close');}catch{}socket?.close();for(const request of pending.values()){clearTimeout(request.timer);request.no(Error('Owned browser closed.'));}pending.clear();const stopped=await Promise.allSettled([stop(browser),stop(server)]);assert.ok(stopped.every(result=>result.status==='fulfilled'),'Owned browser or fixture did not exit.');assert.ok(within(temporary,owned)&&await realpath(owned)===owned);await rm(owned,{recursive:true,force:false});report.cleanup='owned browser and fixture exited; only their temporary profile was removed';}catch(error){report.cleanup='owned process/profile cleanup unconfirmed';report.cleanup_error=String(error.message).slice(0,300);report.status='failed';failed??=error;}
+  report.finished_at=new Date().toISOString();await writeFile(join(evidence,'ui-evidence.json'),JSON.stringify(report,null,2)+'\n');
+}
+if(failed)throw Error(`Browser UI evidence failed: ${report.error||report.cleanup_error}`);
+console.log(`Captured ${report.pages.length} actual browser PNGs; synthetic UI checks passed.`);

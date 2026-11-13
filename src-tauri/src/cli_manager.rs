@@ -134,14 +134,17 @@ fn fetch_latest(config:&Config)->Result<String,String>{
     let version=data["version"].as_str().filter(|value|valid_version(value)).ok_or("官方 CLI 版本格式无效。")?;
     if data["name"].as_str()!=Some(PACKAGE){return Err("CLI 更新信息与官方包身份不匹配。".into())}Ok(version.into())
 }
-pub fn check()->Result<CliState,String>{
+fn check_with(read:impl FnOnce()->Result<Option<Install>,String>,fetch:impl FnOnce()->Result<String,String>)->Result<CliState,String>{
     let operation=Operation::begin("check",false)?;
-    let result=(||{let local=local_install();apply_local(&local);let _install=local?.ok_or("未检测到可管理的 Codex CLI。")?;
-        {let mut view=state().lock().unwrap_or_else(|error|error.into_inner());view.latest=None;view.checked_at=None;}
-        let config=settings::load(&settings::root()).map_err(|_|"无法读取联网配置。")?;let latest=fetch_latest(&config)?;
+    let result=(||{let local=read();apply_local(&local);let _install=local?.ok_or("未检测到可管理的 Codex CLI。")?;
+        // Retain the last verified display value for this installation. A failed
+        // recheck must not leave its old authorization timestamp usable.
+        state().lock().unwrap_or_else(|error|error.into_inner()).checked_at=None;
+        let latest=fetch()?;
         let mut view=state().lock().unwrap_or_else(|error|error.into_inner());view.latest=Some(latest);view.checked_at=Some(settings::now());view.progress="CLI 更新检查已完成。".into();Ok(())})();
     finish(result)?;drop(operation);Ok(snapshot())
 }
+pub fn check()->Result<CliState,String>{check_with(local_install,||{let config=settings::load(&settings::root()).map_err(|_|"无法读取联网配置。")?;fetch_latest(&config)})}
 #[derive(Clone,Copy)]enum Mutation{Install,Update,Uninstall}
 impl Mutation{fn name(self)->&'static str{match self{Self::Install=>"install",Self::Update=>"update",Self::Uninstall=>"uninstall"}}}
 fn mutation_args(install:&Install,action:Mutation,version:Option<&str>,scratch:&Path)->Result<Vec<String>,String>{
@@ -242,6 +245,10 @@ pub fn install(target_token:String)->Result<CliState,String>{
         let root=sandbox();let(command,prefix)=fixture(&root);let before=snapshot();
         assert!(refresh_with(||Ok(None)));assert_eq!(snapshot().source,"not_installed");
         assert!(refresh_with(||inspect_install(&command,&prefix).map(Some)));let installed=snapshot();assert!(installed.supported);assert_eq!(installed.current.as_deref(),Some("0.167.0"));assert!(installed.target_token.is_some());assert!(installed.operation.is_none());
+        {let mut view=state().lock().unwrap();view.latest=Some("0.168.0".into());view.checked_at=Some(settings::now());}
+        assert!(check_with(||inspect_install(&command,&prefix).map(Some),||Err("offline fixture".into())).is_err());let failed=snapshot();assert_eq!(failed.latest.as_deref(),Some("0.168.0"));assert!(failed.checked_at.is_none());assert_eq!(failed.error.as_deref(),Some("offline fixture"));assert!(failed.operation.is_none());
+        let recovered=check_with(||inspect_install(&command,&prefix).map(Some),||Ok("0.169.0".into())).unwrap();assert_eq!(recovered.latest.as_deref(),Some("0.169.0"));assert!(recovered.checked_at.is_some());assert!(recovered.error.is_none());
+        fs::write(&command[1],b"changed installation identity").unwrap();assert!(check_with(||inspect_install(&command,&prefix).map(Some),||Err("changed fixture".into())).is_err());assert!(snapshot().latest.is_none());assert!(snapshot().checked_at.is_none());
         let operation=Operation::begin("update",true).unwrap();assert!(!refresh_with(||panic!("Background discovery must not run during an update")));assert_eq!(snapshot().operation.as_deref(),Some("update"));drop(operation);assert!(snapshot().progress.is_empty());
         fs::remove_dir_all(prefix.join("node_modules/@openai/codex")).unwrap();assert!(refresh_with(||Ok(None)));assert!(!snapshot().supported);assert!(snapshot().target_token.is_none());
         *state().lock().unwrap()=before;fs::remove_dir_all(root).unwrap();
