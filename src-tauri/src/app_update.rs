@@ -90,11 +90,12 @@ fn client(config:&settings::Config)->Result<reqwest::blocking::Client,String>{
 fn download(client:&reqwest::blocking::Client,url:&str,path:&Path,limit:u64,report:bool)->Result<(),String>{
     if !settings::load(&settings::root()).is_ok_and(|config|config.network_enabled){return Err("联网检测已关闭，更新下载已停止。".into())}
     let mut response=crate::update::official_get(client,url)?.error_for_status().map_err(|error|error.status().map_or_else(||"官方更新附件暂不可用，请稍后重试。".into(),|status|format!("官方更新附件暂不可用（HTTP {}），尚未替换程序。",status.as_u16())))?;
-    if response.content_length().is_some_and(|n|n>limit){return Err("更新附件超过允许大小。".into())}
+    let expected_length=response.content_length();
+    if expected_length.is_some_and(|n|n>limit){return Err("更新附件超过允许大小。".into())}
     let mut file=fs::OpenOptions::new().write(true).create_new(true).open(path).map_err(|_|"无法创建下载文件。")?;
-    if report{view().lock().unwrap_or_else(|e|e.into_inner()).total=response.content_length();}
+    if report{view().lock().unwrap_or_else(|e|e.into_inner()).total=expected_length;}
     let mut checked=Instant::now();let mut bytes=0u64;let mut buffer=[0u8;65536];loop{if checked.elapsed()>=Duration::from_millis(250){if !settings::load(&settings::root()).is_ok_and(|config|config.network_enabled){return Err("联网检测已关闭，更新下载已取消。".into())}checked=Instant::now();}let n=response.read(&mut buffer).map_err(|_|"更新下载中断，尚未替换程序。")?;if n==0{break}bytes+=n as u64;if bytes>limit{return Err("更新附件超过允许大小。".into())}file.write_all(&buffer[..n]).map_err(|_|"更新下载无法写入磁盘。")?;if report{view().lock().unwrap_or_else(|e|e.into_inner()).downloaded=bytes;}}
-    if response.content_length().is_some_and(|n|n!=bytes){return Err("更新附件下载不完整。".into())}file.sync_all().map_err(|_|"更新附件未能完整保存。".into())
+    if expected_length.is_some_and(|n|n!=bytes){return Err("更新附件下载不完整。".into())}file.sync_all().map_err(|_|"更新附件未能完整保存。".into())
 }
 fn powershell()->PathBuf{PathBuf::from(std::env::var_os("SystemRoot").unwrap_or_else(||"C:\\Windows".into())).join("System32/WindowsPowerShell/v1.0/powershell.exe")}
 fn command(job:&Path,phase:&str)->Command{let mut command=Command::new(powershell());let inherited=std::env::var_os("PSModulePath");command.env("CODEX_PROXY_UPDATER_MODULES_PRESENT",if inherited.is_some(){"1"}else{"0"}).env("CODEX_PROXY_UPDATER_MODULES",inherited.unwrap_or_default());let policy=std::env::var_os("PSExecutionPolicyPreference");command.env("CODEX_PROXY_UPDATER_POLICY_PRESENT",if policy.is_some(){"1"}else{"0"}).env("CODEX_PROXY_UPDATER_POLICY",policy.unwrap_or_default());command.args(["-NoLogo","-NoProfile","-NonInteractive","-ExecutionPolicy","Bypass","-File"]).arg(job.join("installer.ps1")).args(["-Phase",phase,"-Job"]).arg(job).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).creation_flags(0x08000000);command}

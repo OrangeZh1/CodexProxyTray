@@ -144,8 +144,23 @@ jobs:
         env:
           CODEX_PROXY_PUBLIC_DOWNLOAD_PROBE_RESULT: ${{ runner.temp }}/public-download-probe.json
         run: |
-          & '${{ steps.native-tests.outputs.service_probe_executable }}' app_update::tests::published_update_download_probe --ignored --exact --test-threads=1
-          if($LASTEXITCODE -ne 0){exit $LASTEXITCODE}
+          $ErrorActionPreference='Stop'
+          $info=[Diagnostics.ProcessStartInfo]::new('${{ steps.native-tests.outputs.service_probe_executable }}')
+          $info.UseShellExecute=$false;$info.CreateNoWindow=$true;$info.WindowStyle='Hidden'
+          $info.RedirectStandardOutput=$true;$info.RedirectStandardError=$true
+          foreach($argument in @('app_update::tests::published_update_download_probe','--ignored','--exact','--test-threads=1')){$info.ArgumentList.Add($argument)}
+          $process=[Diagnostics.Process]::Start($info)
+          $stdout=$process.StandardOutput.ReadToEndAsync();$stderr=$process.StandardError.ReadToEndAsync()
+          try {
+            if(-not $process.WaitForExit(210000)){throw 'Public download probe timed out; no success is recorded.'}
+            if(-not [Threading.Tasks.Task]::WaitAll(@($stdout,$stderr),2000)){throw 'Public download diagnostic streams did not finish.'}
+            Write-Host $stdout.Result;Write-Host $stderr.Result
+            if($process.ExitCode -ne 0){throw "Public download native probe failed: $($process.ExitCode)"}
+            $path=$env:CODEX_PROXY_PUBLIC_DOWNLOAD_PROBE_RESULT
+            if(-not (Test-Path -LiteralPath $path -PathType Leaf) -or (Get-Item -LiteralPath $path).Length -gt 16384){throw 'The bounded public download result is missing.'}
+            $result=Get-Content -LiteralPath $path -Raw -Encoding utf8|ConvertFrom-Json
+            if($result.schema -ne 1 -or $result.status -cne 'passed' -or $result.sums_verified -ne $true -or $result.manifest_verified -ne $true -or $result.cleanup -cne 'passed'){throw 'Public download receipt did not pass.'}
+          } finally {$process.Dispose()}
       - name: 保存公开下载检查证据
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
