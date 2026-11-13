@@ -35,6 +35,7 @@ fn os_error() -> String { std::io::Error::last_os_error().to_string() }
     fn GetProcessTimes(process: Handle, created: *mut u64, exited: *mut u64, kernel: *mut u64, user: *mut u64) -> i32;
     fn QueryFullProcessImageNameW(process:Handle,flags:u32,name:*mut u16,length:*mut u32)->i32;
     fn GetFinalPathNameByHandleW(file:Handle,path:*mut u16,length:u32,flags:u32)->u32;
+    #[cfg(test)] fn K32GetProcessImageFileNameW(process:Handle,path:*mut u16,length:u32)->u32;
     fn GetCurrentProcess() -> Handle;
     fn GetSystemTimeAsFileTime(time:*mut u64);
     fn GetModuleHandleW(name:*const u16) -> Handle;
@@ -171,21 +172,53 @@ fn process_lifetime_lease(pid:u32)->Result<Option<ProcessLease>,String>{unsafe{
     if GetProcessId(process)!=pid||GetProcessTimes(process,&mut created,&mut exited,&mut kernel,&mut user)==0||created==0{return Err("无法核验目标进程创建身份。".into())}
     lease.identity.created_filetime=created;Ok(Some(lease))
 }}
-fn process_image_name(lease:&ProcessLease,flags:u32)->Result<String,String>{unsafe{
+#[cfg(test)]
+fn root_diagnostic(pid:u32,stage:&str,code:u32,value:u32){
+    use std::sync::atomic::{AtomicUsize,Ordering};
+    static LINES:AtomicUsize=AtomicUsize::new(0);
+    if LINES.fetch_add(1,Ordering::Relaxed)<128{eprintln!("scope_root pid={pid} stage={stage} code={code} value={value}");}
+}
+#[cfg(not(test))]
+fn root_diagnostic(_pid:u32,_stage:&str,_code:u32,_value:u32){}
+fn process_image_name(lease:&ProcessLease,flags:u32,diagnostic:bool)->Result<String,String>{unsafe{
     let mut path=vec![0u16;32768];let mut length=path.len()as u32;
-    if QueryFullProcessImageNameW(lease.handle,flags,path.as_mut_ptr(),&mut length)==0{return Err(format!("无法核验目标进程映像（PID {}，查询格式 {}，Windows 错误 {}）。",lease.identity.pid,flags,std::io::Error::last_os_error().raw_os_error().unwrap_or(0)))}
+    let success=QueryFullProcessImageNameW(lease.handle,flags,path.as_mut_ptr(),&mut length)!=0;
+    let code=if success{0}else{std::io::Error::last_os_error().raw_os_error().unwrap_or(0)as u32};
+    if diagnostic{root_diagnostic(lease.identity.pid,if flags==0{"win32_query"}else{"native_query"},code,if success{length}else{0});}
+    if !success{return Err(format!("无法核验目标进程映像（PID {}，查询格式 {}，Windows 错误 {}）。",lease.identity.pid,flags,code))}
     if length==0||length as usize>=path.len(){return Err("目标进程映像长度无效。".into())}
     path.truncate(length as usize);String::from_utf16(&path).map_err(|_|"目标进程映像编码无效。".into())
 }}
-fn process_image(lease:&ProcessLease)->Result<String,String>{process_image_name(lease,0).map(|image|crate::settings::normalized_executable(&PathBuf::from(image)))}
-fn native_file_image(path:&str)->Option<String>{
+fn process_image(lease:&ProcessLease)->Result<String,String>{process_image_name(lease,0,false).map(|image|crate::settings::normalized_executable(&PathBuf::from(image)))}
+fn native_file_image(pid:u32,path:&str)->Option<String>{
     use std::os::windows::{fs::OpenOptionsExt,io::AsRawHandle};
     // Query metadata only, preserving the executable's sharing contract. NT
     // volume paths avoid guessing drive letters, mount points or path prefixes.
-    let file=std::fs::OpenOptions::new().access_mode(0).share_mode(7).security_qos_flags(0x10000).open(path).ok()?;
+    let file=match std::fs::OpenOptions::new().access_mode(0x80).share_mode(7).security_qos_flags(0x10000).open(path){
+        Ok(file)=>{root_diagnostic(pid,"metadata_open",0,0x80);file},
+        Err(error)=>{root_diagnostic(pid,if error.kind()==std::io::ErrorKind::InvalidInput{"metadata_open_invalid_input"}else{"metadata_open"},error.raw_os_error().unwrap_or(0)as u32,0x80);return None}
+    };
     let mut buffer=vec![0u16;32768];let length=unsafe{GetFinalPathNameByHandleW(file.as_raw_handle(),buffer.as_mut_ptr(),buffer.len()as u32,2)};
-    if length==0||length as usize>=buffer.len(){return None}
-    buffer.truncate(length as usize);String::from_utf16(&buffer).ok()
+    if length==0{root_diagnostic(pid,"final_nt_query",std::io::Error::last_os_error().raw_os_error().unwrap_or(0)as u32,0);return None}
+    root_diagnostic(pid,"final_nt_query",0,length);
+    if length as usize>=buffer.len(){root_diagnostic(pid,"final_nt_length",122,length);return None}
+    buffer.truncate(length as usize);match String::from_utf16(&buffer){Ok(path)=>Some(path),Err(_)=>{root_diagnostic(pid,"final_nt_encoding",13,length);None}}
+}
+fn known_native_cli_image(pid:u32,native:&str,root:&std::path::Path,config:&crate::settings::Config,stage:&str)->bool{
+    let mut candidates=0;
+    for expected in crate::settings::cli_process_paths(root,config){
+        if !std::path::Path::new(&expected).file_name().is_some_and(|name|name.to_string_lossy().eq_ignore_ascii_case("codex.exe")){continue}
+        candidates+=1;
+        if let Some(actual)=native_file_image(pid,&expected){let matches=actual.to_lowercase()==native.to_lowercase();root_diagnostic(pid,stage,0,u32::from(matches));if matches{return true}}
+    }
+    root_diagnostic(pid,"native_candidates",0,candidates);false
+}
+#[cfg(test)]
+fn diagnose_psapi_image(lease:&ProcessLease,root:&std::path::Path,config:&crate::settings::Config){
+    let mut buffer=vec![0u16;32768];let length=unsafe{K32GetProcessImageFileNameW(lease.handle,buffer.as_mut_ptr(),buffer.len()as u32)};
+    let code=if length==0{std::io::Error::last_os_error().raw_os_error().unwrap_or(0)as u32}else{0};root_diagnostic(lease.identity.pid,"psapi_native_query",code,length);
+    if length==0||length as usize>=buffer.len(){return}buffer.truncate(length as usize);
+    if let Ok(native)=String::from_utf16(&buffer){let _=known_native_cli_image(lease.identity.pid,&native,root,config,"psapi_compare");}
 }
 /// Requested identities locate objects only: the collector must independently
 /// establish a real application root, including a GUI-held exited root object.
@@ -193,15 +226,15 @@ pub(crate) fn traffic_root_lease(root:&std::path::Path,config:&crate::settings::
     crate::traffic_core::validate_targets(&[identity])?;
     let Some(lease)=process_lifetime_lease(identity.pid)?else{return Ok(None)};
     if lease.identity!=identity{return Ok(None)}
-    let image=match process_image(&lease){
-        Ok(image)=>image,
+    let image=match process_image_name(&lease,0,true){
+        Ok(image)=>crate::settings::normalized_executable(&PathBuf::from(image)),
         Err(error)=>{
             if lease.is_running()?{return Err(error)}
             // Win32-name queries can fail after exit even while the exact
             // process object remains held. Accept only an independently read
             // native image path equal to a known CLI file's final native path.
-            let Ok(native)=process_image_name(&lease,1)else{return Ok(None)};
-            let allowed=crate::settings::cli_process_paths(root,config).iter().filter(|expected|std::path::Path::new(expected).file_name().is_some_and(|name|name.to_string_lossy().eq_ignore_ascii_case("codex.exe"))).any(|expected|native_file_image(expected).is_some_and(|actual|actual.to_lowercase()==native.to_lowercase()));
+            let Ok(native)=process_image_name(&lease,1,true)else{#[cfg(test)]diagnose_psapi_image(&lease,root,config);return Ok(None)};
+            let allowed=known_native_cli_image(identity.pid,&native,root,config,"native_compare");
             return Ok(allowed.then_some(lease))
         }
     };let path=PathBuf::from(&image);
