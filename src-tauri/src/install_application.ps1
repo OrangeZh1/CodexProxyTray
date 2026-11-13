@@ -12,7 +12,7 @@ param(
     [switch]$Silent
 )
 $ErrorActionPreference='Stop'
-$exitCode=2;$outerLock=$null;$codeLock=$null;$applicationJob=$null;$applicationResult=$null;$healthy=$false;$removalStarted=$false
+$exitCode=2;$outerLock=$null;$codeLock=$null;$applicationJob=$null;$applicationResult=$null;$healthy=$false;$removalStarted=$false;$bootstrapPhase='load_engine'
 function AppFail([string]$Text){throw $Text}
 function Full([string]$Path){if(-not $Path -or $Path.Contains([char]0) -or $Path.Contains('"')){AppFail '安装路径无效。'};[IO.Path]::GetFullPath($Path).TrimEnd('\')}
 function Within([string]$Path,[string]$Directory){$Path.StartsWith($Directory.TrimEnd('\')+'\',[StringComparison]::OrdinalIgnoreCase)}
@@ -162,14 +162,16 @@ function Uninstall {
 try {
     if(-not $UpdateEnginePath){$UpdateEnginePath=Join-Path $PSScriptRoot 'install_update.ps1'};$UpdateEnginePath=Full $UpdateEnginePath
     . $UpdateEnginePath -Phase Library
+    $bootstrapPhase='parse_plan'
     if($PlanPath){$values=InstallPlan (Full $PlanPath);foreach($name in @('Action','InstallRoot','PayloadZip','ZipSha256','Version','SourceCommit','UninstallerPath','ResultPath')){Set-Variable -Name $name -Value ([string]$values[$name]) -Scope Script};$Silent=$values.Silent -ceq '1'}
+    $bootstrapPhase='resolve_local_appdata'
     if(-not $env:LOCALAPPDATA -or -not [IO.Path]::IsPathRooted($env:LOCALAPPDATA)){AppFail '当前用户 LOCALAPPDATA 无效。'}
     $localBase=Full $env:LOCALAPPDATA;if($localBase.StartsWith('\\') -or $localBase.StartsWith('\\?\')){AppFail '安装仅支持本机用户目录。'};Plain $localBase
     $defaultRoot=Join-Path $localBase 'Programs\CodexProxyTray';$installRoot=if($InstallRoot){Full $InstallRoot}else{Full $defaultRoot};if($installRoot -ine (Full $defaultRoot)){AppFail '安装根目录必须是当前用户 Programs\CodexProxyTray，未接受其他目录。'}
     $data=Join-Path $localBase 'CodexProxyTray';if((Within $data $installRoot) -or (Within $installRoot $data) -or $data -ieq $installRoot){AppFail '代码目录与用户数据目录不得重叠。'}
-    PlainParent $data;[void][IO.Directory]::CreateDirectory($data);Plain $data;$ownerSid=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    $bootstrapPhase='create_data_root';PlainParent $data;[void][IO.Directory]::CreateDirectory($data);Plain $data;$ownerSid=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value
     $outerLock=[IO.File]::Open((Join-Path $data 'application-install.lock'),'OpenOrCreate','ReadWrite','None')
-    $jobs=Join-Path $data 'installations';PlainParent $jobs;[void][IO.Directory]::CreateDirectory($jobs);$applicationJob=Join-Path $jobs ($PID.ToString()+'-'+[DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds());[void][IO.Directory]::CreateDirectory($applicationJob);Event 'preflight'
+    $jobs=Join-Path $data 'installations';PlainParent $jobs;[void][IO.Directory]::CreateDirectory($jobs);$applicationJob=Join-Path $jobs ($PID.ToString()+'-'+[DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds());[void][IO.Directory]::CreateDirectory($applicationJob);$bootstrapPhase='preflight';Event 'preflight'
     $target=Join-Path $installRoot 'current';$previous=Join-Path $installRoot 'previous';$exe=Join-Path $target 'CodexProxyTray.exe';$uninstaller=Join-Path $installRoot 'uninstall.exe';$activePath=Join-Path $installRoot 'active-version.json';$journalPath=Join-Path $installRoot 'install-journal.json';$plan=@{version=$Version;launch_background=[bool]$Silent}
     if($Action -ceq 'Install'){
         [void](Helpers -RejectForeign);if($Version -cnotmatch '^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$' -or $SourceCommit -cnotmatch '^[a-f0-9]{40}$' -or $ZipSha256 -cnotmatch '^[a-f0-9]{64}$'){AppFail '安装器版本或来源参数无效。'}
@@ -181,6 +183,6 @@ try {
     }else{if(-not(Test-Path -LiteralPath $installRoot -PathType Container)){AppFail '安装归属记录缺失，未执行卸载。'};Plain $installRoot;[void](Owned -Removing);TakeCodeLock;Uninstall}
 }catch {
     $message=$_.Exception.Message;if($message.Length -gt 2000){$message=$message.Substring(0,2000)};$phase=if($healthy){'installed_cleanup_pending'}elseif($removalStarted){'uninstall_cleanup_pending'}else{'error'};$exitCode=if($phase -like '*cleanup_pending'){3}else{2}
-    try{if($applicationJob){SaveOutcome $phase $message}}catch{[Console]::Error.WriteLine('安装结果保存未完成，原恢复材料已保留。')};[Console]::Error.WriteLine($message)
+    try{if($applicationJob){SaveOutcome $phase $message}}catch{[Console]::Error.WriteLine('安装结果保存未完成，原恢复材料已保留。')};[Console]::Error.WriteLine('CodexProxyTray.Installation stage='+$bootstrapPhase+'; '+$message)
 }finally{ReleaseCodeLock;if($outerLock){$outerLock.Dispose()}}
 exit $exitCode

@@ -24,9 +24,20 @@ function Hash([string]$Path){(Get-FileHash -LiteralPath $Path -Algorithm SHA256)
 function WriteJson([string]$Path,$Value){[IO.File]::WriteAllText($Path,($Value|ConvertTo-Json -Depth 16),[Text.UTF8Encoding]::new($false))}
 function RunInstaller([string]$File,[string[]]$Arguments=@('/S')){
     $info=[Diagnostics.ProcessStartInfo]::new($File);$info.UseShellExecute=$false;$info.CreateNoWindow=$true;$info.WindowStyle='Hidden';$info.WorkingDirectory=[IO.Path]::GetDirectoryName($File)
+    $info.RedirectStandardOutput=$true;$info.RedirectStandardError=$true;$info.StandardOutputEncoding=[Text.Encoding]::Unicode
     foreach($argument in $Arguments){$info.ArgumentList.Add($argument)}
     $process=[Diagnostics.Process]::Start($info)
-    try{if(-not $process.WaitForExit(120000)){throw 'installer_timeout_preserved'};CaptureOutcome $process.ExitCode;return $process.ExitCode}finally{$process.Dispose()}
+    $stdout=$process.StandardOutput.ReadToEndAsync();$stderr=$process.StandardError.ReadToEndAsync()
+    try{
+        if(-not $process.WaitForExit(120000)){throw 'installer_timeout_preserved'}
+        CaptureOutcome $process.ExitCode
+        # A resident child must not make diagnostic collection wait indefinitely.
+        [void][Threading.Tasks.Task]::WaitAll(@($stdout,$stderr),2000)
+        $diagnostic=(@($stdout,$stderr)|ForEach-Object {if($_.IsCompletedSuccessfully){$_.Result}else{'<diagnostic stream not completed>'}}) -join "`n"
+        foreach($prefix in @($installRoot,$data,$work)){if($prefix){$diagnostic=$diagnostic.Replace($prefix,'<owned-path>')}};$diagnostic=[regex]::Replace($diagnostic,'S-\d-(?:\d+-)*\d+','<SID>')
+        if($diagnostic.Length -gt 4096){$diagnostic=$diagnostic.Substring(0,4096)};$report.outcomes[-1]['bootstrap_output']=$diagnostic
+        return $process.ExitCode
+    }finally{$process.Dispose()}
 }
 function CaptureOutcome([int]$ExitCode){
     $path=Join-Path $data 'installation-result-v1.json'
@@ -123,7 +134,8 @@ try {
     $logHash=Hash $logSentinel;$usageHash=Hash $usageSentinel
     [void][IO.Directory]::CreateDirectory($installRoot);$ownedRoot=$true
     $unknown=Join-Path $installRoot 'user-notes.txt';[IO.File]::WriteAllText($unknown,'synthetic unknown root file')
-    Require ((RunInstaller $setup) -ne 0 -and [IO.File]::ReadAllText($unknown) -ceq 'synthetic unknown root file' -and -not (Test-Path -LiteralPath $reg)) 'unknown_first_install_directory_refused'
+    $rejected=RunInstaller $setup;$rejectedOutcome=$report.outcomes[-1]
+    Require ($rejected -ne 0 -and $rejectedOutcome.status -ceq 'failed' -and $rejectedOutcome.phase -ceq 'error' -and $rejectedOutcome.error -match '目标目录非空且没有本产品归属记录' -and [IO.File]::ReadAllText($unknown) -ceq 'synthetic unknown root file' -and -not (Test-Path -LiteralPath $reg)) 'unknown_first_install_directory_refused_by_real_backend'
     [IO.File]::Delete($unknown);[IO.Directory]::Delete($installRoot)
     Require ((RunInstaller $setup) -eq 0) 'fresh_standard_install_succeeds'
     $successfulInstall=$true

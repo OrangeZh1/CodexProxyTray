@@ -36,24 +36,60 @@ Var BackendExit
 Var BackendCommand
 Var BackendOutput
 Var SystemPowerShell
+Var BootstrapText
+Var BootstrapCount
+Var BootstrapBom
 
-!macro CaptureEnvironment Original Present Value
-  System::Call 'kernel32::SetLastError(i 0)'
-  System::Call 'kernel32::GetEnvironmentVariableW(w "${Original}", p 0, i 0) i.r0'
+!macro DefineBootstrapDiagnostic Prefix
+Function ${Prefix}BootstrapDiagnostic
+  Push $8
+  Push $9
+  StrCpy $BootstrapText $BootstrapText 400
+  DetailPrint $BootstrapText
+  ${If} $BootstrapCount < 10
+    System::Call 'kernel32::GetStdHandle(i -11) p.r9'
+    System::Call 'kernel32::GetFileType(p r9) i.r8'
+    ${If} $8 == 1
+    ${OrIf} $8 == 3
+      ; Borrow the caller's redirected stdout. Do not close it or open a console.
+      ; /BOM uses seeking; emit the first UTF16 BOM directly so pipes work too.
+      ${If} $BootstrapBom != 1
+        FileWriteWord $9 0xFEFF
+        StrCpy $BootstrapBom 1
+      ${EndIf}
+      FileWriteUTF16LE $9 "$BootstrapText$\r$\n"
+      IntOp $BootstrapCount $BootstrapCount + 1
+    ${EndIf}
+  ${EndIf}
+  Pop $9
+  Pop $8
+FunctionEnd
+!macroend
+!insertmacro DefineBootstrapDiagnostic ""
+!insertmacro DefineBootstrapDiagnostic "un."
+
+!macro CaptureEnvironment Original Present Value Prefix
+  System::Call 'kernel32::GetEnvironmentVariableW(w "${Original}", p 0, i 0) i.r0 ?e'
+  Pop $1
   ${If} $0 == 0
-    System::Call 'kernel32::GetLastError() i.r1'
     ${If} $1 == 203
-      System::Call 'kernel32::SetEnvironmentVariableW(w "${Present}", w "0") i.r3'
+      System::Call 'kernel32::SetEnvironmentVariableW(w "${Present}", w "0") i.r3 ?e'
+      Pop $1
       System::Call 'kernel32::SetEnvironmentVariableW(w "${Value}", p 0)'
     ${ElseIf} $1 == 0
-      System::Call 'kernel32::SetEnvironmentVariableW(w "${Present}", w "1") i.r3'
+      System::Call 'kernel32::SetEnvironmentVariableW(w "${Present}", w "1") i.r3 ?e'
+      Pop $1
       System::Call 'kernel32::SetEnvironmentVariableW(w "${Value}", w "")'
     ${Else}
+      StrCpy $BootstrapText "stage=capture;variable=${Original};operation=query;return=$0;winerror=$1"
+      Call ${Prefix}BootstrapDiagnostic
       SetErrorLevel 2
       Abort
     ${EndIf}
   ${Else}
     ${If} $0 > 32768
+      StrCpy $BootstrapText "stage=capture;variable=${Original};operation=size;length=$0"
+      Call ${Prefix}BootstrapDiagnostic
       SetErrorLevel 2
       Abort
     ${EndIf}
@@ -61,35 +97,69 @@ Var SystemPowerShell
     System::Alloc $1
     Pop $2
     ${If} $2 == 0
+      StrCpy $BootstrapText "stage=capture;variable=${Original};operation=allocate;failed=1"
+      Call ${Prefix}BootstrapDiagnostic
       SetErrorLevel 2
       Abort
     ${EndIf}
-    System::Call 'kernel32::SetLastError(i 0)'
-    System::Call 'kernel32::GetEnvironmentVariableW(w "${Original}", p r2, i r0) i.r3'
-    System::Call 'kernel32::GetLastError() i.r1'
+    System::Call 'kernel32::GetEnvironmentVariableW(w "${Original}", p r2, i r0) i.r3 ?e'
+    Pop $1
     ${If} $3 >= $0
-    ${OrIf} $1 != 0
       System::Free $2
+      StrCpy $BootstrapText "stage=capture;variable=${Original};operation=read;return=$3;capacity=$0;winerror=$1"
+      Call ${Prefix}BootstrapDiagnostic
       SetErrorLevel 2
       Abort
     ${EndIf}
-    System::Call 'kernel32::SetEnvironmentVariableW(w "${Value}", p r2) i.r3'
+    ${If} $3 == 0
+    ${AndIf} $1 != 0
+      System::Free $2
+      StrCpy $BootstrapText "stage=capture;variable=${Original};operation=read;return=$3;winerror=$1"
+      Call ${Prefix}BootstrapDiagnostic
+      SetErrorLevel 2
+      Abort
+    ${EndIf}
+    ; A positive return is success; its LastError may be an unrelated stale value.
+    System::Call 'kernel32::SetEnvironmentVariableW(w "${Value}", p r2) i.r3 ?e'
+    Pop $1
     System::Free $2
     ${If} $3 == 0
+      StrCpy $BootstrapText "stage=capture;variable=${Original};operation=copy;return=$3;winerror=$1"
+      Call ${Prefix}BootstrapDiagnostic
       SetErrorLevel 2
       Abort
     ${EndIf}
-    System::Call 'kernel32::SetEnvironmentVariableW(w "${Present}", w "1") i.r3'
+    System::Call 'kernel32::SetEnvironmentVariableW(w "${Present}", w "1") i.r3 ?e'
+    Pop $1
   ${EndIf}
   ${If} $3 == 0
+    StrCpy $BootstrapText "stage=capture;variable=${Original};operation=presence;return=$3;winerror=$1"
+    Call ${Prefix}BootstrapDiagnostic
     SetErrorLevel 2
     Abort
   ${EndIf}
 !macroend
 
-!macro CaptureOriginalEnvironment
-  !insertmacro CaptureEnvironment PSModulePath CODEX_PROXY_UPDATER_MODULES_PRESENT CODEX_PROXY_UPDATER_MODULES
-  !insertmacro CaptureEnvironment PSExecutionPolicyPreference CODEX_PROXY_UPDATER_POLICY_PRESENT CODEX_PROXY_UPDATER_POLICY
+!macro CaptureOriginalEnvironment Prefix
+  StrCpy $BootstrapText "stage=environment-capture-start"
+  Call ${Prefix}BootstrapDiagnostic
+  !insertmacro CaptureEnvironment PSModulePath CODEX_PROXY_UPDATER_MODULES_PRESENT CODEX_PROXY_UPDATER_MODULES "${Prefix}"
+  !insertmacro CaptureEnvironment PSExecutionPolicyPreference CODEX_PROXY_UPDATER_POLICY_PRESENT CODEX_PROXY_UPDATER_POLICY "${Prefix}"
+  StrCpy $BootstrapText "stage=environment-capture-complete"
+  Call ${Prefix}BootstrapDiagnostic
+!macroend
+
+!macro EmitBackendResult Prefix
+  StrCpy $BootstrapText "stage=backend-return;return=$BackendExit"
+  Call ${Prefix}BootstrapDiagnostic
+  ${If} $BackendExit != 0
+    StrCpy $BootstrapText "backend-output-1=$BackendOutput" 400
+    Call ${Prefix}BootstrapDiagnostic
+    StrCpy $BootstrapText $BackendOutput 400 382
+    Call ${Prefix}BootstrapDiagnostic
+    StrCpy $BootstrapText $BackendOutput 400 782
+    Call ${Prefix}BootstrapDiagnostic
+  ${EndIf}
 !macroend
 
 !macro ClearPrivateEnvironment
@@ -151,7 +221,7 @@ Section "安装"
   File /oname=install_application.ps1 "${ENGINE_PATH}"
   File /oname=install_update.ps1 "${UPDATE_ENGINE_PATH}"
   WriteUninstaller "$PLUGINSDIR\uninstall.exe"
-  !insertmacro CaptureOriginalEnvironment
+  !insertmacro CaptureOriginalEnvironment ""
   IfSilent install_quiet install_interactive
 install_quiet:
   !insertmacro WriteApplicationPlan Install 1
@@ -160,10 +230,13 @@ install_interactive:
   !insertmacro WriteApplicationPlan Install 0
 install_plan_ready:
   StrCpy $BackendCommand '$"$SystemPowerShell$" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $"$PLUGINSDIR\install_application.ps1$" -PlanPath $"$PLUGINSDIR\plan.ini$"'
+  StrCpy $BootstrapText "stage=plan-ready;launcher=sysnative64"
+  Call BootstrapDiagnostic
   ; nsExec uses a hidden console. No TIMEOUT: never kill an installation transaction for quiet output.
   nsExec::ExecToStack $BackendCommand
   Pop $BackendExit
   Pop $BackendOutput
+  !insertmacro EmitBackendResult ""
   StrCmp $BackendExit "error" backend_launch_failed
   StrCmp $BackendExit "timeout" backend_unexpected_timeout
   StrCmp $BackendExit "0" backend_return_valid
@@ -204,12 +277,15 @@ Section "Uninstall"
   SetOutPath "$PLUGINSDIR"
   File /oname=install_application.ps1 "${ENGINE_PATH}"
   File /oname=install_update.ps1 "${UPDATE_ENGINE_PATH}"
-  !insertmacro CaptureOriginalEnvironment
+  !insertmacro CaptureOriginalEnvironment "un."
   !insertmacro WriteApplicationPlan Uninstall 1
   StrCpy $BackendCommand '$"$SystemPowerShell$" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $"$PLUGINSDIR\install_application.ps1$" -PlanPath $"$PLUGINSDIR\plan.ini$"'
+  StrCpy $BootstrapText "stage=plan-ready;launcher=sysnative64"
+  Call un.BootstrapDiagnostic
   nsExec::ExecToStack $BackendCommand
   Pop $BackendExit
   Pop $BackendOutput
+  !insertmacro EmitBackendResult "un."
   StrCmp $BackendExit "error" uninstall_launch_failed
   StrCmp $BackendExit "timeout" uninstall_unexpected_timeout
   StrCmp $BackendExit "0" uninstall_return_valid
