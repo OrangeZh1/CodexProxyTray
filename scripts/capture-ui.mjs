@@ -40,7 +40,14 @@ try{
   await until(async()=>{if(!live(server))throw Error(server.qaError||'Fixture exited.');return fetch(`${origin}/__qa/state`,{signal:AbortSignal.timeout(1500)}).then(r=>r.ok).catch(()=>false);},'Owned loopback fixture did not become ready.');
   const profile=join(owned,'browser-profile');browser=child(report.browser_binary,['--headless=new','--remote-debugging-address=127.0.0.1','--remote-debugging-port=0',`--user-data-dir=${profile}`,'--window-size=1440,1040','--force-device-scale-factor=1','--disable-background-networking','--disable-component-update','--disable-domain-reliability','--disable-sync','--disable-client-side-phishing-detection','--no-first-run','--no-default-browser-check','--disable-extensions','--password-store=basic','--use-mock-keychain','--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE 127.0.0.1, EXCLUDE localhost','about:blank'],process.env);
   const debugPort=await until(async()=>{if(!live(browser))throw Error(browser.qaError||'Browser exited.');try{return Number((await readFile(join(profile,'DevToolsActivePort'),'utf8')).split('\n')[0])||false;}catch{return false;}},'Browser CDP port was not created.');
-  const targets=await(await fetch(`http://127.0.0.1:${debugPort}/json/list`,{signal:AbortSignal.timeout(3000)})).json(),target=targets.find(item=>item.type==='page');check(!!target,'Owned browser page discovered');
+  // DevToolsActivePort can precede the HTTP target list becoming ready.
+  // Wait for this owned browser only; UI assertions below are never retried.
+  report.browser_target_list_attempts=0;
+  const target=await until(async()=>{
+    if(!live(browser))throw Error(browser.qaError||'Browser exited before its target list became ready.');
+    report.browser_target_list_attempts++;
+    try{const response=await fetch(`http://127.0.0.1:${debugPort}/json/list`,{signal:AbortSignal.timeout(1500)});if(!response.ok)return false;const targets=await response.json();return Array.isArray(targets)&&targets.find(item=>item.type==='page');}catch{return false;}
+  },'Owned browser target list did not become ready.');check(!!target,'Owned browser page discovered');
   const endpoint=new URL(target.webSocketDebuggerUrl);check(endpoint.hostname==='127.0.0.1'||endpoint.hostname==='localhost','CDP endpoint is loopback');socket=new WebSocket(endpoint);
   await new Promise((yes,no)=>{socket.addEventListener('open',yes,{once:true});socket.addEventListener('error',()=>no(Error('CDP socket failed.')),{once:true});});
   socket.addEventListener('message',event=>{const message=JSON.parse(event.data);if(message.id){const request=pending.get(message.id);if(request){clearTimeout(request.timer);pending.delete(message.id);message.error?request.no(Error(message.error.message)):request.yes(message.result);}return;}
