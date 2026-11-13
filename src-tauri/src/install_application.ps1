@@ -183,7 +183,7 @@ try {
         if(Test-Path -LiteralPath (Join-Path $installRoot 'installation.json')){$owned=Owned;Upgrade $owned}else{Initialise}
     }else{if(-not(Test-Path -LiteralPath $installRoot -PathType Container)){AppFail '安装归属记录缺失，未执行卸载。'};Plain $installRoot;[void](Owned -Removing);TakeCodeLock;Uninstall}
 }catch {
-    $message=$_.Exception.Message;if($message.Length -gt 2000){$message=$message.Substring(0,2000)};$phase=if($healthy){'installed_cleanup_pending'}elseif($removalStarted){'uninstall_cleanup_pending'}else{'error'};$exitCode=if($phase -like '*cleanup_pending'){3}else{2}
-    try{if($applicationJob){SaveOutcome $phase $message}}catch{[Console]::Error.WriteLine('安装结果保存未完成，原恢复材料已保留。')};[Console]::Error.WriteLine('CodexProxyTray.Installation stage='+$bootstrapPhase+'; '+$message)
+    $message=$_.Exception.Message;if($message.Length -gt 2000){$message=$message.Substring(0,2000)};$outcomePhase=if($healthy){'installed_cleanup_pending'}elseif($removalStarted){'uninstall_cleanup_pending'}else{'error'};$exitCode=if($outcomePhase -like '*cleanup_pending'){3}else{2}
+    try{if($applicationJob){SaveOutcome $outcomePhase $message}}catch{[Console]::Error.WriteLine('安装结果保存未完成，原恢复材料已保留。')};[Console]::Error.WriteLine('CodexProxyTray.Installation stage='+$bootstrapPhase+'; '+$message)
 }finally{ReleaseCodeLock;if($outerLock){$outerLock.Dispose()}}
 exit $exitCode
