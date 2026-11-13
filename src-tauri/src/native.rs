@@ -23,6 +23,8 @@ fn os_error() -> String { std::io::Error::last_os_error().to_string() }
     fn GetPackagePathByFullName(name: *const u16, length: *mut u32, path: *mut u16) -> i32;
     fn GetPackageFamilyName(process: Handle, length: *mut u32, family: *mut u16) -> i32;
     fn OpenProcess(access: u32, inherit: i32, pid: u32) -> Handle;
+    fn GetProcessId(process: Handle) -> u32;
+    fn WaitForSingleObject(handle: Handle, milliseconds: u32) -> u32;
     fn OpenThread(access: u32, inherit: i32, tid: u32) -> Handle;
     fn GetProcessIdOfThread(thread: Handle) -> u32;
     fn ResumeThread(thread: Handle) -> u32;
@@ -109,23 +111,42 @@ pub fn desktop_info() -> Option<DesktopInfo> { unsafe {
 pub(crate) struct ProcessLease{pub identity:crate::traffic_core::ProcessIdentity,handle:Handle}
 unsafe impl Send for ProcessLease{} unsafe impl Sync for ProcessLease{}
 impl ProcessLease{
-    fn allows_child(&self,child_created:u64)->bool{unsafe{let(mut created,mut exited,mut kernel,mut user)=(0,0,0,0);GetProcessTimes(self.handle,&mut created,&mut exited,&mut kernel,&mut user)!=0&&created==self.identity.created_filetime&&child_created>=created&&(exited==0||child_created<=exited)}}
+    pub(crate) fn is_running(&self)->Result<bool,String>{unsafe{match WaitForSingleObject(self.handle,0){258=>Ok(true),0=>Ok(false),_=>Err("无法核验目标进程的存活状态。".into())}}}
+    pub(crate) fn reopen_running(&self)->Result<Option<Self>,String>{
+        if !self.is_running()?{return Ok(None)}
+        let Some(lease)=process_lifetime_lease(self.identity.pid)?else{return Ok(None)};
+        if lease.identity!=self.identity||!lease.is_running()?{return Ok(None)}Ok(Some(lease))
+    }
+    fn allows_child(&self,child_created:u64)->bool{unsafe{
+        // Exit time is defined only once the process object is signaled. Keep
+        // the exact parent object and verify both ends of its real lifetime.
+        let Ok(running)=self.is_running()else{return false};
+        let(mut created,mut exited,mut kernel,mut user)=(0,0,0,0);
+        GetProcessTimes(self.handle,&mut created,&mut exited,&mut kernel,&mut user)!=0&&created==self.identity.created_filetime&&child_created>=created&&(running||exited>=created&&child_created<=exited)
+    }}
     pub(crate) fn as_handle(&self)->*mut c_void{self.handle}
 }
 impl Drop for ProcessLease{fn drop(&mut self){unsafe{CloseHandle(self.handle);}}}
 pub fn traffic_targets(root:&std::path::Path,config:&crate::settings::Config)->Result<Vec<crate::traffic_core::ProcessIdentity>,String>{traffic_targets_held(root,config).map(|leases|leases.into_iter().map(|lease|lease.identity).collect())}
 pub(crate) fn traffic_targets_held(root:&std::path::Path,config:&crate::settings::Config)->Result<Vec<ProcessLease>,String>{traffic_targets_with_anchors(root,config,&[])}
 pub(crate) fn traffic_targets_with_anchors(root:&std::path::Path,config:&crate::settings::Config,anchors:&[&ProcessLease])->Result<Vec<ProcessLease>,String>{unsafe{
+    if anchors.len()>4096{return Err("进程交接保留数量超过允许上限。".into())}
     let mut snapshot_started=0;GetSystemTimeAsFileTime(&mut snapshot_started);
     let snapshot=CreateToolhelp32Snapshot(2,0);if snapshot as isize == -1{return Err(os_error())}
     let mut entry:ProcessEntry=std::mem::zeroed();entry.size=std::mem::size_of::<ProcessEntry>()as u32;let mut rows=vec![];
     let mut more=Process32FirstW(snapshot,&mut entry);while more!=0{rows.push((entry.pid,entry.parent,string(&entry.exe)));more=Process32NextW(snapshot,&mut entry);}CloseHandle(snapshot);
     let allowed=crate::settings::cli_process_paths(root,config);let mut identified=std::collections::BTreeMap::new();let mut selected=std::collections::BTreeSet::new();let mut leases=std::collections::BTreeMap::new();
     let held=anchors.iter().map(|lease|(lease.identity.pid,*lease)).collect::<std::collections::BTreeMap<_,_>>();
-    for lease in anchors{identified.insert(lease.identity.pid,lease.identity);selected.insert(lease.identity.pid);}
+    for lease in anchors{
+        if identified.insert(lease.identity.pid,lease.identity).is_some_and(|previous|previous!=lease.identity){return Err("保留的目标进程身份发生冲突。".into())}
+        selected.insert(lease.identity.pid);
+        // Return exact live anchors as discoveries, including generic children,
+        // so their proof remains current while that same process is alive.
+        if let Some(current)=lease.reopen_running()?{leases.insert(current.identity.pid,current);}
+    }
     for &(pid,_,ref name) in &rows{
         if !name.eq_ignore_ascii_case("ChatGPT.exe")&&!name.eq_ignore_ascii_case("codex.exe"){continue}
-        if let Some((identity,image,desktop,lease))=process_identity_with_lease(pid){if desktop||allowed.iter().any(|path|path==&image){selected.insert(pid);}identified.insert(pid,identity);leases.insert(pid,lease);}
+        if let Some((identity,image,desktop,lease))=process_identity_with_lease(pid){if name.eq_ignore_ascii_case("ChatGPT.exe")&&desktop||name.eq_ignore_ascii_case("codex.exe")&&allowed.iter().any(|path|path==&image){selected.insert(pid);}identified.insert(pid,identity);leases.insert(pid,lease);}
     }
     // Anchored parent identities cannot be reused; child creation must fall within
     // the real parent lifetime, including a parent that exited during discovery.
@@ -138,12 +159,34 @@ pub(crate) fn traffic_targets_with_anchors(root:&std::path::Path,config:&crate::
 }}
 pub(crate) unsafe fn process_identity(pid:u32)->Option<(crate::traffic_core::ProcessIdentity,String,bool)>{process_identity_with_lease(pid).map(|(identity,image,desktop,_)|(identity,image,desktop))}
 pub(crate) unsafe fn process_identity_with_lease(pid:u32)->Option<(crate::traffic_core::ProcessIdentity,String,bool,ProcessLease)>{
-    let process=OpenProcess(0x101000,0,pid);if process.is_null(){return None}
-    let mut path=vec![0u16;32768];let mut length=path.len()as u32;let(mut created,mut exited,mut kernel,mut user)=(0,0,0,0);
-    let valid=QueryFullProcessImageNameW(process,0,path.as_mut_ptr(),&mut length)!=0&&GetProcessTimes(process,&mut created,&mut exited,&mut kernel,&mut user)!=0&&created!=0&&exited==0;
-    let desktop=valid&&family_matches(process);if !valid{CloseHandle(process);return None}
-    path.truncate(length as usize);let image=crate::settings::normalized_executable(&PathBuf::from(String::from_utf16_lossy(&path)));
-    let identity=crate::traffic_core::ProcessIdentity{pid,created_filetime:created};Some((identity,image,desktop,ProcessLease{identity,handle:process}))
+    let lease=process_lifetime_lease(pid).ok()??;if !lease.is_running().ok()?{return None}
+    let image=process_image(&lease).ok()?;let desktop=family_matches(lease.handle);
+    Some((lease.identity,image,desktop,lease))
+}
+fn process_lifetime_lease(pid:u32)->Result<Option<ProcessLease>,String>{unsafe{
+    let process=OpenProcess(0x101000,0,pid);if process.is_null(){let error=std::io::Error::last_os_error();return if error.raw_os_error()==Some(87){Ok(None)}else{Err(format!("无法打开目标进程身份：{error}"))}}
+    let mut lease=ProcessLease{identity:crate::traffic_core::ProcessIdentity{pid,created_filetime:0},handle:process};
+    let(mut created,mut exited,mut kernel,mut user)=(0,0,0,0);
+    if GetProcessId(process)!=pid||GetProcessTimes(process,&mut created,&mut exited,&mut kernel,&mut user)==0||created==0{return Err("无法核验目标进程创建身份。".into())}
+    lease.identity.created_filetime=created;Ok(Some(lease))
+}}
+fn process_image(lease:&ProcessLease)->Result<String,String>{unsafe{
+    let mut path=vec![0u16;32768];let mut length=path.len()as u32;
+    if QueryFullProcessImageNameW(lease.handle,0,path.as_mut_ptr(),&mut length)==0{return Err(format!("无法核验目标进程映像（PID {}，Windows 错误 {}）。",lease.identity.pid,std::io::Error::last_os_error().raw_os_error().unwrap_or(0)))}
+    if length==0||length as usize>=path.len(){return Err("目标进程映像长度无效。".into())}
+    path.truncate(length as usize);Ok(crate::settings::normalized_executable(&PathBuf::from(String::from_utf16_lossy(&path))))
+}}
+/// Requested identities locate objects only: the collector must independently
+/// establish a real application root, including a GUI-held exited root object.
+pub(crate) fn traffic_root_lease(root:&std::path::Path,config:&crate::settings::Config,identity:crate::traffic_core::ProcessIdentity)->Result<Option<ProcessLease>,String>{
+    crate::traffic_core::validate_targets(&[identity])?;
+    let Some(lease)=process_lifetime_lease(identity.pid)?else{return Ok(None)};
+    if lease.identity!=identity{return Ok(None)}
+    lease.is_running()?;
+    let image=process_image(&lease)?;let path=PathBuf::from(&image);
+    let name=path.file_name().and_then(|value|value.to_str()).unwrap_or("");
+    let allowed=name.eq_ignore_ascii_case("ChatGPT.exe")&&family_matches(lease.handle)||name.eq_ignore_ascii_case("codex.exe")&&crate::settings::cli_process_paths(root,config).iter().any(|expected|expected==&image);
+    Ok(allowed.then_some(lease))
 }
 
 pub fn memory_bytes()->Option<u64>{unsafe{let mut counters:MemoryCounters=std::mem::zeroed();let size=std::mem::size_of::<MemoryCounters>()as u32;counters.size=size;if GetProcessMemoryInfo(GetCurrentProcess(),&mut counters,size)!=0{Some(counters.working as u64)}else{None}}}

@@ -19,8 +19,8 @@ const PRODUCT:&str="CodexProxyTray.TrafficService";
 const FILE_SDDL:&str="O:BAG:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)";
 const PROTOCOL:u32=2;
 // Independent of the GUI release. Raise the minimum only for required helper fixes.
-const SERVICE_VERSION:&str="1.0.0";
-const MIN_SERVICE_VERSION:&str="1.0.0";
+const SERVICE_VERSION:&str="1.0.1";
+const MIN_SERVICE_VERSION:&str="1.0.1";
 const MAX_FRAME:usize=4096;
 static SELF_HASH:OnceLock<Result<String,String>>=OnceLock::new();
 static STOP:AtomicBool=AtomicBool::new(false);
@@ -271,9 +271,13 @@ impl UserContext{
         let end=buffer.iter().position(|&value|value==0).ok_or("用户配置目录无效。")?;let base=PathBuf::from(OsString::from_wide(&buffer[..end]));
         let text=base.to_string_lossy().to_ascii_lowercase();if !base.is_absolute()||text.starts_with(r"\\?\unc\")||(text.starts_with(r"\\")&&!text.starts_with(r"\\?\")){return Err("辅助服务只读取本机用户配置。".into())}Ok(base.join("CodexProxyTray"))
     }}
-    fn targets(&self,root:&Path,anchors:&[&crate::native::ProcessLease])->Result<Vec<crate::native::ProcessLease>,String>{
+    fn targets(&self,root:&Path,anchors:&[&crate::native::ProcessLease],requested:&[ProcessIdentity],owner:&str)->Result<Vec<crate::native::ProcessLease>,String>{
         let _user=Impersonation::begin(self.0.0)?;
-        let config=scope_config(root)?;crate::native::traffic_targets_with_anchors(root,&config,anchors)
+        let config=scope_config(root)?;let mut roots=Vec::new();
+        // Requested identities are lookup hints only. The service reopens and verifies the
+        // real root object, including a root that exited after the GUI retained its handle.
+        for &identity in requested{if let Some(lease)=crate::native::traffic_root_lease(root,&config,identity)?{if lease_belongs_to(&lease,owner){roots.push(lease);}}}
+        let all=anchors.iter().copied().chain(roots.iter()).collect::<Vec<_>>();let mut discovered=crate::native::traffic_targets_with_anchors(root,&config,&all)?;discovered.extend(roots);Ok(discovered)
     }
 }
 #[derive(Deserialize)]struct ScopeConfig{#[serde(default)]cli_command:Vec<String>}
@@ -294,13 +298,19 @@ pub(crate) struct CollectorScope{
 impl CollectorScope{
     pub(crate) fn new(parent:HANDLE)->Result<Self,String>{let owner_sid=process_sid(parent)?;let user=UserContext::from_parent(parent)?;let root=user.root()?;Ok(Self{user,root,owner_sid,allowed:HashMap::new(),missed:HashSet::new(),first_missed:None,last_missed:None})}
     pub(crate) fn targets(&mut self,requested:&[ProcessIdentity])->Result<Vec<ProcessIdentity>,String>{
-        crate::traffic_core::validate_targets(requested)?;let now=Instant::now();self.allowed.retain(|_,(seen,_)|now.saturating_duration_since(*seen)<Duration::from_secs(60));
-        let anchors=self.allowed.values().map(|(_,lease)|lease).collect::<Vec<_>>();let discovered=self.user.targets(&self.root,&anchors)?;
+        crate::traffic_core::validate_targets(requested)?;let now=Instant::now();let mut expired=Vec::new();
+        for (&identity,(seen,lease)) in &mut self.allowed{
+            if lease.identity!=identity||!lease_belongs_to(lease,&self.owner_sid){return Err(format!("已核验目标的身份或用户归属发生变化（PID {}，创建标识 {}），已拒绝采样。",identity.pid,identity.created_filetime))}
+            if lease.is_running()?{*seen=now;}else if now.saturating_duration_since(*seen)>=Duration::from_secs(60){expired.push(identity);}
+        }
+        for identity in expired{self.allowed.remove(&identity);}
+        let unknown=requested.iter().filter(|identity|!self.allowed.contains_key(identity)).copied().collect::<Vec<_>>();
+        let anchors=self.allowed.values().map(|(_,lease)|lease).collect::<Vec<_>>();let discovered=self.user.targets(&self.root,&anchors,&unknown,&self.owner_sid)?;
         for lease in discovered{if !lease_belongs_to(&lease,&self.owner_sid){continue}if let Some((seen,_))=self.allowed.get_mut(&lease.identity){*seen=now;}else{if self.allowed.len()>=4096{return Err("辅助服务进程交接保留数量达到上限。".into())}self.allowed.insert(lease.identity,(now,lease));}}
         let mut accepted=Vec::new();for &identity in requested{
             if self.allowed.contains_key(&identity){accepted.push(identity);continue}
             let alive=match crate::traffic::open_lifetime_identity(identity).map_err(win)?{Some(process)=>match unsafe{WaitForSingleObject(process.0,0)}{WAIT_TIMEOUT=>true,WAIT_OBJECT_0=>false,_=>return Err("辅助服务无法核验目标进程状态。".into())},None=>false};
-            if alive{return Err("目标进程不属于已核验的 ChatGPT / Codex CLI 范围，已拒绝采样。".into())}
+            if alive{return Err(format!("目标进程不属于已核验的 ChatGPT / Codex CLI 范围，已拒绝采样（PID {}，创建标识 {}；服务未能独立确认应用根或完整父链）。",identity.pid,identity.created_filetime))}
             // An exited identity without our own application-scope proof never enters ETW bindings.
             if self.missed.len()>=4096&&!self.missed.contains(&identity){return Err("辅助服务遗漏身份记录达到上限。".into())}if self.missed.insert(identity){let at=crate::settings::now();self.first_missed=Some(self.first_missed.map_or(at,|first|first.min(at)));self.last_missed=Some(at);}
         }Ok(accepted)
@@ -361,7 +371,7 @@ pub(crate) fn start_collector(token:&str,parent:ProcessIdentity)->Result<OwnedHa
     pipe.write(&Request{protocol:PROTOCOL,token:token.into(),parent})?;let deadline=Instant::now()+Duration::from_secs(8);let reply:Reply=loop{if let Some(reply)=pipe.read()?{break reply}if Instant::now()>=deadline{return Err("辅助服务采集器响应超时。".into())}thread::sleep(Duration::from_millis(10));};
     if reply.protocol!=PROTOCOL{return Err("辅助服务响应协议不匹配。".into())}let returned=if reply.handle!=0{Some(OwnedHandle(HANDLE(reply.handle as usize as *mut std::ffi::c_void)))}else{None};pipe.write(&ReplyReceived{protocol:PROTOCOL})?;
     if reply.error.is_some(){return Err(reply.error.unwrap())}let handle=returned.ok_or("辅助服务采集器启动失败。")?;if identity_on(handle.0).map_err(win)?!=reply.child.ok_or("辅助服务进程身份缺失。")?{return Err("辅助服务返回的进程身份不匹配。".into())}validate_collector(handle.0)?;
-    #[cfg(test)]tests::track_probe_collector(&handle)?;
+        #[cfg(test)]tests::track_probe_collector(&handle,token)?;
     Ok(handle)
 }}
 
@@ -369,9 +379,90 @@ pub(crate) fn start_collector(token:&str,parent:ProcessIdentity)->Result<OwnedHa
     use super::*;
     static PROBE_ACTIVE:AtomicBool=AtomicBool::new(false);
     static PROBE_COLLECTOR:std::sync::Mutex<Option<OwnedHandle>>=std::sync::Mutex::new(None);
-    pub(super)fn track_probe_collector(process:&OwnedHandle)->Result<(),String>{
+    static PROBE_TRACE:std::sync::Mutex<Option<String>>=std::sync::Mutex::new(None);
+    pub(super)fn track_probe_collector(process:&OwnedHandle,token:&str)->Result<(),String>{
         if !PROBE_ACTIVE.load(Ordering::Acquire){return Ok(())}let mut copy=HANDLE::default();unsafe{DuplicateHandle(GetCurrentProcess(),process.0,GetCurrentProcess(),&mut copy,(PROCESS_QUERY_LIMITED_INFORMATION|PROCESS_SYNCHRONIZE).0,false,DUPLICATE_HANDLE_OPTIONS(0)).map_err(win)?;}
-        let copy=OwnedHandle(copy);let mut proof=PROBE_COLLECTOR.lock().map_err(|_|"普通权限验收句柄状态无效。")?;if proof.is_some(){return Err("普通权限验收出现重复采集器。".into())}*proof=Some(copy);Ok(())
+        let copy=OwnedHandle(copy);let mut proof=PROBE_COLLECTOR.lock().map_err(|_|"普通权限验收句柄状态无效。")?;if proof.is_some(){return Err("普通权限验收出现重复采集器。".into())}*proof=Some(copy);*PROBE_TRACE.lock().map_err(|_|"验收会话标识状态无效。")?=Some(token.into());Ok(())
+    }
+    #[derive(Serialize,Deserialize)]#[serde(deny_unknown_fields)]struct ScopeReady{identity:ProcessIdentity,port:u16,token:String}
+    fn fixture_ready(directory:&Path)->Result<ScopeReady,String>{
+        let deadline=Instant::now()+Duration::from_secs(10);loop{match File::open(directory.join("child-ready.json")){
+            Ok(file)=>{let mut bytes=Vec::new();file.take(4097).read_to_end(&mut bytes).map_err(|_|"fixture_ready_read")?;if bytes.len()>4096{return Err("fixture_ready_size".into())}if let Ok(ready)=serde_json::from_slice::<ScopeReady>(&bytes){return Ok(ready)}},
+            Err(error)if error.kind()==std::io::ErrorKind::NotFound=>{},Err(_)=>return Err("fixture_ready_open".into())}
+            if Instant::now()>=deadline{return Err("fixture_ready_timeout".into())}thread::sleep(Duration::from_millis(20));
+        }
+    }
+    fn fixture_wait(child:&mut Child)->Result<(),String>{let deadline=Instant::now()+Duration::from_secs(5);loop{if let Some(exit)=child.try_wait().map_err(|_|"fixture_parent_wait")?{return if exit.success(){Ok(())}else{Err("fixture_parent_exit".into())}}if Instant::now()>=deadline{let _=child.kill();let _=child.wait();return Err("fixture_parent_forced_cleanup".into())}thread::sleep(Duration::from_millis(20));}}
+    struct ScopeFixture{directory:PathBuf,parent:Child,child:Option<crate::native::ProcessLease>,port:u16,closed:bool}
+    impl ScopeFixture{
+        fn start(directory:&Path)->Result<Self,String>{
+            if fs::read_dir(directory).map_err(|_|"fixture_directory")?.next().is_some(){return Err("fixture_not_fresh".into())}
+            let current=std::env::current_exe().map_err(|_|"fixture_image")?;let mut random=[0u8;16];if unsafe{BCryptGenRandom(None,&mut random,BCRYPT_USE_SYSTEM_PREFERRED_RNG)}.0<0{return Err("fixture_random".into())}let token=random.iter().map(|byte|format!("{byte:02x}")).collect::<String>();
+            fs::copy(&current,directory.join("codex.exe")).map_err(|_|"fixture_parent_copy")?;fs::copy(&current,directory.join("scope-child.exe")).map_err(|_|"fixture_child_copy")?;
+            let parent=Command::new(directory.join("codex.exe")).args(["--exact","traffic_service::tests::scope_process_fixture"]).env("CODEX_PROXY_SCOPE_FIXTURE_ROLE","parent").env("CODEX_PROXY_SCOPE_FIXTURE_DIR",directory).env("CODEX_PROXY_SCOPE_FIXTURE_TOKEN",&token).current_dir(current.parent().ok_or("fixture_cwd")?).creation_flags(0x08000000).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().map_err(|_|"fixture_parent_start")?;
+            let mut fixture=Self{directory:directory.into(),parent,child:None,port:0,closed:false};let ready=fixture_ready(directory)?;if ready.token!=token||ready.port==0{return Err("fixture_ready_binding".into())}
+            let(identity,image,_,lease)=unsafe{crate::native::process_identity_with_lease(ready.identity.pid)}.ok_or("fixture_child_identity")?;
+            if identity!=ready.identity||image!=crate::settings::normalized_executable(&directory.join("scope-child.exe")){return Err("fixture_child_image".into())}fixture.child=Some(lease);fixture.port=ready.port;Ok(fixture)
+        }
+        fn parent_identity(&self)->Result<ProcessIdentity,String>{identity_on(HANDLE(self.parent.as_raw_handle())).map_err(win)}
+        fn child_identity(&self)->ProcessIdentity{self.child.as_ref().unwrap().identity}
+        fn release_parent(&mut self)->Result<(),String>{if let Some(mut input)=self.parent.stdin.take(){input.write_all(b"x").map_err(|_|"fixture_parent_release")?;}fixture_wait(&mut self.parent)}
+        fn transfer(&self)->Result<(),String>{use std::net::{TcpStream,SocketAddr};let mut connection=TcpStream::connect_timeout(&SocketAddr::from(([127,0,0,1],self.port)),Duration::from_secs(2)).map_err(|_|"fixture_loopback_connect")?;connection.set_read_timeout(Some(Duration::from_secs(2))).map_err(|_|"fixture_loopback_timeout")?;connection.write_all(b"d").map_err(|_|"fixture_loopback_request")?;let mut bytes=Vec::new();connection.take(32769).read_to_end(&mut bytes).map_err(|_|"fixture_loopback_read")?;if bytes!=vec![7;32768]{return Err("fixture_loopback_bytes".into())}Ok(())}
+        fn close_child(&mut self)->Result<(),String>{if let Some(lease)=&self.child{if lease.is_running()?{let mut connection=std::net::TcpStream::connect_timeout(&([127,0,0,1],self.port).into(),Duration::from_secs(2)).map_err(|_|"fixture_stop_connect")?;connection.write_all(b"x").map_err(|_|"fixture_stop_write")?;}if unsafe{WaitForSingleObject(HANDLE(lease.as_handle()),10000)}!=WAIT_OBJECT_0{return Err("fixture_child_stop_unconfirmed".into())}}Ok(())}
+        fn finish(&mut self)->Result<(),String>{if self.closed{return Ok(())}let parent=self.release_parent();let child=self.close_child();parent?;child?;let expected=["codex.exe","scope-child.exe","child-ready.json"];if fs::read_dir(&self.directory).map_err(|_|"fixture_cleanup_list")?.any(|entry|match entry{Ok(entry)=>!expected.iter().any(|name|entry.file_name()==OsStr::new(name)),Err(_)=>true}){return Err("fixture_cleanup_unknown_file".into())}self.child.take();for name in expected{fs::remove_file(self.directory.join(name)).map_err(|_|"fixture_cleanup_file")?;}fs::remove_dir(&self.directory).map_err(|_|"fixture_cleanup_directory")?;self.closed=true;Ok(())}
+    }
+    impl Drop for ScopeFixture{fn drop(&mut self){let _=self.finish();}}
+    #[test]fn scope_process_fixture(){
+        let Some(role)=std::env::var_os("CODEX_PROXY_SCOPE_FIXTURE_ROLE")else{return};let directory=PathBuf::from(std::env::var_os("CODEX_PROXY_SCOPE_FIXTURE_DIR").expect("fixture directory")).canonicalize().unwrap();let image=std::env::current_exe().unwrap().canonicalize().unwrap();assert_eq!(image.parent(),Some(directory.as_path()));
+        let token=std::env::var("CODEX_PROXY_SCOPE_FIXTURE_TOKEN").unwrap();assert!(valid_token(&token));
+        if role=="parent"{assert_eq!(image.file_name(),Some(OsStr::new("codex.exe")));let mut child=Command::new(directory.join("scope-child.exe")).args(["--exact","traffic_service::tests::scope_process_fixture"]).env("CODEX_PROXY_SCOPE_FIXTURE_ROLE","child").creation_flags(0x08000000).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();let _=fixture_ready(&directory).unwrap();let _=std::io::stdin().read_exact(&mut [0u8;1]);let _=child.try_wait();}
+        else{assert_eq!(role,"child");assert_eq!(image.file_name(),Some(OsStr::new("scope-child.exe")));let listener=std::net::TcpListener::bind(([127,0,0,1],0)).unwrap();listener.set_nonblocking(true).unwrap();let ready=ScopeReady{identity:identity_on(unsafe{GetCurrentProcess()}).unwrap(),port:listener.local_addr().unwrap().port(),token};let mut output=OpenOptions::new().create_new(true).write(true).open(directory.join("child-ready.json")).unwrap();output.write_all(&serde_json::to_vec(&ready).unwrap()).and_then(|_|output.sync_all()).unwrap();drop(output);let deadline=Instant::now()+Duration::from_secs(60);
+            while Instant::now()<deadline{match listener.accept(){Ok((mut stream,address))=>{assert!(address.ip().is_loopback());stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();let mut request=[0];if stream.read_exact(&mut request).is_ok(){if request==*b"x"{return}assert_eq!(request,*b"d");stream.write_all(&[7;32768]).unwrap();}},Err(error)if error.kind()==std::io::ErrorKind::WouldBlock=>thread::sleep(Duration::from_millis(10)),Err(error)=>panic!("fixture listener: {error}")}}panic!("fixture child lifetime exceeded");
+        }
+    }
+    fn verified_handoff(scope:&mut CollectorScope,fixture:&mut ScopeFixture)->Result<(Vec<crate::native::ProcessLease>,Vec<&'static str>),String>{
+        let config=scope_config(&scope.root)?;let parent=fixture.parent_identity()?;let child=fixture.child_identity();let mut leases=crate::native::traffic_targets_held(&scope.root,&config)?;leases.retain(|lease|lease.identity==parent||lease.identity==child);
+        if ![parent,child].iter().all(|identity|leases.iter().any(|lease|lease.identity==*identity)){return Err("scope_gui_discovery_missing".into())}let mut checks=vec!["gui_discovered_parent_and_child"];
+        fixture.release_parent()?;if unsafe{WaitForSingleObject(HANDLE(fixture.parent.as_raw_handle()),0)}!=WAIT_OBJECT_0||!fixture.child.as_ref().unwrap().is_running()?{return Err("scope_fixture_lifetimes_invalid".into())}checks.push("parent_exited_child_still_alive");
+        let accepted=scope.targets(&[parent,child]).map_err(|_|"scope_first_handoff_refused")?;if !accepted.contains(&child)||!scope.allowed.contains_key(&parent){return Err("scope_first_handoff_missing".into())}checks.push("first_handoff_independently_verified");
+        scope.allowed.get_mut(&child).ok_or("scope_child_proof_missing")?.0=Instant::now()-Duration::from_secs(61);if !scope.targets(&[child])?.contains(&child){return Err("scope_live_child_expired".into())}checks.push("live_child_proof_survives_sixty_seconds");
+        let wrong=ProcessIdentity{pid:child.pid,created_filetime:child.created_filetime.saturating_add(1)};if scope.targets(&[wrong])?.contains(&wrong){return Err("scope_wrong_creation_accepted".into())}checks.push("wrong_creation_excluded");
+        let other=fixture.directory.join("other-scope");fs::create_dir(&other).map_err(|_|"scope_other_directory")?;let mut unrelated=ScopeFixture::start(&other)?;
+        let root_rejected=scope.targets(&[unrelated.parent_identity()?]).is_err();let child_rejected=scope.targets(&[unrelated.child_identity()]).is_err();let unrelated_rejected=scope.targets(&[identity_on(unsafe{GetCurrentProcess()}).map_err(win)?]).is_err();unrelated.finish()?;
+        if !root_rejected||!child_rejected||!unrelated_rejected{return Err("scope_unrelated_alive_accepted".into())}checks.extend(["same_name_other_path_rejected","other_scope_child_rejected","unrelated_alive_rejected"]);Ok((leases,checks))
+    }
+    #[test]fn exited_application_root_handoff_preserves_live_child_without_trusting_requested_identity(){
+        let root=std::env::temp_dir().join(format!("codex-scope-handoff-{}-{}",std::process::id(),crate::settings::now()));fs::create_dir(&root).unwrap();let fixture_dir=root.join("fixture");fs::create_dir(&fixture_dir).unwrap();fs::write(root.join("config.json"),serde_json::to_vec(&serde_json::json!({"cli_command":[fixture_dir.join("codex.exe")]})).unwrap()).unwrap();
+        let mut fixture=ScopeFixture::start(&fixture_dir).unwrap();let mut scope=CollectorScope::new(unsafe{GetCurrentProcess()}).unwrap();scope.root=root.clone();let(leases,checks)=verified_handoff(&mut scope,&mut fixture).unwrap();assert_eq!(checks.len(),8);
+        let child=fixture.child_identity();fixture.close_child().unwrap();scope.allowed.get_mut(&child).unwrap().0=Instant::now()-Duration::from_secs(61);assert!(!scope.targets(&[child]).unwrap().contains(&child));drop(leases);drop(scope);fixture.finish().unwrap();fs::remove_file(root.join("config.json")).unwrap();fs::remove_dir(root).unwrap();
+    }
+    fn probe_trace_absent(token:&str)->Result<bool,String>{
+        use windows::Win32::System::Diagnostics::Etw::{ControlTraceW,CONTROLTRACE_HANDLE,EVENT_TRACE_PROPERTIES,EVENT_TRACE_CONTROL_QUERY};
+        if !valid_token(token){return Err("probe_trace_token_invalid".into())}let mut bytes=vec![0u64;(size_of::<EVENT_TRACE_PROPERTIES>()+4096).div_ceil(8)];let properties=bytes.as_mut_ptr().cast::<EVENT_TRACE_PROPERTIES>();let name=wide(format!("CodexProxyTray.Network.{token}"));
+        unsafe{(*properties).Wnode.BufferSize=(bytes.len()*8)as u32;(*properties).LoggerNameOffset=size_of::<EVENT_TRACE_PROPERTIES>()as u32;(*properties).LogFileNameOffset=(*properties).LoggerNameOffset+2048;let result=ControlTraceW(CONTROLTRACE_HANDLE::default(),PCWSTR(name.as_ptr()),properties,EVENT_TRACE_CONTROL_QUERY);match result.0{4201=>Ok(true),0=>Ok(false),_=>Err(format!("probe_trace_query_{}",result.0))}}
+    }
+    #[test]#[ignore="Requires the isolated service QA case, a fresh synthetic real-profile config and protected SYSTEM service"]
+    fn service_scope_handoff_probe(){
+        #[derive(Serialize)]struct Probe{schema:u32,status:&'static str,marker:String,scope:&'static str,checks:Vec<&'static str>,samples:usize,stop_ack:bool,collector_exited:bool,collector_exit_code:Option<u32>,trace_absent:bool,fixture_closed:bool,service_version:Option<String>,failure_code:Option<String>,elapsed_ms:u64}
+        assert_eq!(std::env::var("GITHUB_ACTIONS").as_deref(),Ok("true"));assert_eq!(std::env::var("RUNNER_ENVIRONMENT").as_deref(),Ok("github-hosted"));
+        let marker=std::env::var("CODEX_PROXY_SCOPE_PROBE_MARKER").expect("scope probe marker");assert!(marker.len()==64&&marker.bytes().all(|byte|byte.is_ascii_digit()||(b'a'..=b'f').contains(&byte)));
+        let boundary=PathBuf::from(std::env::var_os("RUNNER_TEMP").unwrap()).canonicalize().unwrap();let result=PathBuf::from(std::env::var_os("CODEX_PROXY_SCOPE_PROBE_RESULT").expect("scope result"));let directory=PathBuf::from(std::env::var_os("CODEX_PROXY_SCOPE_PROBE_FIXTURE").expect("scope fixture")).canonicalize().unwrap();
+        assert!(result.is_absolute()&&result.file_name()==Some(OsStr::new("result.json"))&&result.parent().unwrap().canonicalize().unwrap().starts_with(&boundary));assert!(directory.starts_with(&boundary)&&directory!=boundary&&fs::symlink_metadata(&directory).unwrap().file_attributes()&0x400==0);assert!(fs::read_dir(&directory).unwrap().next().is_none());
+        let mut output=OpenOptions::new().create_new(true).write(true).open(&result).expect("fresh scope result");let started=Instant::now();let mut probe=Probe{schema:1,status:"failed",marker,scope:"real service scope handoff; synthetic process tree and loopback only",checks:vec![],samples:0,stop_ack:false,collector_exited:false,collector_exit_code:None,trace_absent:false,fixture_closed:false,service_version:None,failure_code:None,elapsed_ms:0};
+        let mut sampler=crate::traffic::Coordinator::new();let mut fixture=None;let mut scope=None;let mut sampling_started=false;
+        let outcome=(||->Result<(),String>{
+            let user=UserContext::from_parent(unsafe{GetCurrentProcess()})?;let root=user.root()?;let config=scope_config(&root)?;if config.cli_command.len()!=1||crate::settings::normalized_executable(Path::new(&config.cli_command[0]))!=crate::settings::normalized_executable(&directory.join("codex.exe")){return Err("scope_real_profile_config_mismatch".into())}probe.checks.push("real_profile_config_matches_fixture");
+            let(service_directory,image)=paths()?;let record=load_receipt(&service_directory,&image,true)?;compatible(&record)?;if record.owner_sid!=current_sid()?{return Err("scope_service_owner_mismatch".into())}probe.service_version=Some(record.version);
+            fixture=Some(ScopeFixture::start(&directory)?);scope=Some(CollectorScope::new(unsafe{GetCurrentProcess()})?);let(leases,checks)=verified_handoff(scope.as_mut().unwrap(),fixture.as_mut().unwrap())?;probe.checks.extend(checks);
+            sampler.set_targets(leases)?;PROBE_ACTIVE.store(true,Ordering::Release);sampler.enable(crate::traffic::EnableMode::Normal)?;sampling_started=true;let deadline=Instant::now()+Duration::from_secs(25);let mut stamps=HashSet::new();let mut transferred=Instant::now()-Duration::from_secs(1);
+            while Instant::now()<deadline{if transferred.elapsed()>=Duration::from_millis(500){fixture.as_ref().unwrap().transfer()?;transferred=Instant::now();}let snapshot=sampler.snapshot();if matches!(snapshot.state,crate::traffic::TrafficState::Unavailable|crate::traffic::TrafficState::NeedsPermission|crate::traffic::TrafficState::NeedsInstallation){return Err("scope_service_sampling_unavailable".into())}if snapshot.state==crate::traffic::TrafficState::Collecting&&snapshot.target_count>0&&snapshot.sent_bytes.is_some_and(|bytes|bytes>0)&&snapshot.received_bytes.is_some_and(|bytes|bytes>0){stamps.insert(snapshot.timestamp_ms);probe.samples=stamps.len();if probe.samples>=2{let trace=PROBE_TRACE.lock().map_err(|_|"scope_trace_lock")?.clone().ok_or("scope_trace_missing")?;if probe_trace_absent(&trace)?{return Err("scope_trace_missing_while_sampling".into())}probe.checks.push("two_service_samples_with_loopback_bytes");return Ok(())}}thread::sleep(Duration::from_millis(100));}Err("scope_service_samples_missing".into())
+        })();
+        let stopped=sampler.disable();probe.stop_ack=sampling_started&&probe.samples>=2&&stopped.is_ok()&&sampler.snapshot().state==crate::traffic::TrafficState::Disabled;PROBE_ACTIVE.store(false,Ordering::Release);
+        if let Some(process)=PROBE_COLLECTOR.lock().unwrap_or_else(|error|error.into_inner()).take(){probe.collector_exited=unsafe{WaitForSingleObject(process.0,10000)}==WAIT_OBJECT_0;if probe.collector_exited{let mut code=0;if unsafe{GetExitCodeProcess(process.0,&mut code)}.is_ok(){probe.collector_exit_code=Some(code);}}}
+        if let Some(token)=PROBE_TRACE.lock().unwrap_or_else(|error|error.into_inner()).take(){probe.trace_absent=probe_trace_absent(&token).unwrap_or(false);}
+        let cleanup=(||->Result<(),String>{if let Some(fixture)=&mut fixture{fixture.close_child()?;if let Some(scope)=&mut scope{let child=fixture.child_identity();if let Some((seen,_))=scope.allowed.get_mut(&child){*seen=Instant::now()-Duration::from_secs(61);}if scope.targets(&[child])?.contains(&child){return Err("scope_exited_tombstone_not_expired".into())}probe.checks.push("exited_tombstone_expires");}fixture.finish()?;probe.fixture_closed=true;}Ok(())})();
+        probe.failure_code=outcome.err().or_else(||cleanup.err()).map(|message|if message.len()<=100&&message.bytes().all(|byte|byte.is_ascii_lowercase()||byte.is_ascii_digit()||byte==b'_'){message}else{"scope_independent_validation_failed".into()}).or_else(||if !probe.stop_ack{Some("scope_stop_ack_missing".into())}else if !probe.collector_exited||probe.collector_exit_code!=Some(0){Some("scope_collector_exit_missing".into())}else if !probe.trace_absent{Some("scope_trace_stop_missing".into())}else if !probe.fixture_closed{Some("scope_fixture_cleanup_missing".into())}else{None});
+        if probe.failure_code.is_none(){probe.status="passed";}probe.elapsed_ms=started.elapsed().as_millis().min(u128::from(u64::MAX))as u64;let bytes=serde_json::to_vec(&probe).unwrap();assert!(bytes.len()<=16384);output.write_all(&bytes).and_then(|_|output.sync_all()).expect("durable scope result");assert_eq!(probe.status,"passed","scope probe failed: {:?}",probe.failure_code);
     }
     #[test]#[ignore="Requires the isolated service QA script and a verified unelevated medium token"]
     fn unelevated_service_client_probe(){
@@ -413,7 +504,7 @@ pub(crate) fn start_collector(token:&str,parent:ProcessIdentity)->Result<OwnedHa
         let(identity,_,_,lease)=unsafe{crate::native::process_identity_with_lease(std::process::id())}.unwrap();assert!(lease_belongs_to(&lease,&scope.owner_sid));
         assert!(scope.targets(&[identity]).is_err());
         scope.allowed.insert(identity,(Instant::now()-Duration::from_secs(59),lease));assert_eq!(scope.targets(&[identity]).unwrap(),vec![identity]);
-        scope.allowed.get_mut(&identity).unwrap().0=Instant::now()-Duration::from_secs(61);assert!(scope.targets(&[identity]).is_err());
+        scope.allowed.get_mut(&identity).unwrap().0=Instant::now()-Duration::from_secs(61);assert_eq!(scope.targets(&[identity]).unwrap(),vec![identity]);
         let mut child=Command::new(std::env::current_exe().unwrap()).args(["--exact","traffic_etw::tests::short_lived_binding_fixture"]).env("CODEX_TRAFFIC_BINDING_FIXTURE","1").creation_flags(0x08000000).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
         let(exited,_,_,held)=unsafe{crate::native::process_identity_with_lease(child.id())}.unwrap();assert!(lease_belongs_to(&held,&scope.owner_sid));scope.allowed.insert(exited,(Instant::now(),held));child.stdin.take().unwrap().write_all(b"x").unwrap();assert!(child.wait().unwrap().success());
         assert_eq!(scope.targets(&[exited]).unwrap(),vec![exited]);scope.allowed.get_mut(&exited).unwrap().0=Instant::now()-Duration::from_secs(61);assert!(scope.targets(&[exited]).unwrap().is_empty());
@@ -428,7 +519,7 @@ pub(crate) fn start_collector(token:&str,parent:ProcessIdentity)->Result<OwnedHa
         let mut record=Receipt{schema:1,product:PRODUCT.into(),owner_sid:"S-1-5-21-1".into(),version:SERVICE_VERSION.into(),protocol:PROTOCOL,sha256:"a".repeat(64),loader_sha256:LOADER_HASH.into(),image:String::new(),service_command:String::new(),phase:"installed".into(),readiness:String::new(),previous:None,created_parent:false};
         assert!(compatible(&record).is_ok());record.sha256="b".repeat(64);assert!(compatible(&record).is_ok());
         record.owner_sid=current_sid().unwrap();assert!(trusted_gui(unsafe{GetCurrentProcess()},&record).is_ok());record.owner_sid="S-1-5-21-999999".into();assert!(trusted_gui(unsafe{GetCurrentProcess()},&record).is_err());
-        record.version="1.9.0".into();assert!(compatible(&record).is_ok());
+        record.version="1.0.0".into();assert!(compatible(&record).is_err());record.version="1.9.0".into();assert!(compatible(&record).is_ok());
         record.version="0.9.0".into();assert!(compatible(&record).is_err());record.version="bad".into();assert!(compatible(&record).is_err());record.version=SERVICE_VERSION.into();record.protocol=0;assert!(compatible(&record).is_err());record.protocol=PROTOCOL+1;assert!(compatible(&record).is_err());
         // Legacy receipts stay readable for a safe explicit uninstall, but cannot claim compatibility.
         let mut legacy=serde_json::to_value(&record).unwrap();legacy.as_object_mut().unwrap().remove("protocol");let legacy:Receipt=serde_json::from_value(legacy).unwrap();assert_eq!(legacy.protocol,0);assert!(compatible(&legacy).is_err());

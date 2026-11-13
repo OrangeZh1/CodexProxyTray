@@ -123,6 +123,37 @@ function RootSnapshot {
     $result=[ordered]@{};foreach($file in Get-ChildItem -LiteralPath (Join-Path $installRoot 'current') -File|Sort-Object Name){$result[$file.Name]=Hash $file.FullName};$result|ConvertTo-Json -Compress
 }
 function ShortcutText([string]$Value){foreach($pair in @(@($work,'<fixture>'),@($local,'<LocalAppData>'),@($env:RUNNER_TEMP,'<RunnerTemp>'),@($env:USERPROFILE,'<UserProfile>'))){if($pair[0]){$Value=$Value.Replace($pair[0],$pair[1])}};$Value}
+function ReadinessDiagnostics {
+    $expected=Join-Path $installRoot 'current\CodexProxyTray.exe';$value=[ordered]@{source_root=(ShortcutText $installRoot);observed_at=[DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds();current_exe_exists=$false;processes=@();files=[ordered]@{}}
+    if(-not $ownedData){$value.skipped='fixture_data_not_owned';return $value}
+    $fixed=Join-Path $local 'Programs\CodexProxyTray';$rootPath=[IO.Path]::GetFullPath($installRoot)
+    if($rootPath -ine $fixed -and -not $rootPath.StartsWith([IO.Path]::GetFullPath($work).TrimEnd('\')+'\',[StringComparison]::OrdinalIgnoreCase)){$value.skipped='fixture_code_root_outside_owned_paths';return $value}
+    # Only the named synthetic fixture files below are read; never config or log/history bodies.
+    $cursor=$data;while($cursor){if(Test-Path -LiteralPath $cursor){if((Get-Item -LiteralPath $cursor -Force).Attributes -band [IO.FileAttributes]::ReparsePoint){$value.skipped='fixture_data_reparse_point';return $value}};$cursor=[IO.Path]::GetDirectoryName($cursor)}
+    $value.current_exe_exists=Test-Path -LiteralPath $expected -PathType Leaf
+    try{foreach($process in @(Get-CimInstance Win32_Process -Filter "Name='CodexProxyTray.exe'")){if($process.ExecutablePath -and [IO.Path]::GetFullPath($process.ExecutablePath) -ieq [IO.Path]::GetFullPath($expected)){$value.processes+=@{pid=$process.ProcessId;started_at=$process.CreationDate.ToUniversalTime().ToString('o');path=(ShortcutText $process.ExecutablePath)}}}}catch{$value.process_read_error=ShortcutText $_.Exception.Message}
+    $specifications=[ordered]@{
+        'ui-error.json'=@{limit=65536;fields=@('helper_pid','at','window','message')}
+        'startup-error.txt'=@{limit=65536;fields=@()}
+        'ui-ready-main.json'=@{limit=65536;fields=@('helper_pid','at','rendered','window')}
+        'ui-ready-tray.json'=@{limit=65536;fields=@('helper_pid','at','rendered','window')}
+        'status.json'=@{limit=131072;fields=@('helper_pid','updated_at','enabled','backend_ready','error')}
+    }
+    foreach($name in $specifications.Keys){
+        $record=[ordered]@{exists=$false};$value.files[$name]=$record;$path=Join-Path $data $name
+        try{
+            if(-not(Test-Path -LiteralPath $path)){continue};$record.exists=$true;$item=Get-Item -LiteralPath $path -Force;$record.bytes=$item.Length;$limit=$specifications[$name].limit
+            if($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -or $item.Length -gt $limit){$record.skipped='unsupported_type_or_size';continue}
+            $stream=[IO.File]::OpenRead($path);$buffer=[byte[]]::new($limit+1);$length=0
+            try{while($length -lt $buffer.Length){$read=$stream.Read($buffer,$length,$buffer.Length-$length);if($read -eq 0){break};$length+=$read}}finally{$stream.Dispose()}
+            if($length -gt $limit){$record.skipped='grew_beyond_read_limit';continue};$text=[Text.UTF8Encoding]::new($false,$true).GetString($buffer,0,$length)
+            if($name -ceq 'startup-error.txt'){$record.error=ShortcutText ($text.Substring(0,[Math]::Min(1000,$text.Length)));continue}
+            $json=$text|ConvertFrom-Json;$record.selected=[ordered]@{}
+            foreach($field in $specifications[$name].fields){$content=$json.$field;if($content -is [string]){$record.selected[$field]=ShortcutText ($content.Substring(0,[Math]::Min(1000,$content.Length)))}elseif($null -eq $content -or $content -is [bool] -or $content -is [int] -or $content -is [long] -or $content -is [double]){$record.selected[$field]=$content}}
+        }catch{$record.read_error=$_.Exception.GetType().FullName;$record.read_hresult=('0x{0:X8}' -f ($_.Exception.HResult -band 0xffffffffL))}
+    }
+    $value
+}
 function ReadNativeShortcut([string]$Path){
     if(-not ('CodexProxyTray.InstallerShortcutNative' -as [type])){Add-Type -TypeDefinition @'
 using System;
@@ -386,6 +417,7 @@ try {
     $report.status='passed'
 }catch{$report.status='failed';$report.error=$_.Exception.Message;$report.diagnostic_root=$work;throw}
 finally {
+    if($report.status -eq 'failed'){try{$report.readiness_diagnostics=ReadinessDiagnostics}catch{$report.readiness_diagnostics=@{capture_error=(ShortcutText $_.Exception.Message)}}}
     # Do not try a reverse operation after an uncertain or rejected installation.
     # Failed code/data/registration are retained as recovery evidence on this disposable runner.
     $report.cleanup=if($report.status -eq 'passed'){'product_uninstalled_user_data_retained_as_verified'}else{'retained_for_diagnostics'}

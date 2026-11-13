@@ -69,7 +69,7 @@ function Remove-Diagnostics {
     if(-not $diagnosticOwned){return}
     Require (Same-Path ((Get-Item -LiteralPath $diagnosticRoot -Force).FullName) $diagnosticRoot) 'diagnostic_directory_changed'
     No-Reparse $diagnosticRoot
-    foreach($ownedName in @('pipeline-data','service-client-data','guard-traffic-data')){$ownedWork=Join-Path $diagnosticRoot $ownedName;if(Test-Path -LiteralPath $ownedWork){No-Reparse $ownedWork;Require ($report.status -eq 'failed') 'owned_work_directory_after_success';return 'retained_for_debugging'}}
+    foreach($ownedName in @('pipeline-data','service-client-data','guard-traffic-data','scope-handoff-data')){$ownedWork=Join-Path $diagnosticRoot $ownedName;if(Test-Path -LiteralPath $ownedWork){No-Reparse $ownedWork;Require ($report.status -eq 'failed') 'owned_work_directory_after_success';return 'retained_for_debugging'}}
     $entries=@(Get-ChildItem -LiteralPath $diagnosticRoot -Force)
     foreach($entry in $entries){Require (-not $entry.PSIsContainer -and $diagnosticFiles.Contains($entry.FullName)) 'unknown_diagnostic_file_preserved';No-Reparse $entry.FullName}
     foreach($entry in $entries){[IO.File]::Delete($entry.FullName)}
@@ -254,6 +254,7 @@ namespace CodexProxyTray {
    ValidToken(token);IntPtr memory=Marshal.AllocHGlobal(4096);try{for(int offset=0;offset<4096;offset+=4)Marshal.WriteInt32(memory,offset,0);var properties=new TraceProperties {node=new WnodeHeader {size=4096},loggerName=(uint)Marshal.SizeOf(typeof(TraceProperties))};Marshal.StructureToPtr(properties,memory,false);uint result=ControlTraceW(0,"CodexProxyTray.Network."+token,memory,0);if(result==0)return true;if(result==4201)return false;throw new Win32Exception((int)result);}finally{Marshal.FreeHGlobal(memory);}
   }
   public static string ProgramFiles() {var path=new StringBuilder(260);if(SHGetFolderPathW(IntPtr.Zero,0x26,IntPtr.Zero,0,path)<0)throw new InvalidOperationException("known_folder_failed");return path.ToString();}
+  public static string LocalAppData() {var path=new StringBuilder(260);if(SHGetFolderPathW(IntPtr.Zero,0x1c,IntPtr.Zero,0,path)<0)throw new InvalidOperationException("local_appdata_known_folder_failed");return path.ToString();}
   public static byte[] ProcessSecurity(uint pid) {
    IntPtr process=OpenProcess(0x20000,false,pid);if(process==IntPtr.Zero)throw new Win32Exception();
    try {uint needed;GetKernelObjectSecurity(process,4,null,0,out needed);if(needed==0||needed>65536)throw new InvalidOperationException("process_security_size");var security=new byte[(int)needed];if(!GetKernelObjectSecurity(process,4,security,needed,out needed))throw new Win32Exception();return security;}
@@ -331,7 +332,7 @@ function Assert-OwnedInstall([switch]$AllowPrepared,[switch]$AllowMissingService
     $keys=@('schema','product','owner_sid','version','protocol','sha256','loader_sha256','image','service_command','phase','readiness','previous','created_parent')
     foreach($key in $keys){Require ($key -in $receipt.PSObject.Properties.Name) 'receipt_schema_missing_field'}
     Require ($receipt.schema -eq 1 -and $receipt.product -eq 'CodexProxyTray.TrafficService' -and $receipt.owner_sid -ceq $ownerSid) 'receipt_owner_or_product_invalid'
-    Require ($receipt.version -ceq '1.0.0' -and $receipt.protocol -eq 2 -and $receipt.sha256 -ceq $binaryHash -and $receipt.loader_sha256 -ceq $loaderHash) 'receipt_version_or_hash_invalid'
+    Require ($receipt.version -ceq '1.0.1' -and $receipt.protocol -eq 2 -and $receipt.sha256 -ceq $binaryHash -and $receipt.loader_sha256 -ceq $loaderHash) 'receipt_version_or_hash_invalid'
     Require ($receipt.image -ceq $serviceImage -and $receipt.service_command -ceq $expectedCommand -and $null -eq $receipt.previous) 'receipt_paths_or_previous_invalid'
     Require ($receipt.created_parent -is [bool] -and $receipt.created_parent -eq (-not $parentInitiallyExisted)) 'receipt_parent_ownership_invalid'
     $installed=$receipt.phase -eq 'installed' -and $receipt.readiness -eq 'scm_configuration_verified'
@@ -519,6 +520,46 @@ function Run-GuardTrafficProbe {
     }
     if($probeFailure){throw $probeFailure}
 }
+function Run-ScopeHandoffProbe {
+    $sandbox=Join-Path $diagnosticRoot 'scope-handoff-data';Require (-not(Test-Path -LiteralPath $sandbox)) 'scope_handoff_sandbox_exists';$fixture=Join-Path $sandbox 'fixture';[void][IO.Directory]::CreateDirectory($fixture)
+    $resultPath=Join-Path $sandbox 'result.json';$random=[byte[]]::new(32);[Security.Cryptography.RandomNumberGenerator]::Fill($random);$marker=([BitConverter]::ToString($random)).Replace('-','').ToLowerInvariant()
+    $profileRoot=Join-Path (Full-Path ([CodexProxyTray.ServiceQaNative]::LocalAppData())) 'CodexProxyTray';$configPath=Join-Path $profileRoot 'config.json'
+    $profileExisted=$false;$profileCreated=$false;$configCreated=$false;$configBytes=$null;$configHash=$null;$process=$null;$started=$null;$probeFailure=$null
+    $record=[ordered]@{status='running';scope='Real SYSTEM service scope handoff with synthetic local process tree; no business targets or user profile copies';native_exit_code=$null;result=$null;profile_config_cleanup='not_created';profile_directory_cleanup='not_created';collector_cleanup='pending'}
+    try{
+        $cursor=$profileRoot;while($cursor){if(Test-Path -LiteralPath $cursor){No-Reparse $cursor};$cursor=[IO.Path]::GetDirectoryName($cursor)}
+        Require (-not(Test-Path -LiteralPath $configPath)) 'scope_handoff_existing_profile_config_preserved';$profileExisted=Test-Path -LiteralPath $profileRoot
+        if(-not $profileExisted){[void][IO.Directory]::CreateDirectory($profileRoot);$profileCreated=$true};No-Reparse $profileRoot
+        $configBytes=[Text.UTF8Encoding]::new($false).GetBytes((@{cli_command=@((Join-Path $fixture 'codex.exe'));launch_target='none';network_enabled=$false;traffic_enabled=$false;auto_check_updates=$false;connectivity_enabled=$false}|ConvertTo-Json -Compress))
+        $stream=[IO.File]::Open($configPath,'CreateNew','Write','None');$configCreated=$true;try{$stream.Write($configBytes,0,$configBytes.Length);$stream.Flush($true)}finally{$stream.Dispose()};$configHash=(Get-FileHash -LiteralPath $configPath -Algorithm SHA256).Hash.ToLowerInvariant();$record.profile_config_sha256=$configHash;$record.profile_config_bytes=$configBytes.Length;$record.profile_config_cleanup='pending'
+        Require ((Get-FileHash -LiteralPath $serviceProbe -Algorithm SHA256).Hash.ToLowerInvariant() -ceq $serviceProbeHash -and (Assert-OwnedInstall).version -ceq '1.0.1') 'scope_handoff_probe_source_or_service_version_changed'
+        $info=[Diagnostics.ProcessStartInfo]::new($serviceProbe);$info.UseShellExecute=$false;$info.CreateNoWindow=$true;$info.WindowStyle='Hidden';$info.WorkingDirectory=[IO.Path]::GetDirectoryName($binary)
+        foreach($argument in @('--exact','traffic_service::tests::service_scope_handoff_probe','--ignored','--nocapture','--test-threads=1')){$info.ArgumentList.Add($argument)}
+        $info.Environment['PATH']=[IO.Path]::GetDirectoryName($binary)+';'+$env:PATH;$info.Environment['CODEX_PROXY_SCOPE_PROBE_RESULT']=$resultPath;$info.Environment['CODEX_PROXY_SCOPE_PROBE_MARKER']=$marker;$info.Environment['CODEX_PROXY_SCOPE_PROBE_FIXTURE']=$fixture
+        $process=[Diagnostics.Process]::Start($info);[CodexProxyTray.ServiceQaNative]::PinGui($process);$started=$process.StartTime.ToUniversalTime();Require ($process.WaitForExit(180000)) 'scope_handoff_probe_timeout';$record.native_exit_code=[CodexProxyTray.ServiceQaNative]::GuiExitCode([uint32]$process.Id)
+        Require (Test-Path -LiteralPath $resultPath -PathType Leaf) 'scope_handoff_result_missing';No-Reparse $resultPath;Require ((Get-Item -LiteralPath $resultPath).Length -le 16384) 'scope_handoff_result_too_large'
+        $stream=[IO.File]::OpenRead($resultPath);$buffer=[byte[]]::new(16385);$length=0;try{while($length -lt $buffer.Length){$read=$stream.Read($buffer,$length,$buffer.Length-$length);if($read -eq 0){break};$length+=$read}}finally{$stream.Dispose()};Require ($length -gt 0 -and $length -le 16384) 'scope_handoff_result_too_large';$result=[Text.UTF8Encoding]::new($false,$true).GetString($buffer,0,$length)|ConvertFrom-Json
+        $fields=@($result.PSObject.Properties.Name);$expected=@('schema','status','marker','scope','checks','samples','stop_ack','collector_exited','collector_exit_code','trace_absent','fixture_closed','service_version','failure_code','elapsed_ms')
+        Require ($fields.Count -eq 14 -and @($fields|Where-Object {$_ -cnotin $expected}).Count -eq 0 -and ($result.schema -is [int] -or $result.schema -is [long]) -and $result.schema -eq 1 -and $result.marker -ceq $marker -and $result.status -cin @('passed','failed') -and $result.scope -ceq 'real service scope handoff; synthetic process tree and loopback only') 'scope_handoff_result_binding_invalid'
+        $required=@('real_profile_config_matches_fixture','gui_discovered_parent_and_child','parent_exited_child_still_alive','first_handoff_independently_verified','live_child_proof_survives_sixty_seconds','wrong_creation_excluded','same_name_other_path_rejected','other_scope_child_rejected','unrelated_alive_rejected','two_service_samples_with_loopback_bytes','exited_tombstone_expires')
+        Require (($result.samples -is [int] -or $result.samples -is [long]) -and $result.samples -ge 0 -and $result.samples -le 1024 -and $result.stop_ack -is [bool] -and $result.collector_exited -is [bool] -and $result.trace_absent -is [bool] -and $result.fixture_closed -is [bool] -and ($null -eq $result.collector_exit_code -or (($result.collector_exit_code -is [int] -or $result.collector_exit_code -is [long]) -and $result.collector_exit_code -ge 0 -and $result.collector_exit_code -le [uint32]::MaxValue)) -and ($null -eq $result.service_version -or ($result.service_version -is [string] -and $result.service_version -cmatch '^\d+\.\d+\.\d+$')) -and ($null -eq $result.failure_code -or ($result.failure_code -is [string] -and $result.failure_code -cmatch '^[a-z][a-z0-9_]{1,90}$')) -and ($result.elapsed_ms -is [int] -or $result.elapsed_ms -is [long]) -and $result.elapsed_ms -ge 0 -and $result.elapsed_ms -le 600000 -and @($result.checks|Where-Object {$_ -isnot [string] -or $_ -cnotin $required}).Count -eq 0) 'scope_handoff_result_values_invalid'
+        $record.result=[ordered]@{status=$result.status;marker_matches=$true;checks=$result.checks;samples=$result.samples;stop_ack=$result.stop_ack;collector_exited=$result.collector_exited;collector_exit_code=$result.collector_exit_code;trace_absent=$result.trace_absent;fixture_closed=$result.fixture_closed;service_version=$result.service_version;failure_code=$result.failure_code;elapsed_ms=$result.elapsed_ms}
+        Require ($record.native_exit_code -eq 0 -and $result.status -ceq 'passed' -and $null -eq $result.failure_code -and @($result.checks).Count -eq $required.Count -and @(Compare-Object $required @($result.checks)).Count -eq 0 -and $result.samples -ge 2 -and $result.stop_ack -and $result.collector_exited -and $null -ne $result.collector_exit_code -and $result.collector_exit_code -eq 0 -and $result.trace_absent -and $result.fixture_closed -and $result.service_version -ceq '1.0.1') 'scope_handoff_independent_proof_or_stop_failed'
+        Require ((Assert-OwnedInstall).receipt_hash -ceq $firstReceipt -and (Get-FileHash -LiteralPath $serviceProbe -Algorithm SHA256).Hash.ToLowerInvariant() -ceq $serviceProbeHash) 'scope_handoff_changed_service_receipt_or_probe';$record.status='passed'
+    }catch{$probeFailure=$_;$record.status='failed';$record.failure_code=Failure-Code $_}
+    finally{
+        if($process){try{if(-not $process.HasExited){Require ($null -ne $started -and $process.StartTime.ToUniversalTime() -eq $started -and (Same-Path $process.Path $serviceProbe)) 'scope_handoff_cleanup_identity_changed';$process.Kill($false);Require ($process.WaitForExit(10000)) 'scope_handoff_cleanup_exit_unconfirmed'};$record.native_exit_code=[CodexProxyTray.ServiceQaNative]::GuiExitCode([uint32]$process.Id)}catch{if(-not $probeFailure){$probeFailure=$_};$record.status='failed'}finally{[CodexProxyTray.ServiceQaNative]::ReleaseGui([uint32]$process.Id);$process.Dispose()}}
+        try{
+            if($configCreated){No-Reparse $profileRoot;No-Reparse $configPath;Require ((Get-Item -LiteralPath $configPath).Length -eq $configBytes.Length -and (Get-FileHash -LiteralPath $configPath -Algorithm SHA256).Hash.ToLowerInvariant() -ceq $configHash -and [Convert]::ToBase64String([IO.File]::ReadAllBytes($configPath)) -ceq [Convert]::ToBase64String($configBytes)) 'scope_handoff_profile_config_changed_preserved';[IO.File]::Delete($configPath);$record.profile_config_cleanup='removed_exact_owned_bytes'}
+            if($profileCreated){No-Reparse $profileRoot;Require (@(Get-ChildItem -LiteralPath $profileRoot -Force).Count -eq 0) 'scope_handoff_new_profile_directory_not_empty';[IO.Directory]::Delete($profileRoot);$record.profile_directory_cleanup='removed_owned_empty_directory'}elseif($profileExisted){$record.profile_directory_cleanup='preexisting_directory_preserved'}
+        }catch{$record.status='failed';$record.profile_config_cleanup='blocked_unknown_preserved';$record.profile_cleanup_code=Failure-Code $_;if(-not $probeFailure){$probeFailure=$_}}
+        $until=[DateTime]::UtcNow.AddSeconds(12);do{$collectors=@(Get-CimInstance Win32_Process -Filter "Name = 'CodexProxyTrayTrafficService.exe'"|Where-Object {$_.CommandLine -like '*--traffic-collector*' -and (Same-Path $_.ExecutablePath $serviceImage)});if($collectors.Count){Start-Sleep -Milliseconds 100}}while($collectors.Count -and [DateTime]::UtcNow -lt $until)
+        if($collectors.Count){$record.collector_cleanup='blocked';$record.status='failed';if(-not $probeFailure){$probeFailure='scope_handoff_collectors_remain'}}else{$record.collector_cleanup='passed'}
+        if($record.status -eq 'passed'){try{No-Reparse $sandbox;Require (Is-Within (Full-Path $sandbox) $diagnosticRoot) 'scope_handoff_cleanup_boundary';if(Test-Path -LiteralPath $fixture){No-Reparse $fixture;Require (@(Get-ChildItem -LiteralPath $fixture -Force).Count -eq 0) 'scope_handoff_fixture_not_empty';[IO.Directory]::Delete($fixture)};$entries=@(Get-ChildItem -LiteralPath $sandbox -Force);Require ($entries.Count -eq 1 -and $entries[0].Name -ceq 'result.json' -and -not $entries[0].PSIsContainer) 'scope_handoff_sandbox_unknown_preserved';[IO.File]::Delete($resultPath);[IO.Directory]::Delete($sandbox)}catch{$record.status='failed';$record.cleanup_code=Failure-Code $_;$probeFailure=$_}}
+        Write-NewJson (Join-Path $evidenceRoot 'scope-handoff-client.json') $record;$report['scope_handoff_client']=$record
+    }
+    if($probeFailure){throw $probeFailure}
+}
 function Run-TargetScopeRejection([switch]$AfterEmptyTargets) {
     $owned=Assert-OwnedInstall
     if($owned.service.State -eq 1){Start-Service -Name $serviceName -ErrorAction Stop -WarningAction Stop;$controller=Get-Service -Name $serviceName;try{$controller.WaitForStatus([ServiceProcess.ServiceControllerStatus]::Running,[TimeSpan]::FromSeconds($ServiceTimeoutSeconds))}finally{$controller.Dispose()}}
@@ -622,6 +663,7 @@ try {
     Run-Case 'service_backed_sampling_roundtrip_and_stop_ack' {Run-ServicePipeline}
     Run-Case 'non_elevated_medium_service_client_collects_and_stops' {Run-ServiceClientProbe}
     Run-Case 'guard_pause_stops_and_resume_respects_statistics_preference' {Run-GuardTrafficProbe}
+    Run-Case 'service_scope_independently_accepts_exited_parent_live_child_handoff' {Run-ScopeHandoffProbe}
     Run-Case 'same_owner_non_gui_client_cannot_start_out_of_scope_targets' {Run-TargetScopeRejection}
     Run-Case 'same_owner_non_gui_client_cannot_add_out_of_scope_targets' {Run-TargetScopeRejection -AfterEmptyTargets}
     Run-Case 'different_gui_hash_reuses_installed_compatible_service' {
