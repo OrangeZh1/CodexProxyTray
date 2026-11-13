@@ -145,7 +145,20 @@ namespace CodexProxyTray {
   public int PathHResult,RawPathHResult,ArgumentsHResult,WorkingDirectoryHResult;
   public string Path,RawPath,Arguments,WorkingDirectory;
  }
+ public sealed class InstallerMainWindow {public uint ProcessId;public bool Visible,Minimized;public int Width,Height;}
  public static class InstallerShortcutNative {
+  delegate bool EnumWindowProc(IntPtr window,IntPtr parameter);
+  [StructLayout(LayoutKind.Sequential)] struct Rect {public int left,top,right,bottom;}
+  [DllImport("user32.dll",SetLastError=true)] static extern bool EnumWindows(EnumWindowProc callback,IntPtr parameter);
+  [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr window,out uint pid);
+  [DllImport("user32.dll",CharSet=CharSet.Unicode)] static extern int GetWindowTextW(IntPtr window,StringBuilder title,int maximum);
+  [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr window);
+  [DllImport("user32.dll")] static extern bool IsIconic(IntPtr window);
+  [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr window,out Rect rect);
+  public static InstallerMainWindow[] MainWindows(uint expectedPid){
+   var matches=new System.Collections.Generic.List<InstallerMainWindow>();
+   if(!EnumWindows((window,parameter)=>{uint pid;GetWindowThreadProcessId(window,out pid);if(pid!=expectedPid)return true;var title=new StringBuilder(256);GetWindowTextW(window,title,title.Capacity);if(!String.Equals(title.ToString(),"CodexProxyTray",StringComparison.Ordinal))return true;Rect rect;if(GetWindowRect(window,out rect))matches.Add(new InstallerMainWindow {ProcessId=pid,Visible=IsWindowVisible(window),Minimized=IsIconic(window),Width=rect.right-rect.left,Height=rect.bottom-rect.top});return true;},IntPtr.Zero))throw new System.ComponentModel.Win32Exception();return matches.ToArray();
+  }
   public static NativeShortcutValues Read(string file){
    object root=null;
    try {
@@ -162,11 +175,23 @@ namespace CodexProxyTray {
 '@}
     [CodexProxyTray.InstallerShortcutNative]::Read($Path)
 }
-function RecordShortcut([string]$Kind,[string]$Path,$Link){
-    $expected=Join-Path $installRoot 'current\CodexProxyTray.exe';$actual=[string]$Link.TargetPath;$arguments=[string]$Link.Arguments
-    $exists=Test-Path -LiteralPath $Path -PathType Leaf;$targetExists=$actual -and (Test-Path -LiteralPath $actual -PathType Leaf)
-    $expectedHash=if(Test-Path -LiteralPath $expected -PathType Leaf){Hash $expected}else{$null};$targetHash=if($targetExists){Hash $actual}else{$null}
-    $value=[ordered]@{kind=$Kind;source_root=(ShortcutText $installRoot);link_exists=[bool]$exists;target_path=(ShortcutText $actual);arguments=(ShortcutText $arguments);expected_target=(ShortcutText $expected);target_exists=[bool]$targetExists;target_sha256=$targetHash;expected_sha256=$expectedHash;target_hash_matches=($null -ne $targetHash -and $targetHash -ceq $expectedHash)}
+function RecordShortcut([string]$Kind,[string]$Path){
+    $expected=Join-Path $installRoot 'current\CodexProxyTray.exe';$actual='';$arguments='';$targetHash=$null;$targetExists=$false;$wshError=$null
+    try{$shell=New-Object -ComObject WScript.Shell;$link=$shell.CreateShortcut($Path);$actual=[string]$link.TargetPath;$arguments=[string]$link.Arguments;$targetExists=$actual -and (Test-Path -LiteralPath $actual -PathType Leaf);if($targetExists){$targetHash=Hash $actual}}catch{$wshError=ShortcutText $_.Exception.Message}
+    $exists=Test-Path -LiteralPath $Path -PathType Leaf;$expectedHash=if(Test-Path -LiteralPath $expected -PathType Leaf){Hash $expected}else{$null}
+    $value=[ordered]@{kind=$Kind;source_root=(ShortcutText $installRoot);link_exists=[bool]$exists;target_path=(ShortcutText $actual);arguments=(ShortcutText $arguments);expected_target=(ShortcutText $expected);target_exists=[bool]$targetExists;target_sha256=$targetHash;expected_sha256=$expectedHash;target_hash_matches=($null -ne $targetHash -and $targetHash -ceq $expectedHash);native_valid=$false}
+    if($wshError){$value.wsh_read_error=$wshError}
+    if($exists){try{
+        $native=ReadNativeShortcut $Path
+        $value.native_get_path_hresult=('0x{0:X8}' -f $native.PathHResult);$value.native_get_path=(ShortcutText $native.Path)
+        $value.native_get_raw_path_hresult=('0x{0:X8}' -f $native.RawPathHResult);$value.native_get_raw_path=(ShortcutText $native.RawPath)
+        $value.native_get_arguments_hresult=('0x{0:X8}' -f $native.ArgumentsHResult);$value.native_arguments=(ShortcutText $native.Arguments)
+        $value.native_get_working_directory_hresult=('0x{0:X8}' -f $native.WorkingDirectoryHResult);$value.native_working_directory=(ShortcutText $native.WorkingDirectory)
+        $value.native_path_matches=$native.Path -ieq $expected;$value.native_raw_path_matches=$native.RawPath -ieq $expected
+        $value.native_target_exists=Test-Path -LiteralPath $native.Path -PathType Leaf;$nativeHash=if($value.native_target_exists){Hash $native.Path}else{$null};$value.native_target_sha256=$nativeHash
+        $value.native_target_hash_matches=$null -ne $nativeHash -and $nativeHash -ceq $expectedHash
+        $value.native_valid=$native.PathHResult -eq 0 -and $native.RawPathHResult -eq 0 -and $native.ArgumentsHResult -eq 0 -and $value.native_path_matches -and $value.native_raw_path_matches -and [string]::IsNullOrEmpty($native.Arguments) -and $value.native_target_exists -and $value.native_target_hash_matches
+    }catch{$value.native_read_error=ShortcutText $_.Exception.Message}}
     $report.shortcuts.Add($value);$value
 }
 function AssertRegistration {
@@ -174,23 +199,15 @@ function AssertRegistration {
     Require ($entry.DisplayName -ceq 'CodexProxyTray' -and $entry.DisplayVersion -ceq $manifest.version -and [IO.Path]::GetFullPath($entry.InstallLocation) -ieq $installRoot) 'per_user_installed_apps_registration'
     Require ($entry.UninstallString.Contains((Join-Path $installRoot 'uninstall.exe')) -and (Test-Path -LiteralPath (Join-Path $installRoot 'uninstall.exe'))) 'stable_uninstaller_outside_current'
     Require (-not (Test-Path -LiteralPath $machineReg)) 'no_machine_wide_registration'
-    $shell=New-Object -ComObject WScript.Shell;$link=$shell.CreateShortcut($shortcut)
-    $diagnostic=RecordShortcut 'start_menu' $shortcut $link
-    if($diagnostic.link_exists -and -not($link.TargetPath -ieq (Join-Path $installRoot 'current\CodexProxyTray.exe') -and [string]::IsNullOrEmpty($link.Arguments))){
-        try{
-            $native=ReadNativeShortcut $shortcut
-            $diagnostic.native_get_path_hresult=('0x{0:X8}' -f $native.PathHResult);$diagnostic.native_get_path=(ShortcutText $native.Path)
-            $diagnostic.native_get_raw_path_hresult=('0x{0:X8}' -f $native.RawPathHResult);$diagnostic.native_get_raw_path=(ShortcutText $native.RawPath)
-            $diagnostic.native_get_arguments_hresult=('0x{0:X8}' -f $native.ArgumentsHResult);$diagnostic.native_arguments=(ShortcutText $native.Arguments)
-            $diagnostic.native_get_working_directory_hresult=('0x{0:X8}' -f $native.WorkingDirectoryHResult);$diagnostic.native_working_directory=(ShortcutText $native.WorkingDirectory)
-        }catch{$diagnostic.native_read_error=(ShortcutText $_.Exception.Message)}
+    $diagnostic=RecordShortcut 'start_menu' $shortcut
+    if($diagnostic.link_exists -and -not $diagnostic.native_valid){
         try{
             $fixedSource=Join-Path ([Environment]::GetFolderPath('Programs')) 'CodexProxyTray.lnk';$destination=Join-Path ([IO.Path]::GetFullPath($EvidenceDirectory)) 'custom-start-menu-link.lnk';$item=Get-Item -LiteralPath $shortcut -Force
             if([IO.Path]::GetFullPath($shortcut) -ine [IO.Path]::GetFullPath($fixedSource) -or $item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -or $item.Length -gt 65536 -or (Test-Path -LiteralPath $destination)){throw 'shortcut_evidence_boundary_refused'}
             $sourceHash=Hash $shortcut;[IO.File]::Copy($shortcut,$destination,$false);if((Hash $destination) -cne $sourceHash){throw 'shortcut_evidence_copy_hash_mismatch'};$diagnostic.evidence_name='custom-start-menu-link.lnk';$diagnostic.evidence_sha256=$sourceHash
         }catch{$diagnostic.capture_error=ShortcutText $_.Exception.Message}
     }
-    Require ($link.TargetPath -ieq (Join-Path $installRoot 'current\CodexProxyTray.exe') -and [string]::IsNullOrEmpty($link.Arguments)) 'single_normal_start_menu_entry'
+    Require ($diagnostic.link_exists -and $diagnostic.native_valid) 'single_normal_start_menu_entry'
     Require (-not (Test-Path -LiteralPath $legacyShortcut)) 'no_second_notification_start_menu_entry'
     Require (-not (Test-Path -LiteralPath (Join-Path $startMenu 'codex-proxy-cli.lnk'))) 'private_cli_has_no_start_menu_entry'
 }
@@ -199,9 +216,32 @@ function AssertDesktop([bool]$Wanted){
     $preferencePath=Join-Path $data ('installation-preferences-v1\'+$marker.install_id+'.json')
     $preference=Get-Content -LiteralPath $preferencePath -Raw|ConvertFrom-Json
     Require (@($marker.PSObject.Properties.Name).Count -eq 6 -and @($preference.PSObject.Properties.Name).Count -eq 5 -and $preference.schema -eq 1 -and $preference.product -ceq 'CodexProxyTray.InstallationPreferences' -and $preference.install_id -ceq $marker.install_id -and $preference.root -ieq $installRoot -and $preference.desktop_shortcut -is [bool] -and $preference.desktop_shortcut -eq $Wanted) 'strict_data_sidecar_preserves_six_field_marker'
-    $shell=New-Object -ComObject WScript.Shell;$link=$shell.CreateShortcut($desktopShortcut);[void](RecordShortcut 'desktop' $desktopShortcut $link)
-    if($Wanted){Require ((Test-Path -LiteralPath $desktopShortcut) -and $link.TargetPath -ieq (Join-Path $installRoot 'current\CodexProxyTray.exe') -and [string]::IsNullOrEmpty($link.Arguments)) 'desktop_shortcut_is_normal_current_helper'}else{Require (-not(Test-Path -LiteralPath $desktopShortcut)) 'desktop_choice_off_removes_only_owned_entry'}
+    $diagnostic=RecordShortcut 'desktop' $desktopShortcut
+    if($Wanted){Require ($diagnostic.link_exists -and $diagnostic.native_valid) 'desktop_shortcut_is_normal_current_helper'}else{Require (-not(Test-Path -LiteralPath $desktopShortcut)) 'desktop_choice_off_removes_only_owned_entry'}
 }
+function OpenOwnedStartMenu {
+    $diagnostic=RecordShortcut 'custom_start_menu_before_shell_open' $shortcut
+    Require ($diagnostic.link_exists -and $diagnostic.native_valid) 'unicode_start_menu_validated_before_shell_execute'
+    $linkHash=Hash $shortcut;$active=Get-Content -LiteralPath (Join-Path $installRoot 'active-version.json') -Raw|ConvertFrom-Json;$expected=Join-Path $installRoot 'current\CodexProxyTray.exe'
+    Require ($active.schema -eq 1 -and $active.state -ceq 'active' -and $active.current.path -ieq (Join-Path $installRoot 'current') -and $active.current.version -ceq $manifest.version -and $active.readiness.native -ceq 'passed' -and $active.readiness.main_rendered -and $active.readiness.tray_rendered -and $active.readiness.helper_pid -gt 0) 'shortcut_shell_open_uses_current_committed_helper'
+    $helper=Get-Process -Id ([int]$active.readiness.helper_pid) -ErrorAction Stop;$activation=$null
+    try{
+        [void]$helper.SafeHandle;$created=$helper.StartTime.ToUniversalTime().ToFileTimeUtc();$started=([DateTimeOffset]$helper.StartTime.ToUniversalTime()).ToUnixTimeMilliseconds();$image=@($active.current.files|Where-Object name -CEQ 'CodexProxyTray.exe')
+        Require (-not $helper.HasExited -and $helper.Path -ieq $expected -and $image.Count -eq 1 -and (Hash $expected) -ceq $image[0].sha256) 'shortcut_shell_open_binds_exact_live_image'
+        $ready=Get-Content -LiteralPath (Join-Path $data 'ui-ready-main.json') -Raw|ConvertFrom-Json
+        Require ($ready.window -ceq 'main' -and $ready.helper_pid -eq $helper.Id -and $ready.rendered -and $ready.at -ge $started) 'shortcut_shell_open_has_fresh_main_readiness'
+        Require ((Hash $shortcut) -ceq $linkHash) 'shortcut_shell_open_link_unchanged_after_validation'
+        $before=@([CodexProxyTray.InstallerShortcutNative]::MainWindows([uint32]$helper.Id));$info=[Diagnostics.ProcessStartInfo]::new($shortcut);$info.UseShellExecute=$true;$info.Verb='open';$info.WindowStyle='Normal';$activation=[Diagnostics.Process]::Start($info)
+        $deadline=[DateTime]::UtcNow.AddSeconds(15);$visible=@()
+        do{
+            $helper.Refresh();if($helper.HasExited -or $helper.StartTime.ToUniversalTime().ToFileTimeUtc() -ne $created -or $helper.Path -ine $expected){throw 'shortcut_shell_open_helper_identity_changed'}
+            $visible=@([CodexProxyTray.InstallerShortcutNative]::MainWindows([uint32]$helper.Id)|Where-Object {$_.Visible -and -not $_.Minimized -and $_.Width -gt 0 -and $_.Height -gt 0});if($visible.Count -eq 1){break};Start-Sleep -Milliseconds 100
+        }while([DateTime]::UtcNow -lt $deadline)
+        Require ($visible.Count -eq 1 -and $visible[0].ProcessId -eq $active.readiness.helper_pid) 'unicode_owned_start_menu_shell_execute_shows_same_main_helper'
+        $report['custom_shortcut_shell_open']=[ordered]@{helper_pid=$helper.Id;created_filetime=[string]$created;image_sha256=$image[0].sha256;link_sha256=$linkHash;visible_before=@($before|Where-Object Visible).Count -gt 0;visible=$true;minimized=$false;width=$visible[0].Width;height=$visible[0].Height;activation='ShellExecute owned StartMenu LNK';foreground_not_required=$true}
+    }finally{if($activation){$activation.Dispose()};$helper.Dispose()}
+}
+
 function DesktopChoices {
     AssertDesktop $true
     Require ((RunInstaller $setup @('/S','/DESKTOP=0')) -eq 0) 'same_root_desktop_choice_off_is_idempotent';AssertDesktop $false
@@ -320,7 +360,7 @@ try {
     $report.custom_install_cross_drive=[IO.Path]::GetPathRoot($installRoot) -ine [IO.Path]::GetPathRoot($defaultRoot)
     Require (-not(Test-Path -LiteralPath $installRoot) -and $installRoot.Contains('自选安装 目录')) 'fresh_custom_directory_is_chinese_space_path_on_local_drive'
     Require ((RunInstaller $setup @('/S','/DESKTOP=1',('/D='+$installRoot))) -eq 0) 'custom_directory_real_install_succeeds'
-    AssertRegistration;AssertDesktop $true;RefuseOtherRoot
+    AssertRegistration;AssertDesktop $true;OpenOwnedStartMenu;RefuseOtherRoot
     RegisteredUpgradeFixture
     AssertDesktop $true
     Require ((RunUninstaller) -eq 0 -and -not(Test-Path -LiteralPath $installRoot) -and -not(Test-Path -LiteralPath $reg) -and -not(Test-Path -LiteralPath $shortcut) -and -not(Test-Path -LiteralPath $desktopShortcut)) 'custom_directory_upgrade_and_owned_desktop_uninstall_succeed'
