@@ -16,6 +16,26 @@ env:
   RUST_VERSION: 1.99.1
 
 jobs:
+  installer-bootstrap:
+    name: Windows 安装器启动交接检查
+    runs-on: windows-2022
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: 验证实际安装器抵达目录保护门禁
+        shell: pwsh
+        run: ./tests/Test-InstallerBootstrap.ps1 -EvidenceDirectory "$env:RUNNER_TEMP/CodexProxyTray-bootstrap-evidence"
+      - name: 保存安装器启动交接证据
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: installer-bootstrap-evidence
+          path: ${{ runner.temp }}/CodexProxyTray-bootstrap-evidence/
+          if-no-files-found: ignore
+          retention-days: 7
+
   checks:
     name: 逻辑检查与前端构建
     runs-on: ubuntu-24.04
@@ -54,7 +74,7 @@ jobs:
 
   windows:
     name: Windows x64 原生构建与 CLI 检查
-    needs: checks
+    needs: [checks, installer-bootstrap]
     runs-on: windows-2022
     timeout-minutes: 40
     env:

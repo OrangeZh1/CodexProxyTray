@@ -1,3 +1,4 @@
+Target x86-unicode
 Unicode true
 RequestExecutionLevel user
 SetCompressor /SOLID lzma
@@ -162,6 +163,16 @@ FunctionEnd
   ${EndIf}
 !macroend
 
+!macro EmitLauncherCheck Prefix
+  System::Call 'kernel32::IsWow64Process(p -1, *i.r0) i.r1'
+  StrLen $2 $BackendCommand
+  StrCpy $3 0
+  IfFileExists "$SystemPowerShell" 0 +2
+    StrCpy $3 1
+  StrCpy $BootstrapText "stage=launcher-check;wow64=$0;query=$1;file_exists=$3;command_chars=$2"
+  Call ${Prefix}BootstrapDiagnostic
+!macroend
+
 !macro ClearPrivateEnvironment
   System::Call 'kernel32::SetEnvironmentVariableW(w "CODEX_PROXY_UPDATER_MODULES_PRESENT", p 0)'
   System::Call 'kernel32::SetEnvironmentVariableW(w "CODEX_PROXY_UPDATER_MODULES", p 0)'
@@ -232,6 +243,7 @@ install_plan_ready:
   StrCpy $BackendCommand '$"$SystemPowerShell$" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $"$PLUGINSDIR\install_application.ps1$" -PlanPath $"$PLUGINSDIR\plan.ini$"'
   StrCpy $BootstrapText "stage=plan-ready;launcher=sysnative64"
   Call BootstrapDiagnostic
+  !insertmacro EmitLauncherCheck ""
   ; nsExec uses a hidden console. No TIMEOUT: never kill an installation transaction for quiet output.
   nsExec::ExecToStack $BackendCommand
   Pop $BackendExit
@@ -282,6 +294,7 @@ Section "Uninstall"
   StrCpy $BackendCommand '$"$SystemPowerShell$" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $"$PLUGINSDIR\install_application.ps1$" -PlanPath $"$PLUGINSDIR\plan.ini$"'
   StrCpy $BootstrapText "stage=plan-ready;launcher=sysnative64"
   Call un.BootstrapDiagnostic
+  !insertmacro EmitLauncherCheck "un."
   nsExec::ExecToStack $BackendCommand
   Pop $BackendExit
   Pop $BackendOutput

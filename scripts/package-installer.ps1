@@ -44,6 +44,10 @@ try {
     Require ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $setup -PathType Leaf)) 'nsis_installer_compiled'
     $fileVersion=[Diagnostics.FileVersionInfo]::GetVersionInfo($setup)
     Require ($fileVersion.ProductVersion -ceq $version -and $fileVersion.FileVersion -ceq "$version.0") 'installer_pe_version_matches_release'
+    $stream=[IO.File]::OpenRead($setup);$reader=[IO.BinaryReader]::new($stream)
+    try{$stream.Position=0x3c;$peOffset=$reader.ReadUInt32();$stream.Position=$peOffset;Require ($reader.ReadUInt32() -eq 0x4550) 'installer_valid_pe_header';$machine=$reader.ReadUInt16()}finally{$reader.Dispose()}
+    $report.installer_machine=('0x{0:x4}' -f $machine)
+    Require ($machine -eq 0x14c) 'x86_installer_wrapper_uses_native_x64_powershell_alias'
     $setupHash=Hash $setup
     $text=@($zipName,'CodexProxyTray-update.json',$setupName)|ForEach-Object {"$(Hash (Join-Path $release $_))  $_"}
     [IO.File]::WriteAllText((Join-Path $release 'SHA256SUMS.txt'),($text -join "`n")+"`n",[Text.UTF8Encoding]::new($false))

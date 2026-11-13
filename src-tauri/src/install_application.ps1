@@ -160,6 +160,7 @@ function Uninstall {
     SaveOutcome 'uninstalled' $null;$script:exitCode=0
 }
 try {
+    if([IntPtr]::Size -ne 8){AppFail 'The installer backend requires native x64 PowerShell.'}
     if(-not $UpdateEnginePath){$UpdateEnginePath=Join-Path $PSScriptRoot 'install_update.ps1'};$UpdateEnginePath=Full $UpdateEnginePath
     . $UpdateEnginePath -Phase Library
     $bootstrapPhase='parse_plan'
