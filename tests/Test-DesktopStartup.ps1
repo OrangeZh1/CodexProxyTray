@@ -34,6 +34,10 @@ try{
     $grid=@($layout.geometry.nodes|Where-Object selector -eq '.dashboard-grid')[0];$guard=@($layout.geometry.nodes|Where-Object selector -eq '.guard-floating')[0]
     if($null -eq $guard -or [Math]::Abs(($guard.x+$guard.width)-($grid.x+$grid.width)) -gt 1.5){throw 'The guard control must align with the content right edge.'}
     $report['guard_content_alignment_verified']=$true
+    $plot=@($layout.geometry.nodes|Where-Object selector -eq '.traffic-plot')[0];$chart=@($layout.geometry.nodes|Where-Object selector -eq '.traffic-chart-card .probe-chart')[0]
+    if($plot.width -gt 0 -and [Math]::Abs(($plot.x-$chart.x)-(($chart.x+$chart.width)-($plot.x+$plot.width))) -gt 1.5){throw 'The traffic plot must have equal left and right gutters.'}
+    $report['traffic_plot_symmetric_gutters_verified']=($plot.width -gt 0)
+
     $report['page_occlusion_check']='passed'
     $status=Get-Content -LiteralPath (Join-Path $root 'status.json') -Raw|ConvertFrom-Json;if($status.enabled){throw 'A first launch must remain paused until explicitly enabled.'};$report['guard_default_paused']=$true
     $quitter=Start-Owned '--quit';try{if(-not $quitter.WaitForExit(10000) -or $quitter.ExitCode -ne 0){throw 'Quit request failed.'}}finally{$quitter.Dispose()}

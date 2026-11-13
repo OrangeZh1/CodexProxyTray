@@ -287,6 +287,7 @@ fn scope_config(root:&Path)->Result<crate::settings::Config,String>{
     if scope.cli_command.len()>16||scope.cli_command.iter().any(|part|part.is_empty()||part.contains('\0'))||scope.cli_command.iter().map(|part|part.encode_utf16().count()).sum::<usize>()>32767{return Err("本用户 CLI 配置超过辅助服务读取范围。".into())}
     Ok(crate::settings::Config{cli_command:scope.cli_command,..crate::settings::Config::default()})
 }
+fn lease_belongs_to(lease:&crate::native::ProcessLease,owner:&str)->bool{process_sid(HANDLE(lease.as_handle())).is_ok_and(|sid|sid==owner)}
 pub(crate) struct CollectorScope{
     user:UserContext,root:PathBuf,owner_sid:String,allowed:HashMap<ProcessIdentity,(Instant,crate::native::ProcessLease)>,missed:HashSet<ProcessIdentity>,first_missed:Option<u64>,last_missed:Option<u64>,
 }
@@ -295,7 +296,7 @@ impl CollectorScope{
     pub(crate) fn targets(&mut self,requested:&[ProcessIdentity])->Result<Vec<ProcessIdentity>,String>{
         crate::traffic_core::validate_targets(requested)?;let now=Instant::now();self.allowed.retain(|_,(seen,_)|now.saturating_duration_since(*seen)<Duration::from_secs(60));
         let anchors=self.allowed.values().map(|(_,lease)|lease).collect::<Vec<_>>();let discovered=self.user.targets(&self.root,&anchors)?;
-        for lease in discovered{if !lease.belongs_to(&self.owner_sid){continue}if let Some((seen,_))=self.allowed.get_mut(&lease.identity){*seen=now;}else{if self.allowed.len()>=4096{return Err("辅助服务进程交接保留数量达到上限。".into())}self.allowed.insert(lease.identity,(now,lease));}}
+        for lease in discovered{if !lease_belongs_to(&lease,&self.owner_sid){continue}if let Some((seen,_))=self.allowed.get_mut(&lease.identity){*seen=now;}else{if self.allowed.len()>=4096{return Err("辅助服务进程交接保留数量达到上限。".into())}self.allowed.insert(lease.identity,(now,lease));}}
         let mut accepted=Vec::new();for &identity in requested{
             if self.allowed.contains_key(&identity){accepted.push(identity);continue}
             let alive=match crate::traffic::open_lifetime_identity(identity).map_err(win)?{Some(process)=>match unsafe{WaitForSingleObject(process.0,0)}{WAIT_TIMEOUT=>true,WAIT_OBJECT_0=>false,_=>return Err("辅助服务无法核验目标进程状态。".into())},None=>false};
@@ -367,12 +368,12 @@ pub(crate) fn start_collector(token:&str,parent:ProcessIdentity)->Result<OwnedHa
     #[test]fn protected_scope_rejects_unrelated_live_targets_keeps_tombstones_and_restores_user_context(){
         let root=std::env::temp_dir().join(format!("codex-traffic-scope-{}-{}",std::process::id(),crate::settings::now()));fs::create_dir(&root).unwrap();
         let mut scope=CollectorScope::new(unsafe{GetCurrentProcess()}).unwrap();scope.root=root.clone();
-        let(identity,_,_,lease)=unsafe{crate::native::process_identity_with_lease(std::process::id())}.unwrap();assert!(lease.belongs_to(&scope.owner_sid));
+        let(identity,_,_,lease)=unsafe{crate::native::process_identity_with_lease(std::process::id())}.unwrap();assert!(lease_belongs_to(&lease,&scope.owner_sid));
         assert!(scope.targets(&[identity]).is_err());
         scope.allowed.insert(identity,(Instant::now()-Duration::from_secs(59),lease));assert_eq!(scope.targets(&[identity]).unwrap(),vec![identity]);
         scope.allowed.get_mut(&identity).unwrap().0=Instant::now()-Duration::from_secs(61);assert!(scope.targets(&[identity]).is_err());
         let mut child=Command::new(std::env::current_exe().unwrap()).args(["--exact","traffic_etw::tests::short_lived_binding_fixture"]).env("CODEX_TRAFFIC_BINDING_FIXTURE","1").creation_flags(0x08000000).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
-        let(exited,_,_,held)=unsafe{crate::native::process_identity_with_lease(child.id())}.unwrap();assert!(held.belongs_to(&scope.owner_sid));scope.allowed.insert(exited,(Instant::now(),held));child.stdin.take().unwrap().write_all(b"x").unwrap();assert!(child.wait().unwrap().success());
+        let(exited,_,_,held)=unsafe{crate::native::process_identity_with_lease(child.id())}.unwrap();assert!(lease_belongs_to(&held,&scope.owner_sid));scope.allowed.insert(exited,(Instant::now(),held));child.stdin.take().unwrap().write_all(b"x").unwrap();assert!(child.wait().unwrap().success());
         assert_eq!(scope.targets(&[exited]).unwrap(),vec![exited]);scope.allowed.get_mut(&exited).unwrap().0=Instant::now()-Duration::from_secs(61);assert!(scope.targets(&[exited]).unwrap().is_empty());
         let unknown=ProcessIdentity{pid:u32::MAX,created_filetime:1};assert!(scope.targets(&[unknown]).unwrap().is_empty());
         let mut sample=crate::traffic_etw::EngineSample{buffer_limited:false,missed_bindings:0,first_missed_at:None,last_missed_at:None,sent:0,received:0,seen:false,had_targets:false,partial:false,target_count:0,lost_events:Some(0),lost_buffers:Some(0),error:None};scope.mark_sample(&mut sample);assert!(sample.partial&&sample.had_targets);assert_eq!(sample.missed_bindings,2);assert!(sample.first_missed_at.is_some());

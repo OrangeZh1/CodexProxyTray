@@ -158,6 +158,7 @@ try {
   assert.doesNotMatch(unpublished,/尚未发布 CodexProxyTray 正式安装包/);
   const currentNotes=about({update:{status:'current',latest:version,notes:'### 已发布\n- 很长的正文不应自动显示。'}});
   assert.match(currentNotes,/查看更新说明/);assert.doesNotMatch(currentNotes,/很长的正文不应自动显示/);
+  const previewUpdate=renderToStaticMarkup(React.createElement(UpdateSettings,{status:{update:{status:'available',latest:'9.0.0'}},version}));assert.doesNotMatch(previewUpdate,/请在桌面助手中下载和安装更新/);
   const completed=about({app_update:{busy:false,phase:'installed',version},update:{status:'error',latest:version,error:'连接超时'}});
   assert.doesNotMatch(completed,/app-update-progress|助手更新已完成/);assert.match(completed,/上次查到版本/);assert.match(completed,/本次检查失败/);assert.match(completed,/连接超时/);
   assert.match(about({update:{status:'error',error:'连接超时'}}),/本次未获取/);

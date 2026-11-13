@@ -27,7 +27,8 @@ pub struct Summary{#[serde(flatten)]pub tokens:Tokens,pub request_count:u64,pub 
 impl Summary{fn add(&mut self,value:Tokens)->bool{if !self.tokens.add(value){return false}self.request_count+=1;self.missing_price=true;true}}
 #[derive(Clone,Debug,Serialize)]pub struct Bucket{pub start_ms:u64,pub end_ms:u64,#[serde(flatten)]pub summary:Summary,pub models:Vec<ModelUsage>}
 #[derive(Clone,Debug,Serialize)]pub struct ModelUsage{pub model:String,#[serde(flatten)]pub summary:Summary}
-#[derive(Clone,Copy,Debug,Default,Serialize,Deserialize)]pub struct Timing{pub duration_ms:Option<u64>,pub ttft_ms:Option<u64>,pub output_tokens_per_second:Option<f64>,pub timing_estimated:bool,#[serde(deserialize_with="timing_source")]pub timing_source:Option<&'static str>,pub http_status:Option<u16>}
+#[derive(Clone,Copy,Debug,PartialEq,Eq,Serialize,Deserialize)]pub enum TimingSource{#[serde(rename="codex_rollout_estimate")]CodexRolloutEstimate}
+#[derive(Clone,Copy,Debug,Default,Serialize,Deserialize)]pub struct Timing{pub duration_ms:Option<u64>,pub ttft_ms:Option<u64>,pub output_tokens_per_second:Option<f64>,pub timing_estimated:bool,pub timing_source:Option<TimingSource>,pub http_status:Option<u16>}
 #[derive(Clone,Debug,Serialize)]pub struct UsageRecord{pub at:u64,pub model:String,pub provider:Option<String>,pub source_kind:String,#[serde(flatten)]pub tokens:Tokens,#[serde(flatten)]pub timing:Timing,pub estimated_cost_usd:Option<f64>,pub missing_price:bool}
 #[derive(Clone,Debug,Serialize)]pub struct ProviderUsage{pub provider:Option<String>,#[serde(flatten)]pub summary:Summary,pub models:Vec<ModelUsage>}
 #[derive(Clone,Debug,Default,Serialize)]pub struct ScanProgress{pub files_total:usize,pub files_complete:usize,pub bytes_total:u64,pub bytes_read:u64,pub total_known:bool}
@@ -89,7 +90,7 @@ impl ResponseTiming{
                 if let Some(ttft)=self.first.and_then(|first|first.checked_sub(start)).filter(|ttft|*ttft<=duration){
                     timing.duration_ms=Some(duration);timing.ttft_ms=Some(ttft);
                     timing.output_tokens_per_second=duration.checked_sub(ttft).filter(|generation|*generation>=100).map(|generation|output as f64*1000.0/generation as f64).filter(|rate|rate.is_finite());
-                    timing.timing_estimated=true;timing.timing_source=Some("codex_rollout_estimate");
+                    timing.timing_estimated=true;timing.timing_source=Some(TimingSource::CodexRolloutEstimate);
                 }
             }}
         }
@@ -107,7 +108,6 @@ impl ResponseTiming{
 #[derive(Clone,Debug,Default,Serialize,Deserialize)]#[serde(deny_unknown_fields)]pub struct ScanLimits{pub linked_paths:usize,pub compressed_files:usize,pub scan_limit:bool,pub history_limited:bool}
 #[derive(Default)]struct PersistentCache{cache:Cache,loaded:bool,writable:bool,saved:u64,warning:Option<String>}
 #[derive(Serialize,Deserialize)]#[serde(deny_unknown_fields)]struct SavedUsage{schema:u32,cache:Cache}
-fn timing_source<'de,D:serde::Deserializer<'de>>(decoder:D)->Result<Option<&'static str>,D::Error>{match Option::<String>::deserialize(decoder)?.as_deref(){None=>Ok(None),Some("codex_rollout_estimate")=>Ok(Some("codex_rollout_estimate")),_=>Err(serde::de::Error::custom("unknown usage timing source"))}}
 fn fingerprint(bytes:&[u8])->u64{let mut hash=DefaultHasher::new();bytes.hash(&mut hash);hash.finish()}
 fn bounded_label(value:Option<String>)->Option<String>{value.filter(|value|!value.is_empty()&&value.len()<=120&&value.chars().all(|ch|ch.is_ascii_alphanumeric()||"._-:/".contains(ch)))}
 fn model(value:Option<String>)->String{bounded_label(value).filter(|value|!value.starts_with('/')&&!value.starts_with("./")&&!value.starts_with("../")&&!value.contains(":/")).unwrap_or_else(||"unknown".into())}
@@ -401,7 +401,8 @@ fn timestamp(value:&str)->Option<u64>{
         add(&mut file,event("2026-11-12T00:00:18Z","event_msg",serde_json::json!({"type":"item_completed","thread_id":"timing-thread","turn_id":"turn-a","item":{"type":"Reasoning"},"started_at_ms":base+17_000})));
         add(&mut file,usage("2026-11-12T00:00:20Z","response-d","turn-a"));
         let mut cache=Cache::default();cache.files.insert("synthetic".into(),file);let(start,end)=range();let result=aggregate(&cache,start,end,false,0,true);assert_eq!(result.records.len(),4);
-        let first=result.records.iter().find(|row|row.at==base+5_000).unwrap();assert_eq!(first.timing.duration_ms,Some(4_800));assert_eq!(first.timing.ttft_ms,Some(1_000));assert!((first.timing.output_tokens_per_second.unwrap()-400.0/3.8).abs()<0.0001);assert!(first.timing.timing_estimated);assert_eq!(first.timing.timing_source,Some("codex_rollout_estimate"));
+        let first=result.records.iter().find(|row|row.at==base+5_000).unwrap();assert_eq!(first.timing.duration_ms,Some(4_800));assert_eq!(first.timing.ttft_ms,Some(1_000));assert!((first.timing.output_tokens_per_second.unwrap()-400.0/3.8).abs()<0.0001);assert!(first.timing.timing_estimated);assert_eq!(first.timing.timing_source,Some(TimingSource::CodexRolloutEstimate));
+        let mut encoded=serde_json::to_value(first.timing).unwrap();assert_eq!(encoded["timing_source"],"codex_rollout_estimate");assert_eq!(serde_json::from_value::<Timing>(encoded.clone()).unwrap().timing_source,first.timing.timing_source);encoded["timing_source"]="unknown_source".into();assert!(serde_json::from_value::<Timing>(encoded).is_err());
         let second=result.records.iter().find(|row|row.at==base+10_000).unwrap();assert!(second.timing.duration_ms.is_none(),"A token usage gap alone is not request duration");assert!(second.timing.output_tokens_per_second.is_none());
         let third=result.records.iter().find(|row|row.at==base+15_000).unwrap();assert_eq!(third.timing.duration_ms,Some(4_000));assert_eq!(third.timing.ttft_ms,Some(1_000));assert!(result.records.iter().all(|row|row.timing.http_status.is_none()));
         let fourth=result.records.iter().find(|row|row.at==base+20_000).unwrap();assert_eq!(fourth.timing.duration_ms,Some(4_000));assert_eq!(fourth.timing.ttft_ms,Some(1_000));

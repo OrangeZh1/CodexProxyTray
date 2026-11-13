@@ -658,14 +658,14 @@ html[data-input-modality="pointer"] :is(.fui-Button,.fui-Tab,.fui-Option,.fui-Me
 .cli-version-result { padding: 3px 7px; border-radius: 4px; background: var(--panel-hover); color: var(--text-secondary); font-size: 12px; }
 .cli-version-result.has-update { color: var(--accent); background: var(--bg-selected); }
 
-.traffic-chart-card .probe-chart { font-size: 10px; grid-template-columns: var(--traffic-axis-width, 6ch) minmax(0,1fr); gap: 8px; margin-top: 8px; }
+.traffic-chart-card .probe-chart { font-size: 10px; grid-template-columns: var(--traffic-axis-width, 6ch) minmax(0,1fr) var(--traffic-axis-width, 6ch); gap: 8px; margin-top: 8px; }
 .traffic-axis { position: relative; display: block; font-variant-numeric: tabular-nums; }
 .traffic-axis small { position: absolute; top: -18px; left: 0; font-size: 10px; }
 .traffic-axis > span { position: absolute; right: 0; transform: translateY(-50%); }
 .traffic-axis > span:nth-of-type(1) { top: 2.5%; }
 .traffic-axis > span:nth-of-type(2) { top: 50%; }
 .traffic-axis > span:nth-of-type(3) { top: 97.5%; }
-.traffic-time-axis { display: flex; justify-content: space-between; margin: 8px 0 0 0; padding-inline-start: calc(var(--traffic-axis-width, 6ch) + 8px); color: var(--text-muted); font-size: 10px; font-variant-numeric: tabular-nums; }
+.traffic-time-axis { display: flex; justify-content: space-between; margin: 8px 0 0 0; padding-inline: calc(var(--traffic-axis-width, 6ch) + 8px); color: var(--text-muted); font-size: 10px; font-variant-numeric: tabular-nums; }
 .traffic-totals { border-top: 0; margin-top: 12px; padding-top: 0; }
 
 .flow-logs { margin-top: 16px; }

@@ -110,7 +110,7 @@ pub(crate) struct ProcessLease{pub identity:crate::traffic_core::ProcessIdentity
 unsafe impl Send for ProcessLease{} unsafe impl Sync for ProcessLease{}
 impl ProcessLease{
     fn allows_child(&self,child_created:u64)->bool{unsafe{let(mut created,mut exited,mut kernel,mut user)=(0,0,0,0);GetProcessTimes(self.handle,&mut created,&mut exited,&mut kernel,&mut user)!=0&&created==self.identity.created_filetime&&child_created>=created&&(exited==0||child_created<=exited)}}
-    pub(crate) fn belongs_to(&self,owner:&str)->bool{crate::traffic::process_sid(windows::Win32::Foundation::HANDLE(self.handle)).is_ok_and(|sid|sid==owner)}
+    pub(crate) fn as_handle(&self)->*mut c_void{self.handle}
 }
 impl Drop for ProcessLease{fn drop(&mut self){unsafe{CloseHandle(self.handle);}}}
 pub fn traffic_targets(root:&std::path::Path,config:&crate::settings::Config)->Result<Vec<crate::traffic_core::ProcessIdentity>,String>{traffic_targets_held(root,config).map(|leases|leases.into_iter().map(|lease|lease.identity).collect())}
