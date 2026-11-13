@@ -146,7 +146,7 @@ export function App({initialStatus=null,initialPage=globalThis.__QA_NAV__?.page|
   const [system,setSystem]=useState(()=>systemPreferences({},initialStatus||{},new Set()));
   const [directory,setDirectory]=useState(initialStatus?.cli_workdir||''),directoryEdit=useRef({dirty:false,version:0}),directoryWrite=useRef(null);
   const [logTab,setLogTab]=useState('events');
-  const [logFilter,setLogFilter]=useState('all'),[logPeriod,setLogPeriod]=useState('all'),[customStart,setCustomStart]=useState(''),[customEnd,setCustomEnd]=useState(''),[logQuery,setLogQuery]=useState(''),reads=useRef(0),layoutReported=useRef(false),cliStateEpoch=useRef(0);
+  const [logFilter,setLogFilter]=useState('all'),[logPeriod,setLogPeriod]=useState('all'),[customStart,setCustomStart]=useState(''),[customEnd,setCustomEnd]=useState(''),[logQuery,setLogQuery]=useState(''),reads=useRef(0),cliStateEpoch=useRef(0);
   const busy=name=>actions.current.has(name);
   const writable=!!invoke&&online&&status?.backend_ready&&!status?.read_only&&!(status?.app_update?.busy&&status.app_update.operation==='install');
   const observed=online&&!!status&&status.revision>0;
@@ -157,17 +157,21 @@ export function App({initialStatus=null,initialPage=globalThis.__QA_NAV__?.page|
   function navigate(target){if(target==='about'){setSettingsTab('about');setPage('settings');}else if(Object.hasOwn(pages,target)){setPage(target);}}
   useThemeLayoutEffect(()=>{mainScroll.current?.scrollTo({top:0,left:0,behavior:'instant'});if(globalThis.matchMedia?.('(prefers-reduced-motion: reduce)').matches)return;const surface=mainScroll.current?.querySelector('.main-content > section:not([hidden])'),motion=surface?.animate?.([{translate:'0 6px'},{translate:'0 0'}],{duration:220,easing:'cubic-bezier(.2,0,0,1)'});return()=>motion?.cancel();},[page,settingsTab]);
   useThemeLayoutEffect(()=>applyDocumentTheme(resolvedTheme),[resolvedTheme]);
+  useThemeLayoutEffect(()=>{
+    if(!appWindow||!invoke)return;
+    let disposed=false;
+    // A committed DOM is ready even when a hidden window receives no animation
+    // frames or the optional native theme synchronization is still pending.
+    const report=async()=>{try{const requested=await invoke('frontend_ready',{rendered:document.getElementById('root')?.childElementCount>0,geometry:renderGeometry()});if(!disposed)navigate(requested);}catch{if(!disposed)show('窗口初始化失败，请重新打开助手。','warning');}};
+    report();return()=>{disposed=true;};
+  },[]);
   useEffect(()=>{
     let disposed=false;
     const media=globalThis.matchMedia?.(systemThemeQuery);
     const failed=()=>{if(!disposed)show('窗口主题同步失败。','warning');};
     const changed=event=>{if(disposed)return;setSystemDark(event.matches);if(currentThemeMode.current==='system'){applyDocumentTheme(resolveTheme('system',event.matches));syncNativeAppearance('system').catch(failed);}};
     media?.addEventListener('change',changed);
-    const ready=async()=>{
-      try{await syncNativeAppearance(currentThemeMode.current);}catch{failed();}
-      finally{if(appWindow&&invoke){try{const requested=await invoke('frontend_ready',{rendered:document.getElementById('root')?.childElementCount>0,geometry:renderGeometry()});if(!disposed)navigate(requested);}catch{if(!disposed)show('窗口初始化失败，请重新打开助手。','warning');}}}
-    };
-    ready();
+    syncNativeAppearance(currentThemeMode.current).catch(failed);
     return()=>{disposed=true;media?.removeEventListener('change',changed);};
   },[]);
   async function readStatus(){
@@ -186,7 +190,6 @@ export function App({initialStatus=null,initialPage=globalThis.__QA_NAV__?.page|
     if(!proxyEdit.current.dirty)setProxy(next.proxy_url);
     setSystem(value=>systemPreferences(value,next,systemPending.current));
     if(!directoryEdit.current.dirty)setDirectory(next.cli_workdir||'');
-    if(!layoutReported.current){layoutReported.current=true;requestAnimationFrame(()=>invoke?.('frontend_ready',{rendered:true,geometry:renderGeometry()}).catch(()=>{}));}
     return next;
   }
   useEffect(()=>{
