@@ -5,7 +5,7 @@ SetCompressor /SOLID lzma
 Name "CodexProxyTray"
 OutFile "${OUTPUT_FILE}"
 InstallDir "$LOCALAPPDATA\Programs\CodexProxyTray"
-InstallDirRegKey HKCU64 "Software\Microsoft\Windows\CurrentVersion\Uninstall\CodexProxyTray" "InstallLocation"
+InstallDirRegKey HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\CodexProxyTray" "InstallLocation"
 ShowInstDetails show
 ShowUninstDetails show
 VIProductVersion "${APP_VERSION}.0"
