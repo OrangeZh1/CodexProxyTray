@@ -57,8 +57,12 @@ function RequireUpdatedMainVisible($Case){
     $newHelper=Get-Process -Id ([int]$active.readiness.helper_pid) -ErrorAction Stop
     try {
         $newCreated=$newHelper.StartTime.ToUniversalTime().ToFileTimeUtc();$newStartMs=([DateTimeOffset]$newHelper.StartTime.ToUniversalTime()).ToUnixTimeMilliseconds()
-        $committed=[DateTimeOffset]::Parse($active.committed_at).UtcDateTime.ToFileTimeUtc()
-        Require ($Case.parent.HasExited -and $newCreated -ge $Case.parent.ExitTime.ToUniversalTime().ToFileTimeUtc() -and $newCreated -le $committed -and [IO.Path]::GetFullPath($newHelper.Path) -ieq $Case.exe) 'visible_main_process_identity_matches_new_active_image'
+        $commitValue=$active.committed_at
+        $commitUtc=if($commitValue -is [DateTimeOffset]){$commitValue.UtcDateTime}elseif($commitValue -is [DateTime]){$commitValue.ToUniversalTime()}else{[DateTimeOffset]::Parse([string]$commitValue,[Globalization.CultureInfo]::InvariantCulture).UtcDateTime}
+        $committed=$commitUtc.ToFileTimeUtc();$parentExited=$Case.parent.HasExited;$parentExit=if($parentExited){$Case.parent.ExitTime.ToUniversalTime().ToFileTimeUtc()}else{$null}
+        $afterParent=$parentExited -and $newCreated -ge $parentExit;$beforeCommit=$newCreated -le $committed;$imageMatches=[IO.Path]::GetFullPath($newHelper.Path) -ieq $Case.exe
+        $script:report['updated_main_identity']=[ordered]@{helper_pid=$newHelper.Id;parent_pid=$Case.parent.Id;parent_exited=$parentExited;parent_exit_filetime=[string]$parentExit;new_created_filetime=[string]$newCreated;committed_filetime=[string]$committed;committed_value_type=$commitValue.GetType().FullName;committed_utc=$commitUtc.ToString('o');after_parent_exit=$afterParent;before_durable_commit=$beforeCommit;image_path_matches=$imageMatches}
+        Require ($afterParent -and $beforeCommit -and $imageMatches) 'visible_main_process_identity_matches_new_active_image'
         $activeExe=@($active.current.files|Where-Object name -CEQ 'CodexProxyTray.exe')
         Require ($activeExe.Count -eq 1 -and (Hash $Case.exe) -ceq $activeExe[0].sha256) 'visible_main_image_matches_committed_hash'
         foreach($view in @('main','tray')){

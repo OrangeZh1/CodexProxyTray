@@ -217,12 +217,12 @@ jobs:
           path: ${{ runner.temp }}/CodexProxyTray-installer-wizard-evidence/
           if-no-files-found: ignore
           retention-days: 7
-      - name: 隔离验证助手安装更新与失败回退
-        shell: pwsh
-        run: ./tests/Test-AppUpdate.ps1 -ReleaseDirectory "${{ github.workspace }}/release" -EvidenceDirectory "$env:RUNNER_TEMP/CodexProxyTray-updater-evidence"
       - name: 隔离验证标准安装与卸载注册
         shell: pwsh
         run: ./tests/Test-Installer.ps1 -ReleaseDirectory "${{ github.workspace }}/release" -EvidenceDirectory "$env:RUNNER_TEMP/CodexProxyTray-installer-evidence"
+      - name: 隔离验证助手安装更新与失败回退
+        shell: pwsh
+        run: ./tests/Test-AppUpdate.ps1 -ReleaseDirectory "${{ github.workspace }}/release" -EvidenceDirectory "$env:RUNNER_TEMP/CodexProxyTray-updater-evidence"
       - name: 保存 Windows 安装器验收证据
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
