@@ -108,15 +108,21 @@ pub fn desktop_info() -> Option<DesktopInfo> { unsafe {
 // https://devblogs.microsoft.com/oldnewthing/20110107-00/?p=11803
 pub(crate) struct ProcessLease{pub identity:crate::traffic_core::ProcessIdentity,handle:Handle}
 unsafe impl Send for ProcessLease{} unsafe impl Sync for ProcessLease{}
-impl ProcessLease{fn allows_child(&self,child_created:u64)->bool{unsafe{let(mut created,mut exited,mut kernel,mut user)=(0,0,0,0);GetProcessTimes(self.handle,&mut created,&mut exited,&mut kernel,&mut user)!=0&&created==self.identity.created_filetime&&child_created>=created&&(exited==0||child_created<=exited)}}}
+impl ProcessLease{
+    fn allows_child(&self,child_created:u64)->bool{unsafe{let(mut created,mut exited,mut kernel,mut user)=(0,0,0,0);GetProcessTimes(self.handle,&mut created,&mut exited,&mut kernel,&mut user)!=0&&created==self.identity.created_filetime&&child_created>=created&&(exited==0||child_created<=exited)}}
+    pub(crate) fn belongs_to(&self,owner:&str)->bool{crate::traffic::process_sid(windows::Win32::Foundation::HANDLE(self.handle)).is_ok_and(|sid|sid==owner)}
+}
 impl Drop for ProcessLease{fn drop(&mut self){unsafe{CloseHandle(self.handle);}}}
 pub fn traffic_targets(root:&std::path::Path,config:&crate::settings::Config)->Result<Vec<crate::traffic_core::ProcessIdentity>,String>{traffic_targets_held(root,config).map(|leases|leases.into_iter().map(|lease|lease.identity).collect())}
-pub(crate) fn traffic_targets_held(root:&std::path::Path,config:&crate::settings::Config)->Result<Vec<ProcessLease>,String>{unsafe{
+pub(crate) fn traffic_targets_held(root:&std::path::Path,config:&crate::settings::Config)->Result<Vec<ProcessLease>,String>{traffic_targets_with_anchors(root,config,&[])}
+pub(crate) fn traffic_targets_with_anchors(root:&std::path::Path,config:&crate::settings::Config,anchors:&[&ProcessLease])->Result<Vec<ProcessLease>,String>{unsafe{
     let mut snapshot_started=0;GetSystemTimeAsFileTime(&mut snapshot_started);
     let snapshot=CreateToolhelp32Snapshot(2,0);if snapshot as isize == -1{return Err(os_error())}
     let mut entry:ProcessEntry=std::mem::zeroed();entry.size=std::mem::size_of::<ProcessEntry>()as u32;let mut rows=vec![];
     let mut more=Process32FirstW(snapshot,&mut entry);while more!=0{rows.push((entry.pid,entry.parent,string(&entry.exe)));more=Process32NextW(snapshot,&mut entry);}CloseHandle(snapshot);
     let allowed=crate::settings::cli_process_paths(root,config);let mut identified=std::collections::BTreeMap::new();let mut selected=std::collections::BTreeSet::new();let mut leases=std::collections::BTreeMap::new();
+    let held=anchors.iter().map(|lease|(lease.identity.pid,*lease)).collect::<std::collections::BTreeMap<_,_>>();
+    for lease in anchors{identified.insert(lease.identity.pid,lease.identity);selected.insert(lease.identity.pid);}
     for &(pid,_,ref name) in &rows{
         if !name.eq_ignore_ascii_case("ChatGPT.exe")&&!name.eq_ignore_ascii_case("codex.exe"){continue}
         if let Some((identity,image,desktop,lease))=process_identity_with_lease(pid){if desktop||allowed.iter().any(|path|path==&image){selected.insert(pid);}identified.insert(pid,identity);leases.insert(pid,lease);}
@@ -126,7 +132,7 @@ pub(crate) fn traffic_targets_held(root:&std::path::Path,config:&crate::settings
     loop{let mut added=false;for &(pid,parent,_)in &rows{
         if selected.contains(&pid)||!selected.contains(&parent){continue}
         let Some(parent_identity)=identified.get(&parent)else{continue};let parent_created=parent_identity.created_filetime;
-        if let Some((identity,_,_,lease))=process_identity_with_lease(pid){if identity.created_filetime>=parent_created&&identity.created_filetime<=snapshot_started&&leases.get(&parent).is_some_and(|lease|lease.allows_child(identity.created_filetime)){identified.insert(pid,identity);leases.insert(pid,lease);selected.insert(pid);added=true;}}
+        if let Some((identity,_,_,lease))=process_identity_with_lease(pid){if identity.created_filetime>=parent_created&&identity.created_filetime<=snapshot_started&&leases.get(&parent).or_else(||held.get(&parent).copied()).is_some_and(|lease|lease.allows_child(identity.created_filetime)){identified.insert(pid,identity);leases.insert(pid,lease);selected.insert(pid);added=true;}}
     }if !added{break}}
     let targets=selected.into_iter().filter_map(|pid|leases.remove(&pid)).collect::<Vec<_>>();crate::traffic_core::validate_targets(&targets.iter().map(|lease|lease.identity).collect::<Vec<_>>())?;Ok(targets)
 }}

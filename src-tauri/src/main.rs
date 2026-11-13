@@ -90,7 +90,7 @@ mod core;
         let result=tauri::async_runtime::spawn_blocking(crate::runtime_details::memory).await.unwrap_or_else(|_|Err("内存详情读取失败，请稍后重新打开。".into()));crate::event_log::read_state(&state.tx,crate::event_log::ReadState::Memory,result.as_ref().map_or(true,|view|!view.complete),"内存","助手内存详情暂不可完整读取","助手内存详情读取已恢复");result
     }
     #[tauri::command]async fn get_usage(start_ms:u64,end_ms:u64,state:State<'_,Controller>)->Result<crate::usage::UsageSnapshot,String>{
-        let result=tauri::async_runtime::spawn_blocking(move||crate::usage::read(start_ms,end_ms)).await.unwrap_or_else(|_|Err("用量统计暂不可用，请稍后重新打开。".into()));crate::event_log::read_state(&state.tx,crate::event_log::ReadState::Usage,result.as_ref().map_or(true,|view|view.partial),"用量","用量扫描暂不可用或当前仅为部分结果","用量扫描已恢复完整结果");result
+        let result=tauri::async_runtime::spawn_blocking(move||crate::usage::read(start_ms,end_ms)).await.unwrap_or_else(|_|Err("用量统计暂不可用，请稍后重新打开。".into()));crate::event_log::read_state(&state.tx,crate::event_log::ReadState::Usage,result.as_ref().map_or(true,|view|!view.scan_pending&&(view.skipped_records>0||view.unreadable_files>0||view.scan_limits.compressed_files>0||view.scan_limits.linked_paths>0||view.scan_limits.scan_limit||view.scan_limits.history_limited)),"用量","用量来源存在未计入的记录，请查看数据范围","用量读取已恢复");result
     }
     #[tauri::command]async fn get_usage_prices(force:Option<bool>,state:State<'_,Controller>)->Result<crate::pricing::Snapshot,String>{
         let force=force.unwrap_or(false);if force{let _=crate::event_log::ui(&state.tx,crate::event_log::UiEvent::PricesSyncStarted);}

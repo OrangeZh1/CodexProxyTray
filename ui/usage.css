@@ -210,9 +210,6 @@
 .usage-price-sync-status:empty { display: none; }
 .usage-pricing-dialog .usage-price-sync-actions + .error-text { margin: 4px 0 10px; }
 
-.usage-scan-progress { display: grid; gap: 6px; margin: -6px 0 14px; padding: 10px 14px; border: 1px solid var(--panel-stroke); border-radius: 7px; background: var(--panel-bg); color: var(--text-secondary); font-size: 12px; }
-.usage-scan-progress progress { width: 100%; height: 5px; accent-color: var(--accent); }
-.usage-scan-progress small { color: var(--text-muted); }
 
 .usage-view .usage-table :is(th,td):first-child { padding-left: 18px; }
 .usage-view .usage-table :is(th,td):last-child { padding-right: 18px; }

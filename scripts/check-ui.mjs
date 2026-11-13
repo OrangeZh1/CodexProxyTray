@@ -158,6 +158,10 @@ try {
   assert.doesNotMatch(unpublished,/尚未发布 CodexProxyTray 正式安装包/);
   const currentNotes=about({update:{status:'current',latest:version,notes:'### 已发布\n- 很长的正文不应自动显示。'}});
   assert.match(currentNotes,/查看更新说明/);assert.doesNotMatch(currentNotes,/很长的正文不应自动显示/);
+  const completed=about({app_update:{busy:false,phase:'installed',version},update:{status:'error',latest:version,error:'连接超时'}});
+  assert.doesNotMatch(completed,/app-update-progress|助手更新已完成/);assert.match(completed,/上次查到版本/);assert.match(completed,/本次检查失败/);assert.match(completed,/连接超时/);
+  assert.match(about({update:{status:'error',error:'连接超时'}}),/本次未获取/);
+  for(const phase of ['ready','error','rolled_back','installed_cleanup_pending'])assert.match(about({app_update:{phase,version,error:phase==='error'?'校验失败':null}}),/app-update-progress/);
   const release=renderToStaticMarkup(React.createElement(ReleaseNotes,{notes:'### 更新\n- **示例** `<tag>`\n<script>unsafe()</script>'}));
   assert.match(release,/<h3>更新<\/h3>/);assert.match(release,/<strong>示例<\/strong>/);assert.doesNotMatch(release,/<script>|###|\*\*示例/);assert.match(release,/&lt;script&gt;/);
   checks++;
@@ -256,6 +260,7 @@ try {
   const cli=(data,pending=new Set(),networkEnabled=true)=>renderToStaticMarkup(React.createElement(CliManagement,{data,writable:true,networkEnabled,busy:name=>pending.has(name),onCheck:noop,onUpdate:noop,onUninstall:noop}));
   const managed={source:'npm_user_global',supported:true,target_token:'isolated-token',current:'0.1.0',latest:'0.2.0',operation:null};
   const managedCli=cli(managed);assert.match(managedCli,/npm · 当前用户/);assert.match(managedCli,/当前版本<\/small><strong>0\.1\.0/);assert.match(managedCli,/最新版本<\/small><strong>0\.2\.0/);for(const id of ['cli-check','cli-update','cli-uninstall'])assert.equal(disabled(control(managedCli,'button',id)),false);
+  const uncheckedCli=cli({...managed,latest:null});assert.match(uncheckedCli,/最新版本<\/small><strong>—/);assert.equal((uncheckedCli.match(/检查后显示最新版本/g)||[]).length,1);assert.doesNotMatch(uncheckedCli,/尚未检查/);
   const firstCli=cli({source:'not_installed',install_token:'verified-npm-token'});assert.equal(disabled(control(firstCli,'button','cli-install')),false);assert.doesNotMatch(firstCli,/id="cli-uninstall"/);assert.match(cli({...managed,latest:managed.current}),/已是最新/);
   const unsupported=cli({source:'unmanaged',supported:false,current:'1.0.0',reason:'此安装来源不受支持，请使用原安装工具管理。'});assert.match(unsupported,/非托管安装/);assert.match(unsupported,/使用原安装工具管理/);for(const id of ['cli-check','cli-uninstall'])assert.equal(disabled(control(unsupported,'button',id)),true);
   const checkingCli=cli(managed,new Set(['cli-check']));assert.match(control(checkingCli,'button','cli-check'),/aria-busy="true"/);for(const id of ['cli-update','cli-uninstall']){assert.match(control(checkingCli,'button',id),/aria-busy="false"/);assert.equal(disabled(control(checkingCli,'button',id)),true);}
@@ -270,6 +275,8 @@ try {
   assert.match(usage,/data-usage-state="ready"/);assert.match(usage,/Token 用量趋势，纵轴从 0/);assert.match(usage,/model-a/);assert.match(usage,/model-b/);assert.match(usage,/估算费用 · USD/);assert.match(usage,/尚未配置完整单价/);assert.doesNotMatch(usage,/北京时间|NaN|Infinity/);
   assert.match(control(usage,'button','usage-metric-tokens'),/aria-pressed="true"/);assert.match(control(usage,'button','usage-metric-cost'),/aria-pressed="false"/);assert.match(control(usage,'button','usage-metric-records'),/aria-pressed="false"/);
   assert.match(usage,/id="usage-record-0"/);assert.match(usage,/用量设置/);assert.doesNotMatch(usage,/统计范围与计算口径|usage-source-line|usage-provider-summary/);
+  const scanning=renderToStaticMarkup(React.createElement(UsageView,{initialSnapshot:{...usageData,partial:true,scan_pending:true}}));assert.match(scanning,/后台同步中/);assert.doesNotMatch(scanning,/usage-scan-progress/);
+  for(const [extra,label] of [[{partial_tail_files:1},'等待来源日志写入'],[{skipped_records:8},'来源有 8 条记录跳过'],[{scan_limits:{compressed_files:2}},'来源压缩记录未计入']]){const html=renderToStaticMarkup(React.createElement(UsageView,{initialSnapshot:{...usageData,partial:true,...extra}}));assert.match(html,new RegExp(label));assert.doesNotMatch(html,/部分数据/);}
   const countedUsage=renderToStaticMarkup(React.createElement(UsageView,{initialSnapshot:{...usageData,summary:{...usageData.summary,request_count:3728}}}));assert.match(control(countedUsage,'button','usage-metric-records'),/3,728/);
   const timingUsage=renderToStaticMarkup(React.createElement(UsageView,{initialSnapshot:{...usageData,records:usageData.records.map((row,index)=>({...row,ttft_ms:index?97:1279,timing_estimated:index===0}))}}));assert.match(timingUsage,/≈ 1\.3 s/);assert.match(timingUsage,/97 ms/);
   const absentUsage=renderToStaticMarkup(React.createElement(UsageView,{initialSnapshot:{...usageData,source_available:false,summary:{input_tokens:0,cached_input_tokens:0,output_tokens:0,total_tokens:0,request_count:0},records:[],models:[],series:[]}}));
@@ -287,7 +294,7 @@ try {
   assert.equal(disabled(control(installed,'input','traffic-enabled')),false);
   assert.doesNotMatch(installed,/授权采集|不安装 Windows 服务/);
   const outdated=collector({state:'outdated',version:'0.0.1'});
-  assert.match(outdated,/版本不匹配/);assert.match(outdated,/辅助服务与当前应用不匹配，请先卸载后重新安装/);assert.match(outdated,/卸载辅助服务/);
+  assert.match(outdated,/需要更新服务/);assert.match(outdated,/辅助服务协议或最低版本不满足要求/);assert.match(outdated,/卸载辅助服务/);
   assert.doesNotMatch(outdated,/更新辅助服务|\bid="install-traffic-service"/);
   assert.equal(disabled(control(outdated,'input','traffic-enabled')),true);
   const deniedCollector=collector({state:'error',version:null,error:'无法读取服务状态'});

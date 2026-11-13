@@ -78,6 +78,22 @@ pub fn save(root:&Path,config:&Config)->Result<(),String>{
     let mut next=config.clone();next.proxy_url=endpoint(&next.proxy_url)?.url;next.cli_workdir=next.cli_workdir.trim().into();
     write_json(&root.join("config.json"),&next)
 }
+// Separate from strict config.json so an updater rollback can still read the config.
+#[derive(Serialize,Deserialize)]#[serde(deny_unknown_fields)]
+struct GuardState {schema:u32,enabled:bool}
+pub fn load_guard_enabled(root:&Path)->Result<bool,String>{
+    let path=root.join("guard-v1.json");
+    let metadata=match fs::metadata(&path){Ok(value)=>value,Err(error)if error.kind()==std::io::ErrorKind::NotFound=>return Ok(false),Err(_)=>return Err("守护偏好无法读取，已暂停；原文件已保留。".into())};
+    if !metadata.is_file()||metadata.len()>4096{return Err("守护偏好超过读取上限，已暂停；原文件已保留。".into())}
+    let mut bytes=Vec::new();use std::io::Read;fs::File::open(&path).and_then(|file|file.take(4097).read_to_end(&mut bytes)).map_err(|_|"守护偏好无法读取，已暂停；原文件已保留。")?;
+    if bytes.len()>4096{return Err("守护偏好超过读取上限，已暂停；原文件已保留。".into())}
+    let state:GuardState=serde_json::from_slice(&bytes).map_err(|_|"守护偏好格式无效，已暂停；原文件已保留。")?;
+    if state.schema!=1{return Err("守护偏好版本不受支持，已暂停；原文件已保留。".into())}Ok(state.enabled)
+}
+pub fn save_guard_enabled(root:&Path,enabled:bool)->Result<(),String>{
+    load_guard_enabled(root)?;
+    write_json(&root.join("guard-v1.json"),&GuardState{schema:1,enabled}).map_err(|_|"守护偏好保存失败，开关未更改。".into())
+}
 pub fn event_name(root:&Path)->String{let mut hash=0xcbf29ce484222325u64;for b in root.to_string_lossy().to_lowercase().bytes(){hash^=b as u64;hash=hash.wrapping_mul(0x100000001b3)}format!("Local\\CodexProxyTray.Guard.{hash:016x}")}
 fn owned_path(path:&Path,root:&Path)->bool{
     // Canonicalization handles junctions/aliases; Windows path lookup is case insensitive.
@@ -131,6 +147,15 @@ pub fn cli_lookup_info(root:&Path)->serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]fn guard_preference_survives_reloads_without_changing_strict_config(){
+        let root=std::env::temp_dir().join(format!("codex-proxy-guard-{}-{}",std::process::id(),now()));fs::create_dir(&root).unwrap();
+        save(&root,&Config::default()).unwrap();let original=fs::read(root.join("config.json")).unwrap();
+        assert!(!load_guard_enabled(&root).unwrap());
+        for enabled in [true,false,false,true]{save_guard_enabled(&root,enabled).unwrap();assert_eq!(load_guard_enabled(&root).unwrap(),enabled);}
+        assert_eq!(fs::read(root.join("config.json")).unwrap(),original);assert!(load(&root).is_ok());
+        for invalid in [r#"{"schema":2,"enabled":true}"#,r#"{"schema":1,"enabled":null}"#,r#"{"schema":1,"enabled":true,"unknown":true}"#]{fs::write(root.join("guard-v1.json"),invalid).unwrap();assert!(load_guard_enabled(&root).is_err());assert!(save_guard_enabled(&root,true).is_err());assert_eq!(fs::read_to_string(root.join("guard-v1.json")).unwrap(),invalid);}
+        fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn legacy_startup_migrates_without_rewriting_or_losing_preferences(){
         let old:Config=serde_json::from_str(r#"{"launch_desktop":true,"proxy_url":"http://localhost:17890/","cli_command":["node.exe","codex.js"]}"#).unwrap();

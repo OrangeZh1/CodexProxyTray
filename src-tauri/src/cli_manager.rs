@@ -30,7 +30,7 @@ impl Operation{
         view.operation=Some(name.into());view.progress=match name{"check"=>"正在检查 Codex CLI 最新版本。","install"=>"正在准备当前用户 npm 安装。","update"=>"正在验证 CLI 安装和活动进程。","uninstall"=>"正在验证要卸载的 CLI。",_=>"正在识别 CLI 安装来源。"}.into();view.error=None;Ok(Self{_lease:lease})
     }
 }
-impl Drop for Operation{fn drop(&mut self){state().lock().unwrap_or_else(|error|error.into_inner()).operation=None;MUTATING.store(false,Ordering::Release);BUSY.store(false,Ordering::Release);}}
+impl Drop for Operation{fn drop(&mut self){let mut view=state().lock().unwrap_or_else(|error|error.into_inner());view.operation=None;if view.error.is_none(){view.progress.clear();}drop(view);MUTATING.store(false,Ordering::Release);BUSY.store(false,Ordering::Release);}}
 fn progress(message:impl Into<String>){state().lock().unwrap_or_else(|error|error.into_inner()).progress=message.into();}
 fn record_error(error:&str){let mut view=state().lock().unwrap_or_else(|error|error.into_inner());view.error=Some(error.into());view.progress="CLI 操作未完成。".into();}
 fn finish<T>(result:Result<T,String>)->Result<T,String>{if let Err(error)=&result{record_error(error);}result}
@@ -242,7 +242,7 @@ pub fn install(target_token:String)->Result<CliState,String>{
         let root=sandbox();let(command,prefix)=fixture(&root);let before=snapshot();
         assert!(refresh_with(||Ok(None)));assert_eq!(snapshot().source,"not_installed");
         assert!(refresh_with(||inspect_install(&command,&prefix).map(Some)));let installed=snapshot();assert!(installed.supported);assert_eq!(installed.current.as_deref(),Some("0.167.0"));assert!(installed.target_token.is_some());assert!(installed.operation.is_none());
-        let operation=Operation::begin("update",true).unwrap();assert!(!refresh_with(||panic!("Background discovery must not run during an update")));assert_eq!(snapshot().operation.as_deref(),Some("update"));drop(operation);
+        let operation=Operation::begin("update",true).unwrap();assert!(!refresh_with(||panic!("Background discovery must not run during an update")));assert_eq!(snapshot().operation.as_deref(),Some("update"));drop(operation);assert!(snapshot().progress.is_empty());
         fs::remove_dir_all(prefix.join("node_modules/@openai/codex")).unwrap();assert!(refresh_with(||Ok(None)));assert!(!snapshot().supported);assert!(snapshot().target_token.is_none());
         *state().lock().unwrap()=before;fs::remove_dir_all(root).unwrap();
     }

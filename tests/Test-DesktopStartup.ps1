@@ -31,9 +31,25 @@ try{
     if(@($layout.geometry.body_children|Where-Object {$_.class -match '(^|\s)app-shell(\s|$)'}).Count){throw 'Fluent portal copied the page layout and can cover the real interface.'}
     if(-not $layout.geometry.layers[0].nodes.Count -or $layout.geometry.layers[0].nodes[0].class -match '(^|\s)app-shell(\s|$)'){throw 'A full-page layer covers the sidebar navigation.'}
     foreach($selector in @('.sidebar','h1','.main-scroll')){$node=@($layout.geometry.nodes|Where-Object selector -eq $selector);if($node.Count -ne 1 -or $node[0].width -le 0 -or $node[0].height -le 0 -or $node[0].visibility -ne 'visible'){throw "Core page element is not visible: $selector"}}
+    $grid=@($layout.geometry.nodes|Where-Object selector -eq '.dashboard-grid')[0];$guard=@($layout.geometry.nodes|Where-Object selector -eq '.guard-floating')[0]
+    if($null -eq $guard -or [Math]::Abs(($guard.x+$guard.width)-($grid.x+$grid.width)) -gt 1.5){throw 'The guard control must align with the content right edge.'}
+    $report['guard_content_alignment_verified']=$true
     $report['page_occlusion_check']='passed'
+    $status=Get-Content -LiteralPath (Join-Path $root 'status.json') -Raw|ConvertFrom-Json;if($status.enabled){throw 'A first launch must remain paused until explicitly enabled.'};$report['guard_default_paused']=$true
     $quitter=Start-Owned '--quit';try{if(-not $quitter.WaitForExit(10000) -or $quitter.ExitCode -ne 0){throw 'Quit request failed.'}}finally{$quitter.Dispose()}
     if(-not $process.WaitForExit(15000) -or $process.ExitCode -ne 0){throw 'Desktop did not exit cleanly.'}
+    $guardPath=Join-Path $root 'guard-v1.json'
+    if(Test-Path -LiteralPath $guardPath){throw 'Shutdown must not save a manual guard preference.'}
+    foreach($enabled in @($true,$false)){
+        $process.Dispose();$process=$null;[IO.File]::WriteAllText($guardPath,(@{schema=1;enabled=$enabled}|ConvertTo-Json -Compress))
+        $process=Start-Owned '--background';$stderr=$process.StandardError.ReadToEndAsync();$deadline=[DateTime]::UtcNow.AddSeconds(45)
+        do{if($process.HasExited){throw 'Guard preference restart exited early.'};try{$status=Get-Content -LiteralPath (Join-Path $root 'status.json') -Raw|ConvertFrom-Json}catch{$status=$null};if($status.helper_pid -eq $process.Id -and $status.backend_ready){break};Start-Sleep -Milliseconds 100}while([DateTime]::UtcNow -lt $deadline)
+        if($status.helper_pid -ne $process.Id -or -not $status.backend_ready -or $status.enabled -ne $enabled){throw 'A restart did not restore the saved guard preference.'}
+        $quitter=Start-Owned '--quit';try{if(-not $quitter.WaitForExit(10000) -or $quitter.ExitCode -ne 0){throw 'Guard preference quit failed.'}}finally{$quitter.Dispose()}
+        if(-not $process.WaitForExit(15000) -or $process.ExitCode -ne 0){throw 'Guard preference process did not exit gracefully.'}
+        $saved=Get-Content -LiteralPath $guardPath -Raw|ConvertFrom-Json;if($saved.enabled -ne $enabled){throw 'Runtime shutdown overwrote the manual guard preference.'}
+    }
+    $report['guard_restart_preferences_and_shutdown_verified']=$true
     $report.status='passed'
 }catch{$failure=$_;$report.status='failed';$report.error=$_.Exception.Message}
 finally{

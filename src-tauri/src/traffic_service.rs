@@ -1,6 +1,6 @@
 //! Demand-start LocalSystem broker for the optional ETW collector.
 //! Only explicit install/uninstall actions request UAC. The broker accepts no paths or commands.
-use std::{ffi::{OsStr,OsString},fs::{self,File,OpenOptions},io::{Read,Write},mem::size_of,os::windows::{ffi::{OsStrExt,OsStringExt},fs::MetadataExt,io::AsRawHandle,process::CommandExt},path::{Path,PathBuf},process::{Child,Command,Stdio},sync::{OnceLock,atomic::{AtomicBool,Ordering}},thread,time::{Duration,Instant}};
+use std::{collections::{HashMap,HashSet},ffi::{OsStr,OsString},fs::{self,File,OpenOptions},io::{Read,Write},mem::size_of,os::windows::{ffi::{OsStrExt,OsStringExt},fs::MetadataExt,io::AsRawHandle,process::CommandExt},path::{Path,PathBuf},process::{Child,Command,Stdio},sync::{OnceLock,atomic::{AtomicBool,Ordering}},thread,time::{Duration,Instant}};
 use serde::{Deserialize,Serialize};
 use windows::{core::{PCWSTR,PWSTR},Win32::{Foundation::*,Security::{*,Authorization::*,Cryptography::*},Storage::FileSystem::*,System::{Diagnostics::ToolHelp::*,Pipes::*,Services::*,Threading::*},UI::Shell::{SHGetFolderPathW,ShellExecuteExW,SHELLEXECUTEINFOW,SEE_MASK_NOCLOSEPROCESS}}};
 use crate::{traffic::{OwnedHandle,identity_on,open_identity},traffic_core::ProcessIdentity};
@@ -18,6 +18,9 @@ const PENDING:&str="receipt.pending.json";
 const PRODUCT:&str="CodexProxyTray.TrafficService";
 const FILE_SDDL:&str="O:BAG:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)";
 const PROTOCOL:u32=2;
+// Independent of the GUI release. Raise the minimum only for required helper fixes.
+const SERVICE_VERSION:&str="1.0.0";
+const MIN_SERVICE_VERSION:&str="1.0.0";
 const MAX_FRAME:usize=4096;
 static SELF_HASH:OnceLock<Result<String,String>>=OnceLock::new();
 static STOP:AtomicBool=AtomicBool::new(false);
@@ -27,7 +30,7 @@ pub struct ServiceSnapshot {pub state:String,pub version:Option<String>,pub erro
 impl ServiceSnapshot {fn new(state:&str,version:Option<String>,error:Option<String>)->Self{Self{state:state.into(),version,error}}}
 #[derive(Clone,Serialize,Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Receipt {schema:u32,product:String,owner_sid:String,version:String,sha256:String,loader_sha256:String,image:String,service_command:String,phase:String,readiness:String,previous:Option<String>,created_parent:bool}
+struct Receipt {schema:u32,product:String,owner_sid:String,version:String,#[serde(default)]protocol:u32,sha256:String,loader_sha256:String,image:String,service_command:String,phase:String,readiness:String,previous:Option<String>,created_parent:bool}
 #[derive(Serialize,Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Request {protocol:u32,token:String,parent:ProcessIdentity}
@@ -107,7 +110,7 @@ fn validate_record(record:&Receipt,directory:&Path,image:&Path,verify_hash:bool)
 }
 fn recover_pending(directory:&Path,image:&Path,owner:&str,service:Option<&Sc>)->Result<(),String>{
     let pending=directory.join(PENDING);if !pending.exists(){return Ok(())}check_chain(directory)?;inventory(directory)?;let next=read_record(&pending)?;validate_record(&next,directory,image,true)?;if next.owner_sid!=owner{return Err("待恢复记录属于其他用户，已保留。".into())}
-    if directory.join(RECEIPT).exists(){let previous=load_receipt(directory,image,true)?;if previous.owner_sid!=next.owner_sid||previous.sha256!=next.sha256||previous.version!=next.version||previous.created_parent!=next.created_parent||!matches!((previous.phase.as_str(),next.phase.as_str()),("prepared","prepared")|("prepared","installed")|("installed","removing")|("removing","removing")){return Err("待恢复安装记录与现有记录不匹配，已保留。".into())}}
+    if directory.join(RECEIPT).exists(){let previous=load_receipt(directory,image,true)?;if previous.owner_sid!=next.owner_sid||previous.sha256!=next.sha256||previous.version!=next.version||previous.protocol!=next.protocol||previous.created_parent!=next.created_parent||!matches!((previous.phase.as_str(),next.phase.as_str()),("prepared","prepared")|("prepared","installed")|("installed","removing")|("removing","removing")){return Err("待恢复安装记录与现有记录不匹配，已保留。".into())}}
     else if service.is_some()||next.phase!="prepared"||fs::read_dir(directory).map_err(|_|"辅助服务目录不可读取。")?.any(|entry|entry.map_or(true,|entry|entry.file_name()!=PENDING)){return Err("待恢复记录缺少可确认的前序状态，已保留。".into())}
     if let Some(service)=service{validate_config_inner(service,image,owner,next.phase!="prepared")?;}else if next.phase=="installed"{return Err("待恢复记录尚未对应已注册服务，已保留。".into())}
     let from=wide(&pending);let to=wide(directory.join(RECEIPT));unsafe{MoveFileExW(PCWSTR(from.as_ptr()),PCWSTR(to.as_ptr()),MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH).map_err(win)}
@@ -137,7 +140,7 @@ fn snapshot_checked()->Result<ServiceSnapshot,String>{
     let(directory,image)=paths()?;let manager=manager(SC_MANAGER_CONNECT)?;let service=service(&manager,SERVICE_QUERY_CONFIG|SERVICE_QUERY_STATUS|READ_CONTROL.0)?;
     let Some(service)=service else{if directory.exists()&&directory.join(RECEIPT).exists(){let record=load_receipt(&directory,&image,false)?;return Ok(ServiceSnapshot::new("error",Some(record.version),Some("安装记录存在，但辅助服务未完成注册。".into())))}return Ok(ServiceSnapshot::new("not_installed",None,None))};
     let record=load_receipt(&directory,&image,false)?;validate_config(&service,&image,&record.owner_sid)?;if record.owner_sid!=current_sid()?{return Err("辅助服务属于其他 Windows 用户。".into())}if record.phase!="installed"{return Err("辅助服务安装尚未完成。".into())}
-    if record.sha256!=self_hash()?{return Ok(ServiceSnapshot::new("outdated",Some(record.version),Some("辅助服务与当前版本不同，请先卸载再安装。".into())))}
+    if let Err(error)=compatible(&record){return Ok(ServiceSnapshot::new("outdated",Some(record.version),Some(error)))}
     let state=if status(&service)?.dwCurrentState==SERVICE_RUNNING{"running"}else{"stopped"};Ok(ServiceSnapshot::new(state,Some(record.version),None))
 }
 pub fn is_installed()->bool{matches!(snapshot().state.as_str(),"running"|"stopped"|"outdated")}
@@ -187,12 +190,12 @@ fn install_inner(owner:String)->Result<(),String>{
     let(directory,image)=paths()?;check_chain(&directory)?;let manager=manager(SC_MANAGER_CONNECT|SC_MANAGER_CREATE_SERVICE)?;let existing=service(&manager,SERVICE_QUERY_CONFIG|SERVICE_QUERY_STATUS|SERVICE_STOP|WRITE_DAC.0|WRITE_OWNER.0|READ_CONTROL.0)?;
     recover_pending(&directory,&image,&owner,existing.as_ref())?;
     let prior=if directory.join(RECEIPT).exists(){Some(load_receipt(&directory,&image,true)?)}else{None};
-    if let Some(existing)=&existing{let record=prior.as_ref().ok_or("同名服务缺少本程序安装记录，已拒绝覆盖。")?;validate_config_inner(existing,&image,&record.owner_sid,record.phase!="prepared")?;if record.phase=="installed"&&record.owner_sid==owner&&record.sha256==self_hash()?{return Ok(())}}
+    if let Some(existing)=&existing{let record=prior.as_ref().ok_or("同名服务缺少本程序安装记录，已拒绝覆盖。")?;validate_config_inner(existing,&image,&record.owner_sid,record.phase!="prepared")?;if record.phase=="installed"&&record.owner_sid==owner&&compatible(record).is_ok(){return Ok(())}}
     if let Some(record)=&prior{if record.owner_sid!=owner{return Err("辅助服务属于其他用户，已拒绝覆盖。".into())}if record.phase=="removing"{return Err("辅助服务卸载尚未完成，请继续卸载。".into())}if record.sha256!=self_hash()?{return Err("辅助服务版本不同，请先卸载再安装。".into())}}
     else if directory.exists(){inventory(&directory)?;if fs::read_dir(&directory).map_err(|_|"辅助服务目录不可读取。")?.next().is_some(){return Err("辅助服务目录缺少归属记录，已保留。".into())}}
     let created_parent=prior.as_ref().map_or(!directory.parent().ok_or("辅助服务目录无效。")?.exists(),|record|record.created_parent);
     secure_directory(directory.parent().ok_or("辅助服务目录无效。")?)?;secure_directory(&directory)?;
-    let mut record=Receipt{schema:1,product:PRODUCT.into(),owner_sid:owner.clone(),version:env!("CARGO_PKG_VERSION").into(),sha256:self_hash()?,loader_sha256:LOADER_HASH.into(),image:image.to_string_lossy().into(),service_command:command(&image)?,phase:"prepared".into(),readiness:"copy_pending".into(),previous:None,created_parent};if prior.is_none(){write_receipt(&directory,&record)?;}
+    let mut record=Receipt{schema:1,product:PRODUCT.into(),owner_sid:owner.clone(),version:SERVICE_VERSION.into(),protocol:PROTOCOL,sha256:self_hash()?,loader_sha256:LOADER_HASH.into(),image:image.to_string_lossy().into(),service_command:command(&image)?,phase:"prepared".into(),readiness:"copy_pending".into(),previous:None,created_parent};if prior.is_none(){write_receipt(&directory,&record)?;}
     install_file(&source_image,&image,&directory.join(IMAGE_PENDING),&record.sha256)?;install_file(&source_loader,&directory.join(LOADER),&directory.join(LOADER_PENDING),LOADER_HASH)?;record.readiness="files_verified".into();write_receipt(&directory,&record)?;
     let installed=if let Some(existing)=existing{existing}else{let name=wide(NAME);let display=wide(DISPLAY);let binary=wide(&record.service_command);unsafe{Sc(CreateServiceW(manager.0,PCWSTR(name.as_ptr()),PCWSTR(display.as_ptr()),SERVICE_ALL_ACCESS,SERVICE_WIN32_OWN_PROCESS,SERVICE_DEMAND_START,SERVICE_ERROR_NORMAL,PCWSTR(binary.as_ptr()),PCWSTR::null(),None,PCWSTR::null(),PCWSTR::null(),PCWSTR::null()).map_err(win)?)} };
     let acl=descriptor(&format!("O:BAG:BAD:P(A;;0xf01ff;;;SY)(A;;0xf01ff;;;BA)(A;;0x20015;;;{owner})"))?;unsafe{SetServiceObjectSecurity(installed.0,OWNER_SECURITY_INFORMATION|DACL_SECURITY_INFORMATION,acl.0).map_err(win)?;}validate_config(&installed,&image,&owner)?;
@@ -244,10 +247,70 @@ impl BrokerPipe{
     }
 }
 fn valid_token(token:&str)->bool{token.len()==32&&token.bytes().all(|v|v.is_ascii_hexdigit())}
-fn trusted_gui(parent:HANDLE,record:&Receipt)->Result<(),String>{if process_sid(parent)?!=record.owner_sid||sha256(&process_image(parent)?)?!=record.sha256{return Err("辅助服务客户端身份或版本不匹配。".into())}Ok(())}
-fn installed_self()->Result<Receipt,String>{let(directory,image)=paths()?;let record=load_receipt(&directory,&image,true)?;if record.phase!="installed"||own_image()!=Ok(image.canonicalize().map_err(|_|"辅助服务映像不存在。")?)||current_sid()?!="S-1-5-18"||record.sha256!=self_hash()?{return Err("当前进程不是受保护的系统采集辅助程序。".into())}Ok(record)}
+fn compatible(record:&Receipt)->Result<(),String>{
+    if record.protocol!=PROTOCOL||crate::core::version_parts(&record.version).is_none()||crate::core::newer_version(MIN_SERVICE_VERSION,&record.version){return Err("辅助服务协议或最低版本不满足要求，请卸载后重新安装一次；后续兼容的助手更新无需重装服务。".into())}Ok(())
+}
+// The trust boundary is the installed owner SID, not a particular GUI build.
+// Requests can only start our protected collector; application scope and SID/lifetime are independently checked there.
+fn trusted_gui(parent:HANDLE,record:&Receipt)->Result<(),String>{if process_sid(parent)?!=record.owner_sid{return Err("辅助服务客户端用户身份不匹配。".into())}Ok(())}
+struct UserContext(OwnedHandle);
+struct Impersonation;
+impl Impersonation{fn begin(token:HANDLE)->Result<Self,String>{unsafe{ImpersonateLoggedOnUser(token).map_err(win)?;}Ok(Self)}}
+impl Drop for Impersonation{fn drop(&mut self){
+    // Never continue privileged collector work with an unexpected thread identity.
+    if unsafe{RevertToSelf()}.is_err(){std::process::abort();}
+}}
+impl UserContext{
+    fn from_parent(parent:HANDLE)->Result<Self,String>{unsafe{
+        let mut raw=HANDLE::default();OpenProcessToken(parent,TOKEN_QUERY|TOKEN_DUPLICATE,&mut raw).map_err(win)?;let source=OwnedHandle(raw);let mut token=HANDLE::default();
+        DuplicateTokenEx(source.0,TOKEN_QUERY|TOKEN_IMPERSONATE|TOKEN_DUPLICATE,None,SecurityImpersonation,TokenImpersonation,&mut token).map_err(win)?;Ok(Self(OwnedHandle(token)))
+    }}
+    fn root(&self)->Result<PathBuf,String>{unsafe{
+        // The installed owner's real OS profile, never a client-supplied path or LOCALAPPDATA.
+        let mut buffer=[0u16;260];SHGetFolderPathW(None,0x1c,Some(self.0.0),0,&mut buffer).map_err(win)?;
+        let end=buffer.iter().position(|&value|value==0).ok_or("用户配置目录无效。")?;let base=PathBuf::from(OsString::from_wide(&buffer[..end]));
+        let text=base.to_string_lossy().to_ascii_lowercase();if !base.is_absolute()||text.starts_with(r"\\?\unc\")||(text.starts_with(r"\\")&&!text.starts_with(r"\\?\")){return Err("辅助服务只读取本机用户配置。".into())}Ok(base.join("CodexProxyTray"))
+    }}
+    fn targets(&self,root:&Path,anchors:&[&crate::native::ProcessLease])->Result<Vec<crate::native::ProcessLease>,String>{
+        let _user=Impersonation::begin(self.0.0)?;
+        let config=scope_config(root)?;crate::native::traffic_targets_with_anchors(root,&config,anchors)
+    }
+}
+#[derive(Deserialize)]struct ScopeConfig{#[serde(default)]cli_command:Vec<String>}
+fn scope_config(root:&Path)->Result<crate::settings::Config,String>{
+    let file=match File::open(root.join("config.json")){Ok(file)=>file,Err(error)if error.kind()==std::io::ErrorKind::NotFound=>return Ok(crate::settings::Config::default()),Err(_)=>return Err("辅助服务无法读取本用户配置，未扩大采样范围。".into())};
+    let metadata=file.metadata().map_err(|_|"辅助服务无法核验本用户配置。")?;if !metadata.is_file()||metadata.len()>65536{return Err("本用户配置超过辅助服务读取上限。".into())}
+    let mut bytes=Vec::new();file.take(65537).read_to_end(&mut bytes).map_err(|_|"辅助服务无法读取本用户配置。")?;if bytes.len()>65536{return Err("本用户配置超过辅助服务读取上限。".into())}
+    if bytes.iter().find(|byte|!byte.is_ascii_whitespace())!=Some(&b'{'){return Err("本用户配置格式不受支持，未扩大采样范围。".into())}
+    // Only this stable, bounded field is consumed; unrelated GUI preferences may evolve independently.
+    let scope:ScopeConfig=serde_json::from_slice(&bytes).map_err(|_|"本用户 CLI 配置格式无效，未扩大采样范围。")?;
+    if scope.cli_command.len()>16||scope.cli_command.iter().any(|part|part.is_empty()||part.contains('\0'))||scope.cli_command.iter().map(|part|part.encode_utf16().count()).sum::<usize>()>32767{return Err("本用户 CLI 配置超过辅助服务读取范围。".into())}
+    Ok(crate::settings::Config{cli_command:scope.cli_command,..crate::settings::Config::default()})
+}
+pub(crate) struct CollectorScope{
+    user:UserContext,root:PathBuf,owner_sid:String,allowed:HashMap<ProcessIdentity,(Instant,crate::native::ProcessLease)>,missed:HashSet<ProcessIdentity>,first_missed:Option<u64>,last_missed:Option<u64>,
+}
+impl CollectorScope{
+    pub(crate) fn new(parent:HANDLE)->Result<Self,String>{let owner_sid=process_sid(parent)?;let user=UserContext::from_parent(parent)?;let root=user.root()?;Ok(Self{user,root,owner_sid,allowed:HashMap::new(),missed:HashSet::new(),first_missed:None,last_missed:None})}
+    pub(crate) fn targets(&mut self,requested:&[ProcessIdentity])->Result<Vec<ProcessIdentity>,String>{
+        crate::traffic_core::validate_targets(requested)?;let now=Instant::now();self.allowed.retain(|_,(seen,_)|now.saturating_duration_since(*seen)<Duration::from_secs(60));
+        let anchors=self.allowed.values().map(|(_,lease)|lease).collect::<Vec<_>>();let discovered=self.user.targets(&self.root,&anchors)?;
+        for lease in discovered{if !lease.belongs_to(&self.owner_sid){continue}if let Some((seen,_))=self.allowed.get_mut(&lease.identity){*seen=now;}else{if self.allowed.len()>=4096{return Err("辅助服务进程交接保留数量达到上限。".into())}self.allowed.insert(lease.identity,(now,lease));}}
+        let mut accepted=Vec::new();for &identity in requested{
+            if self.allowed.contains_key(&identity){accepted.push(identity);continue}
+            let alive=match crate::traffic::open_lifetime_identity(identity).map_err(win)?{Some(process)=>match unsafe{WaitForSingleObject(process.0,0)}{WAIT_TIMEOUT=>true,WAIT_OBJECT_0=>false,_=>return Err("辅助服务无法核验目标进程状态。".into())},None=>false};
+            if alive{return Err("目标进程不属于已核验的 ChatGPT / Codex CLI 范围，已拒绝采样。".into())}
+            // An exited identity without our own application-scope proof never enters ETW bindings.
+            if self.missed.len()>=4096&&!self.missed.contains(&identity){return Err("辅助服务遗漏身份记录达到上限。".into())}if self.missed.insert(identity){let at=crate::settings::now();self.first_missed=Some(self.first_missed.map_or(at,|first|first.min(at)));self.last_missed=Some(at);}
+        }Ok(accepted)
+    }
+    pub(crate) fn mark_sample(&self,sample:&mut crate::traffic_etw::EngineSample){
+        if self.missed.is_empty(){return}sample.partial=true;sample.had_targets=true;sample.missed_bindings=sample.missed_bindings.saturating_add(self.missed.len()as u64);sample.first_missed_at=match(sample.first_missed_at,self.first_missed){(Some(a),Some(b))=>Some(a.min(b)),(a,b)=>a.or(b)};sample.last_missed_at=match(sample.last_missed_at,self.last_missed){(Some(a),Some(b))=>Some(a.max(b)),(a,b)=>a.or(b)};
+    }
+}
+fn installed_self()->Result<Receipt,String>{let(directory,image)=paths()?;let record=load_receipt(&directory,&image,true)?;if record.protocol!=PROTOCOL||record.version!=SERVICE_VERSION||record.phase!="installed"||own_image()!=Ok(image.canonicalize().map_err(|_|"辅助服务映像不存在。")?)||current_sid()?!="S-1-5-18"||record.sha256!=self_hash()?{return Err("当前进程不是受保护的系统采集辅助程序。".into())}Ok(record)}
 pub(crate) fn validate_service_collector(parent:HANDLE)->Result<(),String>{let record=installed_self()?;trusted_gui(parent,&record)}
-pub(crate) fn validate_collector(handle:HANDLE)->Result<(),String>{let(directory,image)=paths()?;let record=load_receipt(&directory,&image,true)?;if record.owner_sid!=current_sid()?||record.sha256!=self_hash()?||process_image(handle)?!=image.canonicalize().map_err(|_|"辅助服务映像不存在。")?{return Err("采集辅助程序身份不匹配。".into())}Ok(())}
+pub(crate) fn validate_collector(handle:HANDLE)->Result<(),String>{let(directory,image)=paths()?;let record=load_receipt(&directory,&image,true)?;compatible(&record)?;if record.phase!="installed"||record.owner_sid!=current_sid()?||process_image(handle)?!=image.canonicalize().map_err(|_|"辅助服务映像不存在。")?{return Err("采集辅助程序身份不匹配。".into())}Ok(())}
 pub(crate) fn collector_broker()->Result<OwnedHandle,String>{unsafe{
     let record=installed_self()?;let(_,image)=paths()?;let manager=manager(SC_MANAGER_CONNECT)?;let service=service(&manager,SERVICE_QUERY_CONFIG|SERVICE_QUERY_STATUS|READ_CONTROL.0)?.ok_or("采集辅助服务已退出。")?;validate_config(&service,&image,&record.owner_sid)?;let state=status(&service)?;
     if state.dwCurrentState!=SERVICE_RUNNING||state.dwProcessId==0||state.dwProcessId==GetCurrentProcessId(){return Err("采集辅助服务身份无效。".into())}
@@ -289,7 +352,7 @@ fn serve_request(pipe:&BrokerPipe,record:&Receipt,children:&mut Vec<Child>)->Res
     pipe.wait_received()
 }}
 pub(crate) fn start_collector(token:&str,parent:ProcessIdentity)->Result<OwnedHandle,String>{unsafe{
-    if !valid_token(token)||identity_on(GetCurrentProcess()).map_err(win)?!=parent{return Err("采集请求身份无效。".into())}let(directory,image)=paths()?;let record=load_receipt(&directory,&image,true)?;if record.phase!="installed"||record.owner_sid!=current_sid()?||record.sha256!=self_hash()?{return Err("辅助服务未安装或版本不同。".into())}
+    if !valid_token(token)||identity_on(GetCurrentProcess()).map_err(win)?!=parent{return Err("采集请求身份无效。".into())}let(directory,image)=paths()?;let record=load_receipt(&directory,&image,true)?;compatible(&record)?;if record.phase!="installed"||record.owner_sid!=current_sid()?{return Err("辅助服务未安装或用户身份不同。".into())}
     let manager=manager(SC_MANAGER_CONNECT)?;let service=service(&manager,SERVICE_QUERY_CONFIG|SERVICE_QUERY_STATUS|SERVICE_START|READ_CONTROL.0)?.ok_or("辅助服务未安装。")?;validate_config(&service,&image,&record.owner_sid)?;
     match StartServiceW(service.0,None){Ok(())=>{},Err(error)if code(&error)==1056=>{},Err(error)=>return Err(win(error))}
     let deadline=Instant::now()+Duration::from_secs(8);let pipe=loop{let state=status(&service)?.dwCurrentState;if state==SERVICE_RUNNING{if let Ok(pipe)=BrokerPipe::client(){break pipe}}else if state==SERVICE_STOPPED{match StartServiceW(service.0,None){Ok(())=>{},Err(error)if code(&error)==1056=>{},Err(error)=>return Err(win(error))}}if Instant::now()>=deadline{return Err("辅助服务启动尚未完成。".into())}thread::sleep(Duration::from_millis(25));};
@@ -301,6 +364,32 @@ pub(crate) fn start_collector(token:&str,parent:ProcessIdentity)->Result<OwnedHa
 
 #[cfg(test)]mod tests{
     use super::*;
+    #[test]fn protected_scope_rejects_unrelated_live_targets_keeps_tombstones_and_restores_user_context(){
+        let root=std::env::temp_dir().join(format!("codex-traffic-scope-{}-{}",std::process::id(),crate::settings::now()));fs::create_dir(&root).unwrap();
+        let mut scope=CollectorScope::new(unsafe{GetCurrentProcess()}).unwrap();scope.root=root.clone();
+        let(identity,_,_,lease)=unsafe{crate::native::process_identity_with_lease(std::process::id())}.unwrap();assert!(lease.belongs_to(&scope.owner_sid));
+        assert!(scope.targets(&[identity]).is_err());
+        scope.allowed.insert(identity,(Instant::now()-Duration::from_secs(59),lease));assert_eq!(scope.targets(&[identity]).unwrap(),vec![identity]);
+        scope.allowed.get_mut(&identity).unwrap().0=Instant::now()-Duration::from_secs(61);assert!(scope.targets(&[identity]).is_err());
+        let mut child=Command::new(std::env::current_exe().unwrap()).args(["--exact","traffic_etw::tests::short_lived_binding_fixture"]).env("CODEX_TRAFFIC_BINDING_FIXTURE","1").creation_flags(0x08000000).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+        let(exited,_,_,held)=unsafe{crate::native::process_identity_with_lease(child.id())}.unwrap();assert!(held.belongs_to(&scope.owner_sid));scope.allowed.insert(exited,(Instant::now(),held));child.stdin.take().unwrap().write_all(b"x").unwrap();assert!(child.wait().unwrap().success());
+        assert_eq!(scope.targets(&[exited]).unwrap(),vec![exited]);scope.allowed.get_mut(&exited).unwrap().0=Instant::now()-Duration::from_secs(61);assert!(scope.targets(&[exited]).unwrap().is_empty());
+        let unknown=ProcessIdentity{pid:u32::MAX,created_filetime:1};assert!(scope.targets(&[unknown]).unwrap().is_empty());
+        let mut sample=crate::traffic_etw::EngineSample{buffer_limited:false,missed_bindings:0,first_missed_at:None,last_missed_at:None,sent:0,received:0,seen:false,had_targets:false,partial:false,target_count:0,lost_events:Some(0),lost_buffers:Some(0),error:None};scope.mark_sample(&mut sample);assert!(sample.partial&&sample.had_targets);assert_eq!(sample.missed_bindings,2);assert!(sample.first_missed_at.is_some());
+        fs::write(root.join("config.json"),br#"{"new_gui_feature":{"enabled":true},"network_enabled":"future-format","cli_command":[]}"#).unwrap();assert!(scope.targets(&[]).is_ok());
+        for invalid in [b"{broken".as_slice(),br#"{"cli_command":null}"#.as_slice(),br#"{"cli_command":"codex.exe"}"#.as_slice(),br#"{"cli_command":[1]}"#.as_slice(),b"[]".as_slice()]{fs::write(root.join("config.json"),invalid).unwrap();assert!(scope.targets(&[]).is_err());let mut token=HANDLE::default();let error=unsafe{OpenThreadToken(GetCurrentThread(),TOKEN_QUERY,true,&mut token)}.unwrap_err();assert_eq!(code(&error),1008);}
+        for command in [vec!["x".repeat(32768)],vec!["x".into();17]]{fs::write(root.join("config.json"),serde_json::to_vec(&serde_json::json!({"cli_command":command})).unwrap()).unwrap();assert!(scope.targets(&[]).is_err());}
+        fs::remove_file(root.join("config.json")).unwrap();fs::remove_dir(root).unwrap();
+    }
+    #[test]fn service_compatibility_is_independent_of_gui_and_image_hash(){
+        let mut record=Receipt{schema:1,product:PRODUCT.into(),owner_sid:"S-1-5-21-1".into(),version:SERVICE_VERSION.into(),protocol:PROTOCOL,sha256:"a".repeat(64),loader_sha256:LOADER_HASH.into(),image:String::new(),service_command:String::new(),phase:"installed".into(),readiness:String::new(),previous:None,created_parent:false};
+        assert!(compatible(&record).is_ok());record.sha256="b".repeat(64);assert!(compatible(&record).is_ok());
+        record.owner_sid=current_sid().unwrap();assert!(trusted_gui(unsafe{GetCurrentProcess()},&record).is_ok());record.owner_sid="S-1-5-21-999999".into();assert!(trusted_gui(unsafe{GetCurrentProcess()},&record).is_err());
+        record.version="1.9.0".into();assert!(compatible(&record).is_ok());
+        record.version="0.9.0".into();assert!(compatible(&record).is_err());record.version="bad".into();assert!(compatible(&record).is_err());record.version=SERVICE_VERSION.into();record.protocol=0;assert!(compatible(&record).is_err());record.protocol=PROTOCOL+1;assert!(compatible(&record).is_err());
+        // Legacy receipts stay readable for a safe explicit uninstall, but cannot claim compatibility.
+        let mut legacy=serde_json::to_value(&record).unwrap();legacy.as_object_mut().unwrap().remove("protocol");let legacy:Receipt=serde_json::from_value(legacy).unwrap();assert_eq!(legacy.protocol,0);assert!(compatible(&legacy).is_err());
+    }
     #[test]fn broker_protocol_rejects_commands_and_unbounded_tokens(){
         assert!(valid_token("0123456789abcdef0123456789abcdef"));assert!(!valid_token("../codex.exe"));assert!(!valid_token(&"a".repeat(33)));
         assert!(serde_json::from_str::<Request>(r#"{"protocol":1,"token":"0123456789abcdef0123456789abcdef","parent":{"pid":1,"created_filetime":2},"command":"cmd.exe"}"#).is_err());

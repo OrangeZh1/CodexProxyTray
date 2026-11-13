@@ -8,7 +8,6 @@
 .log-filter-panel .log-filter-reset { width: 32px; min-width: 32px !important; height: 32px; min-height: 32px; padding: 0; border-radius: 5px; }
 .log-filter-custom { display: grid; grid-template-columns: minmax(0,1fr) minmax(0,1fr); gap: 8px; margin-top: 10px; }
 .log-filter-custom label { display: grid; min-width: 0; gap: 5px; color: var(--text-secondary); font-size: 12px; line-height: 18px; }
-.log-filter-count { margin-top: 8px; color: var(--text-muted); font-size: 11px; line-height: 16px; text-align: right; font-variant-numeric: tabular-nums; }
 @media(max-width:1000px) {
   .log-filter-controls { grid-template-columns: minmax(0,1fr) minmax(0,1fr) 32px; }
   .log-filter-query { grid-column: 1 / -1; grid-row: 2; }

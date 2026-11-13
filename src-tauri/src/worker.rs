@@ -23,7 +23,7 @@ const LOG_LIMIT:usize=200;
     pub traffic_enabled:bool,pub traffic_service:crate::traffic_service::ServiceSnapshot,
 }
 impl Status {
-    fn new()->Self {Self{revision:0,enabled:true,guard_ready:false,proxy_url:core::DEFAULT_PROXY.into(),proxy_reachable:false,package_count:0,package_version:None,codex_running:false,restart_required:false,cli_detected:false,cli_ready:false,autostart:platform::autostart(),launch_desktop:false,backend_ready:true,error:None,logs:vec![],helper_pid:std::process::id(),updated_at:settings::now(),started_at:settings::now(),proxy_latency_ms:None,probe_history:vec![],desktop_pid:None,tcp_connections:None,helper_memory_bytes:None,log_storage_error:None,launch_target:LaunchTarget::None,cli_workdir:String::new(),network_enabled:true,auto_check_updates:false,update_interval_hours:6,update:crate::update::snapshot(),guard_uptime_ms:0,connectivity_enabled:true,connectivity:crate::connectivity::snapshot(),traffic:crate::traffic::TrafficSnapshot::disabled(),traffic_history:vec![],desktop_operation:crate::desktop_lifecycle::snapshot(),cli_management:crate::cli_manager::snapshot(),update_notice:crate::update_notice::snapshot(),app_update:crate::app_update::snapshot(),desktop_proxy:crate::desktop_proxy::state(None,core::DEFAULT_PROXY,false),traffic_enabled:false,traffic_service:crate::traffic_service::snapshot()}}
+    fn new()->Self {Self{revision:0,enabled:false,guard_ready:false,proxy_url:core::DEFAULT_PROXY.into(),proxy_reachable:false,package_count:0,package_version:None,codex_running:false,restart_required:false,cli_detected:false,cli_ready:false,autostart:platform::autostart(),launch_desktop:false,backend_ready:true,error:None,logs:vec![],helper_pid:std::process::id(),updated_at:settings::now(),started_at:settings::now(),proxy_latency_ms:None,probe_history:vec![],desktop_pid:None,tcp_connections:None,helper_memory_bytes:None,log_storage_error:None,launch_target:LaunchTarget::None,cli_workdir:String::new(),network_enabled:true,auto_check_updates:false,update_interval_hours:6,update:crate::update::snapshot(),guard_uptime_ms:0,connectivity_enabled:true,connectivity:crate::connectivity::snapshot(),traffic:crate::traffic::TrafficSnapshot::disabled(),traffic_history:vec![],desktop_operation:crate::desktop_lifecycle::snapshot(),cli_management:crate::cli_manager::snapshot(),update_notice:crate::update_notice::snapshot(),app_update:crate::app_update::snapshot(),desktop_proxy:crate::desktop_proxy::state(None,core::DEFAULT_PROXY,false),traffic_enabled:false,traffic_service:crate::traffic_service::snapshot()}}
     fn sample_traffic(&mut self){
         use crate::traffic::TrafficState;
         let sample=&self.traffic;
@@ -54,6 +54,7 @@ impl Controller {
             let root=settings::root();let _=fs::create_dir_all(&root);
             let (mut config,mut config_error)=match settings::load(&root) {Ok(c)=>(c,None),Err(e)=>(Config::default(),Some(format!("配置读取失败：{e}")))};
             let mut status=Status::new();
+            let guard_error=match settings::load_guard_enabled(&root){Ok(enabled)=>{status.enabled=enabled;None},Err(error)=>Some(error)};
             let _=fs::create_dir_all(root.join("logs"));let history_path=root.join("logs/events-v1.json");
             let history_writable=match load_history(&history_path) {Ok(records)=>{status.logs=records;true},Err(error)=>{status.log_storage_error=Some(error);false}};
             let mut persisted=status.logs.last().map_or(0,|log|log.id);
@@ -68,7 +69,7 @@ impl Controller {
             loop {
                 let(mut pending,mut result,mut stopping,mut guard_action,mut manual)=(None,Ok(()),false,false,None);let mut traffic_requested=false;
                 if !first {match rx.recv_timeout(Duration::from_secs(2)) {
-                    Ok(Message::Enabled(enabled,reply))=>{pending=reply;if enabled&&config_error.is_some(){result=Err("请先保存有效的代理设置。".into());}else{guard_action=true;if enabled&&!status.enabled {guard_started=Instant::now();status.guard_uptime_ms=0;}if status.enabled&&!enabled {status.guard_uptime_ms=guard_started.elapsed().as_millis()as u64;}status.enabled=enabled;status.log("info","守护",if enabled{"已启用代理守护"}else{"已暂停代理守护"},"作用于 ChatGPT 与 Windows Codex CLI；已运行进程保留启动时的环境。");}},
+                    Ok(Message::Enabled(enabled,reply))=>{pending=reply;if enabled&&config_error.is_some(){result=Err("请先保存有效的代理设置。".into());}else if let Err(error)=settings::save_guard_enabled(&root,enabled){result=Err(error);}else{guard_action=true;if enabled&&!status.enabled {guard_started=Instant::now();status.guard_uptime_ms=0;}if status.enabled&&!enabled {status.guard_uptime_ms=guard_started.elapsed().as_millis()as u64;}status.enabled=enabled;status.log("info","守护",if enabled{"已启用代理守护"}else{"已暂停代理守护"},"作用于 ChatGPT 与 Windows Codex CLI；已运行进程保留启动时的环境。");}},
                     Ok(Message::TrafficEnabled(enabled,reply))=>{pending=Some(reply);if config_error.is_some(){result=Err("配置无法读取，请先修复配置。".into());}else{let mut next=config.clone();next.traffic_enabled=enabled;match settings::save(&root,&next){Ok(())=>{config=next;traffic_requested=true;},Err(error)=>result=Err(error)}}},
                     Ok(Message::ServicePause(reply))=>{pending=Some(reply);service_paused=true;traffic_requested=true;},
                     Ok(Message::ServiceFinished(uninstalled,reply))=>{pending=Some(reply);service_paused=false;traffic_requested=true;if uninstalled{config.traffic_enabled=false;if config_error.is_none(){if let Err(error)=settings::save(&root,&config){status.log("warning","配置","辅助服务已卸载，但统计偏好未能保存",error);}}else{status.log("warning","配置","辅助服务已卸载，原配置文件已保留","配置原本无法读取，未覆盖它；本次运行已停止统计。");}}},
@@ -106,7 +107,7 @@ impl Controller {
                     status.cli_detected=detected;
                     if detected&&!status.cli_ready {match install_cli(&root,&exe,&mut config){Ok(ready)=>{status.cli_ready=ready;cli_error=None;if ready{status.log("info","CLI","CLI 专用入口已恢复",format!("入口：{}\n代理守护：{}",root.join("cli/codex-proxy-cli.exe").display(),yes(status.enabled)));}},Err(error)=>{let message=format!("CLI 接入失败：{error}");if cli_error.as_ref()!=Some(&message){status.log("warning","CLI","CLI 入口稍后重试",message.clone());}cli_error=Some(message);}}}
                 }
-                let mut error=config_error.clone().or_else(||cli_error.clone());status.guard_ready=false;
+                let mut error=config_error.clone().or_else(||guard_error.clone()).or_else(||cli_error.clone());status.guard_ready=false;
                 if !status.enabled {if let Ok(d)=&debug {for package in held.iter().cloned().collect::<Vec<_>>() {match d.disable(&package){Ok(())=>{held.remove(&package);},Err(e)=>error=Some(e)}}}}
                 match native::packages() {Err(e)=>error=Some(e),Ok(packages)=>{
                     let old_version=status.package_version.clone();status.package_count=packages.len();status.package_version=packages.last().map(|p|p.version.clone());
