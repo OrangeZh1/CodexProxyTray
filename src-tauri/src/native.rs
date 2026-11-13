@@ -35,7 +35,6 @@ fn os_error() -> String { std::io::Error::last_os_error().to_string() }
     fn GetProcessTimes(process: Handle, created: *mut u64, exited: *mut u64, kernel: *mut u64, user: *mut u64) -> i32;
     fn QueryFullProcessImageNameW(process:Handle,flags:u32,name:*mut u16,length:*mut u32)->i32;
     fn GetFinalPathNameByHandleW(file:Handle,path:*mut u16,length:u32,flags:u32)->u32;
-    #[cfg(test)] fn K32GetProcessImageFileNameW(process:Handle,path:*mut u16,length:u32)->u32;
     fn GetCurrentProcess() -> Handle;
     fn GetSystemTimeAsFileTime(time:*mut u64);
     fn GetModuleHandleW(name:*const u16) -> Handle;
@@ -190,35 +189,39 @@ fn process_image_name(lease:&ProcessLease,flags:u32,diagnostic:bool)->Result<Str
     path.truncate(length as usize);String::from_utf16(&path).map_err(|_|"目标进程映像编码无效。".into())
 }}
 fn process_image(lease:&ProcessLease)->Result<String,String>{process_image_name(lease,0,false).map(|image|crate::settings::normalized_executable(&PathBuf::from(image)))}
-fn native_file_image(pid:u32,path:&str)->Option<String>{
+fn native_file_image(pid:u32,path:&str,normalizing:bool)->Option<String>{
     use std::os::windows::{fs::OpenOptionsExt,io::AsRawHandle};
     // Query metadata only, preserving the executable's sharing contract. NT
     // volume paths avoid guessing drive letters, mount points or path prefixes.
+    let open_stage=if normalizing{"normalize_open"}else{"metadata_open"};let query_stage=if normalizing{"normalize_query"}else{"final_nt_query"};
     let file=match std::fs::OpenOptions::new().access_mode(0x80).share_mode(7).security_qos_flags(0x10000).open(path){
-        Ok(file)=>{root_diagnostic(pid,"metadata_open",0,0x80);file},
-        Err(error)=>{root_diagnostic(pid,if error.kind()==std::io::ErrorKind::InvalidInput{"metadata_open_invalid_input"}else{"metadata_open"},error.raw_os_error().unwrap_or(0)as u32,0x80);return None}
+        Ok(file)=>{root_diagnostic(pid,open_stage,0,0x80);file},
+        Err(error)=>{root_diagnostic(pid,open_stage,error.raw_os_error().unwrap_or(0)as u32,0x80);return None}
     };
     let mut buffer=vec![0u16;32768];let length=unsafe{GetFinalPathNameByHandleW(file.as_raw_handle(),buffer.as_mut_ptr(),buffer.len()as u32,2)};
-    if length==0{root_diagnostic(pid,"final_nt_query",std::io::Error::last_os_error().raw_os_error().unwrap_or(0)as u32,0);return None}
-    root_diagnostic(pid,"final_nt_query",0,length);
+    if length==0{root_diagnostic(pid,query_stage,std::io::Error::last_os_error().raw_os_error().unwrap_or(0)as u32,0);return None}
+    root_diagnostic(pid,query_stage,0,length);
     if length as usize>=buffer.len(){root_diagnostic(pid,"final_nt_length",122,length);return None}
     buffer.truncate(length as usize);match String::from_utf16(&buffer){Ok(path)=>Some(path),Err(_)=>{root_diagnostic(pid,"final_nt_encoding",13,length);None}}
 }
-fn known_native_cli_image(pid:u32,native:&str,root:&std::path::Path,config:&crate::settings::Config,stage:&str)->bool{
+fn normalize_native_image(pid:u32,native:&str)->Option<String>{
+    // This input comes only from QueryFullProcessImageNameW, never the IPC
+    // request. GLOBALROOT addresses that exact absolute Object Manager path.
+    let valid=!native.contains('\0')&&native.get(..8).is_some_and(|prefix|prefix.eq_ignore_ascii_case(r"\Device\"))&&native.get(8..).and_then(|tail|tail.split_once('\\')).is_some_and(|(device,file)|!device.is_empty()&&!file.is_empty());
+    if !valid{root_diagnostic(pid,"normalize_path",87,0);return None}
+    let global=format!(r"\\?\GLOBALROOT{native}");let length=global.encode_utf16().count();
+    if length>=32768{root_diagnostic(pid,"normalize_length",122,length as u32);return None}
+    let normalized=native_file_image(pid,&global,true)?;root_diagnostic(pid,"normalize_complete",0,normalized.encode_utf16().count()as u32);Some(normalized)
+}
+fn known_native_cli_image(pid:u32,native:&str,root:&std::path::Path,config:&crate::settings::Config)->bool{
+    let Some(native)=normalize_native_image(pid,native)else{return false};
     let mut candidates=0;
     for expected in crate::settings::cli_process_paths(root,config){
         if !std::path::Path::new(&expected).file_name().is_some_and(|name|name.to_string_lossy().eq_ignore_ascii_case("codex.exe")){continue}
         candidates+=1;
-        if let Some(actual)=native_file_image(pid,&expected){let matches=actual.to_lowercase()==native.to_lowercase();root_diagnostic(pid,stage,0,u32::from(matches));if matches{return true}}
+        if let Some(actual)=native_file_image(pid,&expected,false){let matches=actual.to_lowercase()==native.to_lowercase();root_diagnostic(pid,"native_compare",0,u32::from(matches));if matches{return true}}
     }
     root_diagnostic(pid,"native_candidates",0,candidates);false
-}
-#[cfg(test)]
-fn diagnose_psapi_image(lease:&ProcessLease,root:&std::path::Path,config:&crate::settings::Config){
-    let mut buffer=vec![0u16;32768];let length=unsafe{K32GetProcessImageFileNameW(lease.handle,buffer.as_mut_ptr(),buffer.len()as u32)};
-    let code=if length==0{std::io::Error::last_os_error().raw_os_error().unwrap_or(0)as u32}else{0};root_diagnostic(lease.identity.pid,"psapi_native_query",code,length);
-    if length==0||length as usize>=buffer.len(){return}buffer.truncate(length as usize);
-    if let Ok(native)=String::from_utf16(&buffer){let _=known_native_cli_image(lease.identity.pid,&native,root,config,"psapi_compare");}
 }
 /// Requested identities locate objects only: the collector must independently
 /// establish a real application root, including a GUI-held exited root object.
@@ -233,8 +236,8 @@ pub(crate) fn traffic_root_lease(root:&std::path::Path,config:&crate::settings::
             // Win32-name queries can fail after exit even while the exact
             // process object remains held. Accept only an independently read
             // native image path equal to a known CLI file's final native path.
-            let Ok(native)=process_image_name(&lease,1,true)else{#[cfg(test)]diagnose_psapi_image(&lease,root,config);return Ok(None)};
-            let allowed=known_native_cli_image(identity.pid,&native,root,config,"native_compare");
+            let Ok(native)=process_image_name(&lease,1,true)else{return Ok(None)};
+            let allowed=known_native_cli_image(identity.pid,&native,root,config);
             return Ok(allowed.then_some(lease))
         }
     };let path=PathBuf::from(&image);
