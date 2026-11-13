@@ -375,7 +375,6 @@ h2 { font-size: 14px; font-weight: 600; color: var(--text-secondary); margin: 18
 .about-entry { width: 100%; border: 0; background: transparent; color: var(--text-primary); text-align: left; cursor: pointer; }
 .about-entry:hover { background: var(--panel-hover); }
 .about-entry .row-copy { display: grid; }
-.background-check { color: var(--text-muted); font-size: 12px; }
 .workdir-row { flex-wrap: wrap; }
 .workdir-row .row-control { flex: 1; min-width: 230px; }
 .workdir-row .row-control > span { flex: 1; min-width: 0; }

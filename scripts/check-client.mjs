@@ -294,7 +294,7 @@ for(const view of ['main','tray'])for(const theme of ['light','dark']){
       assert.ok(window.document.querySelector('[role="listbox"]'),'Theme uses the Fluent listbox.');
       const chosen=[...window.document.querySelectorAll('[role="option"]')].find(option=>option.textContent.trim()===(theme==='light'?'浅色':'深色'));
       assert.ok(chosen);chosen.click();await delay(700);assert.deepEqual(errors,[]);
-      const check=window.document.querySelector('#check-updates');check.click();await delay(220);
+      backend.revision++;backend.update={...backend.update,checking:true};for(const tick of statusTicks)tick();await until(()=>window.document.querySelector('#settings-panel-home').textContent.includes('正在检查更新'),'Background checks update the existing heading without growing its description');sameNode(window.document.querySelector('.background-check'),null,'Background checking copy must not add a second description line');const check=window.document.querySelector('#check-updates');assert.equal(check.getAttribute('aria-busy'),'false','A background check does not light the manual action');check.click();await delay(220);
       assert.equal(check.getAttribute('aria-busy'),'true');for(const id of ['network-enabled','auto-check-updates','update-interval'])assert.equal(window.document.querySelector(`#${id}`).getAttribute('aria-busy'),'false','An update check must not spin unrelated preferences.');
       checkResolve();for(let i=0;i<50&&check.getAttribute('aria-busy')==='true';i++)await delay(20);
       const notes=[...window.document.querySelectorAll('button')].find(button=>button.textContent.trim()==='查看更新说明');assert.ok(notes);sameNode(window.document.querySelector('.release-dialog'),null,'Release notes stay closed until requested.');

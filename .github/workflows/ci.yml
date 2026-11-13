@@ -64,6 +64,11 @@ jobs:
         run: npm run check:ui
       - name: 生产界面客户端启动检查
         run: npm run check:client
+      - name: 准备中文截图字体
+        run: |
+          sudo apt-get update
+          sudo apt-get -o Dpkg::Lock::Timeout=60 install --no-install-recommends -y fonts-noto-cjk
+          fc-match -f '%{family}\n' :lang=zh-cn
       - name: 实际浏览器界面与流量图检查
         run: node scripts/capture-ui.mjs --evidence "$RUNNER_TEMP/CodexProxyTray-ui-evidence"
       - name: 保存界面截图与交互证据
