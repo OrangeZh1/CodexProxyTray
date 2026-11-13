@@ -276,7 +276,7 @@ impl UserContext{
         let config=scope_config(root)?;let mut roots=Vec::new();
         // Requested identities are lookup hints only. The service reopens and verifies the
         // real root object, including a root that exited after the GUI retained its handle.
-        for &identity in requested{if let Some(lease)=crate::native::traffic_root_lease(root,&config,identity)?{if lease_belongs_to(&lease,owner){roots.push(lease);}}}
+        for &identity in requested{if let Some(lease)=crate::native::traffic_root_lease(root,&config,identity)?{let sid=process_sid(HANDLE(lease.as_handle())).map_err(|error|format!("无法核验应用根的用户归属（PID {}，创建标识 {}）：{error}",identity.pid,identity.created_filetime))?;if sid==owner{roots.push(lease);}}}
         let all=anchors.iter().copied().chain(roots.iter()).collect::<Vec<_>>();let mut discovered=crate::native::traffic_targets_with_anchors(root,&config,&all)?;discovered.extend(roots);Ok(discovered)
     }
 }
@@ -300,8 +300,11 @@ impl CollectorScope{
     pub(crate) fn targets(&mut self,requested:&[ProcessIdentity])->Result<Vec<ProcessIdentity>,String>{
         crate::traffic_core::validate_targets(requested)?;let now=Instant::now();let mut expired=Vec::new();
         for (&identity,(seen,lease)) in &mut self.allowed{
-            if lease.identity!=identity||!lease_belongs_to(lease,&self.owner_sid){return Err(format!("已核验目标的身份或用户归属发生变化（PID {}，创建标识 {}），已拒绝采样。",identity.pid,identity.created_filetime))}
-            if lease.is_running()?{*seen=now;}else if now.saturating_duration_since(*seen)>=Duration::from_secs(60){expired.push(identity);}
+            if lease.identity!=identity{return Err(format!("已核验目标的创建身份发生变化（PID {}，创建标识 {}），已拒绝采样。",identity.pid,identity.created_filetime))}
+            if lease.is_running()?{if !lease_belongs_to(lease,&self.owner_sid){return Err(format!("已核验目标的用户归属无法确认（PID {}，创建标识 {}），已拒绝采样。",identity.pid,identity.created_filetime))}*seen=now;}
+            // The exact held object already passed SID validation while alive.
+            // Exited tombstones cannot acquire a new identity; expire them without reopening a dead token.
+            else if now.saturating_duration_since(*seen)>=Duration::from_secs(60){expired.push(identity);}
         }
         for identity in expired{self.allowed.remove(&identity);}
         let unknown=requested.iter().filter(|identity|!self.allowed.contains_key(identity)).copied().collect::<Vec<_>>();
@@ -424,7 +427,7 @@ pub(crate) fn start_collector(token:&str,parent:ProcessIdentity)->Result<OwnedHa
         let config=scope_config(&scope.root)?;let parent=fixture.parent_identity()?;let child=fixture.child_identity();let mut leases=crate::native::traffic_targets_held(&scope.root,&config)?;leases.retain(|lease|lease.identity==parent||lease.identity==child);
         if ![parent,child].iter().all(|identity|leases.iter().any(|lease|lease.identity==*identity)){return Err("scope_gui_discovery_missing".into())}let mut checks=vec!["gui_discovered_parent_and_child"];
         fixture.release_parent()?;if unsafe{WaitForSingleObject(HANDLE(fixture.parent.as_raw_handle()),0)}!=WAIT_OBJECT_0||!fixture.child.as_ref().unwrap().is_running()?{return Err("scope_fixture_lifetimes_invalid".into())}checks.push("parent_exited_child_still_alive");
-        let accepted=scope.targets(&[parent,child]).map_err(|_|"scope_first_handoff_refused")?;if !accepted.contains(&child)||!scope.allowed.contains_key(&parent){return Err("scope_first_handoff_missing".into())}checks.push("first_handoff_independently_verified");
+        let accepted=scope.targets(&[parent,child]).map_err(|error|{eprintln!("scope_first_handoff_validation: {}",error.chars().take(500).collect::<String>());"scope_first_handoff_refused"})?;if !accepted.contains(&child)||!scope.allowed.contains_key(&parent){return Err("scope_first_handoff_missing".into())}checks.push("first_handoff_independently_verified");
         scope.allowed.get_mut(&child).ok_or("scope_child_proof_missing")?.0=Instant::now()-Duration::from_secs(61);if !scope.targets(&[child])?.contains(&child){return Err("scope_live_child_expired".into())}checks.push("live_child_proof_survives_sixty_seconds");
         let wrong=ProcessIdentity{pid:child.pid,created_filetime:child.created_filetime.saturating_add(1)};if scope.targets(&[wrong])?.contains(&wrong){return Err("scope_wrong_creation_accepted".into())}checks.push("wrong_creation_excluded");
         let other=fixture.directory.join("other-scope");fs::create_dir(&other).map_err(|_|"scope_other_directory")?;let mut unrelated=ScopeFixture::start(&other)?;

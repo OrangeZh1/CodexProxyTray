@@ -34,6 +34,7 @@ fn os_error() -> String { std::io::Error::last_os_error().to_string() }
     fn Process32NextW(snapshot: Handle, entry: *mut ProcessEntry) -> i32;
     fn GetProcessTimes(process: Handle, created: *mut u64, exited: *mut u64, kernel: *mut u64, user: *mut u64) -> i32;
     fn QueryFullProcessImageNameW(process:Handle,flags:u32,name:*mut u16,length:*mut u32)->i32;
+    fn GetFinalPathNameByHandleW(file:Handle,path:*mut u16,length:u32,flags:u32)->u32;
     fn GetCurrentProcess() -> Handle;
     fn GetSystemTimeAsFileTime(time:*mut u64);
     fn GetModuleHandleW(name:*const u16) -> Handle;
@@ -170,20 +171,40 @@ fn process_lifetime_lease(pid:u32)->Result<Option<ProcessLease>,String>{unsafe{
     if GetProcessId(process)!=pid||GetProcessTimes(process,&mut created,&mut exited,&mut kernel,&mut user)==0||created==0{return Err("无法核验目标进程创建身份。".into())}
     lease.identity.created_filetime=created;Ok(Some(lease))
 }}
-fn process_image(lease:&ProcessLease)->Result<String,String>{unsafe{
+fn process_image_name(lease:&ProcessLease,flags:u32)->Result<String,String>{unsafe{
     let mut path=vec![0u16;32768];let mut length=path.len()as u32;
-    if QueryFullProcessImageNameW(lease.handle,0,path.as_mut_ptr(),&mut length)==0{return Err(format!("无法核验目标进程映像（PID {}，Windows 错误 {}）。",lease.identity.pid,std::io::Error::last_os_error().raw_os_error().unwrap_or(0)))}
+    if QueryFullProcessImageNameW(lease.handle,flags,path.as_mut_ptr(),&mut length)==0{return Err(format!("无法核验目标进程映像（PID {}，查询格式 {}，Windows 错误 {}）。",lease.identity.pid,flags,std::io::Error::last_os_error().raw_os_error().unwrap_or(0)))}
     if length==0||length as usize>=path.len(){return Err("目标进程映像长度无效。".into())}
-    path.truncate(length as usize);Ok(crate::settings::normalized_executable(&PathBuf::from(String::from_utf16_lossy(&path))))
+    path.truncate(length as usize);String::from_utf16(&path).map_err(|_|"目标进程映像编码无效。".into())
 }}
+fn process_image(lease:&ProcessLease)->Result<String,String>{process_image_name(lease,0).map(|image|crate::settings::normalized_executable(&PathBuf::from(image)))}
+fn native_file_image(path:&str)->Option<String>{
+    use std::os::windows::{fs::OpenOptionsExt,io::AsRawHandle};
+    // Query metadata only, preserving the executable's sharing contract. NT
+    // volume paths avoid guessing drive letters, mount points or path prefixes.
+    let file=std::fs::OpenOptions::new().access_mode(0).share_mode(7).security_qos_flags(0x10000).open(path).ok()?;
+    let mut buffer=vec![0u16;32768];let length=unsafe{GetFinalPathNameByHandleW(file.as_raw_handle(),buffer.as_mut_ptr(),buffer.len()as u32,2)};
+    if length==0||length as usize>=buffer.len(){return None}
+    buffer.truncate(length as usize);String::from_utf16(&buffer).ok()
+}
 /// Requested identities locate objects only: the collector must independently
 /// establish a real application root, including a GUI-held exited root object.
 pub(crate) fn traffic_root_lease(root:&std::path::Path,config:&crate::settings::Config,identity:crate::traffic_core::ProcessIdentity)->Result<Option<ProcessLease>,String>{
     crate::traffic_core::validate_targets(&[identity])?;
     let Some(lease)=process_lifetime_lease(identity.pid)?else{return Ok(None)};
     if lease.identity!=identity{return Ok(None)}
-    lease.is_running()?;
-    let image=process_image(&lease)?;let path=PathBuf::from(&image);
+    let image=match process_image(&lease){
+        Ok(image)=>image,
+        Err(error)=>{
+            if lease.is_running()?{return Err(error)}
+            // Win32-name queries can fail after exit even while the exact
+            // process object remains held. Accept only an independently read
+            // native image path equal to a known CLI file's final native path.
+            let Ok(native)=process_image_name(&lease,1)else{return Ok(None)};
+            let allowed=crate::settings::cli_process_paths(root,config).iter().filter(|expected|std::path::Path::new(expected).file_name().is_some_and(|name|name.to_string_lossy().eq_ignore_ascii_case("codex.exe"))).any(|expected|native_file_image(expected).is_some_and(|actual|actual.to_lowercase()==native.to_lowercase()));
+            return Ok(allowed.then_some(lease))
+        }
+    };let path=PathBuf::from(&image);
     let name=path.file_name().and_then(|value|value.to_str()).unwrap_or("");
     let allowed=name.eq_ignore_ascii_case("ChatGPT.exe")&&family_matches(lease.handle)||name.eq_ignore_ascii_case("codex.exe")&&crate::settings::cli_process_paths(root,config).iter().any(|expected|expected==&image);
     Ok(allowed.then_some(lease))
