@@ -67,8 +67,14 @@ function RegisteredUpgradeFixture {
         Require ($oldHelper.Path -ieq (Join-Path $current 'CodexProxyTray.exe')) 'registered_upgrade_fixture_quits_only_its_helper'
         $quit=RunApp $oldHelper.Path @('--quit');try{Require ($quit.WaitForExit(10000) -and $oldHelper.WaitForExit(20000)) 'registered_upgrade_fixture_graceful_quit'}finally{$quit.Dispose()}
     }finally{$oldHelper.Dispose()}
-    [IO.Directory]::Move($current,(Join-Path $work 'pre-fixture-current'))
-    [IO.Directory]::Move($old,$current)
+    # RUNNER_TEMP and LocalApplicationData can be on different volumes. Only
+    # this synthetic fixture copies files; production switches remain atomic.
+    $saved=Join-Path $work 'pre-fixture-current';[void][IO.Directory]::CreateDirectory($saved)
+    $files=@(Get-ChildItem -LiteralPath $current -Force)
+    Require ($files.Count -eq 10 -and $oldActive.current.files.Count -eq 10 -and @($files|Where-Object {$_.PSIsContainer -or $_.Attributes -band [IO.FileAttributes]::ReparsePoint}).Count -eq 0) 'registered_fixture_current_exact_file_boundary'
+    foreach($file in $files){$expected=@($oldActive.current.files|Where-Object name -CEQ $file.Name);Require ($expected.Count -eq 1 -and (Hash $file.FullName) -ceq $expected[0].sha256) 'registered_fixture_current_owned_hash';[IO.File]::Copy($file.FullName,(Join-Path $saved $file.Name),$false)}
+    foreach($file in $files){[IO.File]::Delete($file.FullName)}
+    foreach($file in Get-ChildItem -LiteralPath $old -File){[IO.File]::Copy($file.FullName,(Join-Path $current $file.Name),$false)}
     $oldActive.current.version=$oldVersion;$oldActive.current.source_commit=$oldSource
     $oldActive.current.files=@(Get-ChildItem -LiteralPath $current -File|ForEach-Object {@{name=$_.Name;sha256=Hash $_.FullName}})
     $helper=RunApp (Join-Path $current 'CodexProxyTray.exe') @('--background')
