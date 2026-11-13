@@ -6,6 +6,7 @@ if(Test-Path -LiteralPath $EvidenceDirectory){throw 'Existing evidence is retain
 [void](New-Item -ItemType Directory -Path $EvidenceDirectory)
 $root=Join-Path $env:RUNNER_TEMP ('CodexProxyTray-updater-'+[Guid]::NewGuid().ToString('N'))
 [void](New-Item -ItemType Directory -Path $root)
+$initialRoot=(Resolve-Path -LiteralPath $root).Path
 $manifest=Get-Content -LiteralPath (Join-Path $release 'CodexProxyTray-update.json') -Raw|ConvertFrom-Json
 $zip=Join-Path $release ("CodexProxyTray-v$($manifest.version)-windows-x64.zip")
 $report=[ordered]@{schema=1;status='running';checks=@();scope='Isolated real helper restart and read-only verification of its committed new main window being visible and non-minimized, hash/path rejection, rollback and config/log preservation; no foreground requirement, real user profiles, network or service changes';cleanup='pending'}
@@ -97,8 +98,8 @@ function Case([string]$Name){
 }
 function Job($Case,[string]$Archive){$path=Join-Path $Case.data ('updates\'+$Case.parent.Id+'-'+[DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds());[void](New-Item -ItemType Directory -Path $path);Copy-Item -LiteralPath $Archive -Destination (Join-Path $path 'package.zip');Copy-Item -LiteralPath (Join-Path $release 'CodexProxyTray-update.json') -Destination (Join-Path $path 'manifest.json');Copy-Item -LiteralPath (Join-Path $release 'SHA256SUMS.txt') -Destination (Join-Path $path 'release-sums.txt');[IO.File]::WriteAllText((Join-Path $path 'installer.ps1'),[IO.File]::ReadAllText((Join-Path $PSScriptRoot '..\src-tauri\src\install_update.ps1')),[Text.UTF8Encoding]::new($true));WriteJson (Join-Path $path 'plan.json') @{schema=1;product='CodexProxyTray';version=$manifest.version;zip_sha256=Hash (Join-Path $path 'package.zip');manifest_sha256=Hash (Join-Path $path 'manifest.json');executable=$Case.exe;data_root=$Case.data;parent_pid=$Case.parent.Id;parent_created=$Case.parent.StartTime.ToUniversalTime().ToFileTimeUtc().ToString()};$Case.job=$path;return $path}
 function Installer($Case,[string]$Phase){$shell=Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe';StartOwned $Case $shell @('-NoLogo','-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',(Join-Path $Case.job 'installer.ps1'),'-Phase',$Phase,'-Job',$Case.job)}
-function Quit($Case){$quitter=StartOwned $Case $Case.exe @('--quit');[void]$quitter.WaitForExit(10000);WaitFor {$Case.parent.HasExited} 20 'Owned helper refused graceful quit'}
-function StopCase($Case){foreach($process in @(Get-CimInstance Win32_Process -Filter "name='CodexProxyTray.exe'"|Where-Object {$_.ExecutablePath -and $_.ExecutablePath.StartsWith($Case.directory+'\',[StringComparison]::OrdinalIgnoreCase)})){$request=StartOwned $Case $process.ExecutablePath @('--quit');[void]$request.WaitForExit(10000);$owned=Get-Process -Id $process.ProcessId -ErrorAction SilentlyContinue;if($owned -and -not $owned.WaitForExit(10000)){throw 'Owned fixture did not stop; diagnostic tree retained'}}}
+function Quit($Case){$quitter=StartOwned $Case $Case.exe @('--quit');try{[void]$quitter.WaitForExit(10000);WaitFor {$Case.parent.HasExited} 20 'Owned helper refused graceful quit'}finally{$quitter.Dispose()}}
+function StopCase($Case){foreach($process in @(Get-CimInstance Win32_Process -Filter "name='CodexProxyTray.exe'"|Where-Object {$_.ExecutablePath -and $_.ExecutablePath.StartsWith($Case.directory+'\',[StringComparison]::OrdinalIgnoreCase)})){$request=$null;$owned=$null;try{$request=StartOwned $Case $process.ExecutablePath @('--quit');[void]$request.WaitForExit(10000);$owned=Get-Process -Id $process.ProcessId -ErrorAction SilentlyContinue;if($owned -and -not $owned.WaitForExit(10000)){throw 'Owned fixture did not stop; diagnostic tree retained'}}finally{if($owned){$owned.Dispose()};if($request){$request.Dispose()}}}}
 $cases=@()
 try {
     if(@(Get-Process -Name CodexProxyTray -ErrorAction SilentlyContinue).Count){throw 'Another helper exists; it was not touched.'}
@@ -141,12 +142,32 @@ try {
     $report.status='passed'
 } catch {$report.status='failed';$report['error']=$_.Exception.Message;$report['diagnostic_root']=$root;throw}
 finally {
-    foreach($case in $cases){foreach($jobFolder in @(Get-ChildItem -LiteralPath (Join-Path $case.data 'updates') -Directory -ErrorAction SilentlyContinue)){foreach($name in @('result.json','plan.json','verified.json')){$path=Join-Path $jobFolder.FullName $name;if(Test-Path -LiteralPath $path){Copy-Item -LiteralPath $path -Destination (Join-Path $EvidenceDirectory ((Split-Path -Leaf $case.directory)+'-'+$jobFolder.Name+'-'+$name))}}}}
-    foreach($case in $cases){try{StopCase $case}catch{$report.cleanup='retained: owned fixture still active'}}
-    if($report.status -eq 'passed' -and $report.cleanup -ne 'retained: owned fixture still active'){
-        $resolved=(Resolve-Path -LiteralPath $root).Path;$boundary=[IO.Path]::GetFullPath($env:RUNNER_TEMP);if(-not $resolved.StartsWith($boundary+'\',[StringComparison]::OrdinalIgnoreCase) -or ((Get-Item -LiteralPath $resolved).Attributes -band [IO.FileAttributes]::ReparsePoint)){throw 'Cleanup boundary mismatch'}
-        Remove-Item -LiteralPath $resolved -Recurse -Force;$report.cleanup='passed'
-    }elseif($report.cleanup -eq 'pending'){$report.cleanup='retained_for_diagnosis'}
-    $report['finished_at']=[DateTime]::UtcNow.ToString('o');WriteJson (Join-Path $EvidenceDirectory 'updater-checks.json') $report
+    $cleanupFailure=$null
+    try {
+        try{foreach($case in $cases){foreach($jobFolder in @(Get-ChildItem -LiteralPath (Join-Path $case.data 'updates') -Directory -ErrorAction SilentlyContinue)){foreach($name in @('result.json','plan.json','verified.json')){$path=Join-Path $jobFolder.FullName $name;if(Test-Path -LiteralPath $path){Copy-Item -LiteralPath $path -Destination (Join-Path $EvidenceDirectory ((Split-Path -Leaf $case.directory)+'-'+$jobFolder.Name+'-'+$name))}}}}}catch{$cleanupFailure=$_;$report.status='failed';$report.cleanup='retained_for_diagnosis';$report['cleanup_error_code']='evidence_copy_failed'}
+        foreach($case in $cases){try{StopCase $case}catch{$cleanupFailure=$_;$report.status='failed';$report.cleanup='retained_for_diagnosis';$report['cleanup_error_code']='owned_helper_stop_failed'}finally{foreach($process in @($case.parent,$case.installer)){if($process){try{if($process.HasExited){$process.Dispose()}}catch{}}}}}
+        if($report.status -eq 'passed'){
+            $clock=[Diagnostics.Stopwatch]::StartNew();$report['cleanup_attempts']=0
+            while($true){
+                try{
+                    # Recheck the exact GUID root and ancestors before every recursive deletion.
+                    $resolved=[IO.Path]::GetFullPath($root);$boundary=[IO.Path]::GetFullPath($env:RUNNER_TEMP).TrimEnd('\')
+                    if($resolved -ine $initialRoot -or -not $resolved.StartsWith($boundary+'\',[StringComparison]::OrdinalIgnoreCase) -or [IO.Path]::GetFileName($resolved) -cnotmatch '^CodexProxyTray-updater-[a-f0-9]{32}$'){throw 'cleanup_boundary_mismatch'}
+                    $cursor=$resolved;while($cursor){if((Test-Path -LiteralPath $cursor) -and ((Get-Item -LiteralPath $cursor -Force).Attributes -band [IO.FileAttributes]::ReparsePoint)){throw 'cleanup_reparse_point'};if($cursor -ieq $boundary){break};$cursor=[IO.Path]::GetDirectoryName($cursor)}
+                    $report.cleanup_attempts++;if(Test-Path -LiteralPath $resolved){Remove-Item -LiteralPath $resolved -Recurse -Force};if(Test-Path -LiteralPath $resolved){throw 'cleanup_root_remains'};$report.cleanup='passed';break
+                }catch{
+                    $record=$_;$retry=$false;$exception=$record.Exception;while($exception){if($exception -is [IO.IOException] -or $exception -is [UnauthorizedAccessException]){$retry=$true};$exception=$exception.InnerException}
+                    $target=$record.TargetObject;if($null -ne $target -and [string]$target){try{$targetPath=if($target -is [IO.FileSystemInfo]){$target.FullName}else{[string]$target};if(-not[IO.Path]::IsPathRooted($targetPath)){throw 'relative_cleanup_target'};$targetPath=[IO.Path]::GetFullPath($targetPath);if(@($cases|Where-Object {$profile=[IO.Path]::GetFullPath((Join-Path $_.profile 'webview'));$targetPath -ieq $profile -or $targetPath.StartsWith($profile+'\',[StringComparison]::OrdinalIgnoreCase)}).Count -eq 0){$retry=$false}}catch{$retry=$false}}
+                    $report['cleanup_last_error_code']=('0x{0:X8}' -f ($record.Exception.HResult -band 0xffffffffL));$report['cleanup_last_error_type']=$record.Exception.GetType().FullName
+                    if(-not $retry -or $clock.ElapsedMilliseconds -ge 15000){$cleanupFailure=$record;$report.status='failed';$report.cleanup='retained_for_diagnosis';$report['cleanup_error_code']=if($retry){'sharing_release_timeout'}else{'cleanup_unexpected_error'};break}
+                    Start-Sleep -Milliseconds ([Math]::Min(250,[Math]::Max(1,15000-$clock.ElapsedMilliseconds)))
+                }
+            }
+            $report['cleanup_elapsed_ms']=$clock.ElapsedMilliseconds
+        }elseif($report.cleanup -eq 'pending'){$report.cleanup='retained_for_diagnosis'}
+        if($cleanupFailure -and -not $report.Contains('error')){$report['error']='Owned updater fixture cleanup failed; diagnostic tree retained.'}
+    } catch {$cleanupFailure=$_;$report.status='failed';$report.cleanup='retained_for_diagnosis';$report['cleanup_error_code']='cleanup_finalization_failed';if(-not $report.Contains('error')){$report['error']='Owned updater fixture cleanup failed; diagnostic tree retained.'}}
+    finally {$report['finished_at']=[DateTime]::UtcNow.ToString('o');WriteJson (Join-Path $EvidenceDirectory 'updater-checks.json') $report}
+    if($cleanupFailure){throw $cleanupFailure}
 }
 $report|ConvertTo-Json -Depth 6
