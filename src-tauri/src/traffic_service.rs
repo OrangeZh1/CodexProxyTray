@@ -360,11 +360,53 @@ pub(crate) fn start_collector(token:&str,parent:ProcessIdentity)->Result<OwnedHa
     let mut server=0;GetNamedPipeServerProcessId(pipe.0.0,&mut server).map_err(win)?;let state=status(&service)?;if state.dwCurrentState!=SERVICE_RUNNING||state.dwProcessId!=server{return Err("辅助服务管道身份不匹配。".into())}let service_process=OwnedHandle(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,false,server).map_err(win)?);if process_image(service_process.0)?!=image.canonicalize().map_err(|_|"辅助服务映像不存在。")?{return Err("辅助服务进程映像不匹配。".into())}
     pipe.write(&Request{protocol:PROTOCOL,token:token.into(),parent})?;let deadline=Instant::now()+Duration::from_secs(8);let reply:Reply=loop{if let Some(reply)=pipe.read()?{break reply}if Instant::now()>=deadline{return Err("辅助服务采集器响应超时。".into())}thread::sleep(Duration::from_millis(10));};
     if reply.protocol!=PROTOCOL{return Err("辅助服务响应协议不匹配。".into())}let returned=if reply.handle!=0{Some(OwnedHandle(HANDLE(reply.handle as usize as *mut std::ffi::c_void)))}else{None};pipe.write(&ReplyReceived{protocol:PROTOCOL})?;
-    if reply.error.is_some(){return Err(reply.error.unwrap())}let handle=returned.ok_or("辅助服务采集器启动失败。")?;if identity_on(handle.0).map_err(win)?!=reply.child.ok_or("辅助服务进程身份缺失。")?{return Err("辅助服务返回的进程身份不匹配。".into())}validate_collector(handle.0)?;Ok(handle)
+    if reply.error.is_some(){return Err(reply.error.unwrap())}let handle=returned.ok_or("辅助服务采集器启动失败。")?;if identity_on(handle.0).map_err(win)?!=reply.child.ok_or("辅助服务进程身份缺失。")?{return Err("辅助服务返回的进程身份不匹配。".into())}validate_collector(handle.0)?;
+    #[cfg(test)]tests::track_probe_collector(&handle)?;
+    Ok(handle)
 }}
 
 #[cfg(test)]mod tests{
     use super::*;
+    static PROBE_ACTIVE:AtomicBool=AtomicBool::new(false);
+    static PROBE_COLLECTOR:std::sync::Mutex<Option<OwnedHandle>>=std::sync::Mutex::new(None);
+    pub(super)fn track_probe_collector(process:&OwnedHandle)->Result<(),String>{
+        if !PROBE_ACTIVE.load(Ordering::Acquire){return Ok(())}let mut copy=HANDLE::default();unsafe{DuplicateHandle(GetCurrentProcess(),process.0,GetCurrentProcess(),&mut copy,(PROCESS_QUERY_LIMITED_INFORMATION|PROCESS_SYNCHRONIZE).0,false,DUPLICATE_HANDLE_OPTIONS(0)).map_err(win)?;}
+        let copy=OwnedHandle(copy);let mut proof=PROBE_COLLECTOR.lock().map_err(|_|"普通权限验收句柄状态无效。")?;if proof.is_some(){return Err("普通权限验收出现重复采集器。".into())}*proof=Some(copy);Ok(())
+    }
+    #[test]#[ignore="Requires the isolated service QA script and a verified unelevated medium token"]
+    fn unelevated_service_client_probe(){
+        #[derive(Default,Serialize)]struct ProbeToken{elevated:Option<bool>,admin_enabled:Option<bool>,integrity_rid:Option<u32>,owner_sid_matches:Option<bool>}
+        #[derive(Serialize)]struct Probe{schema:u32,status:&'static str,marker:String,scope:&'static str,token:ProbeToken,samples:usize,stop_ack:bool,collector_exited:bool,collector_exit_code:Option<u32>,service_version:Option<String>,failure_code:Option<&'static str>,elapsed_ms:u64}
+        assert_eq!(std::env::var("GITHUB_ACTIONS").as_deref(),Ok("true"));assert_eq!(std::env::var("RUNNER_ENVIRONMENT").as_deref(),Ok("github-hosted"));
+        let marker=std::env::var("CODEX_PROXY_SERVICE_PROBE_MARKER").expect("explicit probe marker");assert!(marker.len()==64&&marker.bytes().all(|value|value.is_ascii_digit()||(b'a'..=b'f').contains(&value)));
+        let result=PathBuf::from(std::env::var_os("CODEX_PROXY_SERVICE_PROBE_RESULT").expect("explicit result path"));let boundary=PathBuf::from(std::env::var_os("RUNNER_TEMP").expect("runner temp")).canonicalize().unwrap();
+        assert!(result.is_absolute()&&result.file_name()==Some(OsStr::new("result.json")));let parent=result.parent().unwrap().canonicalize().unwrap();assert!(parent.starts_with(&boundary));
+        let mut output=OpenOptions::new().create_new(true).write(true).open(&result).expect("fresh probe result");let started=Instant::now();
+        let mut probe=Probe{schema:1,status:"failed",marker,scope:"unelevated Rust service client; no Tauri or WebView2",token:ProbeToken::default(),samples:0,stop_ack:false,collector_exited:false,collector_exit_code:None,service_version:None,failure_code:None,elapsed_ms:0};
+        let mut sampler=crate::traffic::Coordinator::new();let mut sampling_started=false;
+        let outcome=(||->Result<(),&'static str>{unsafe{
+            let mut raw=HANDLE::default();OpenProcessToken(GetCurrentProcess(),TOKEN_QUERY,&mut raw).map_err(|_|"probe_token_open_failed")?;let token=OwnedHandle(raw);let mut returned=0;let mut elevation=TOKEN_ELEVATION::default();
+            GetTokenInformation(token.0,TokenElevation,Some((&mut elevation as *mut TOKEN_ELEVATION).cast()),size_of::<TOKEN_ELEVATION>()as u32,&mut returned).map_err(|_|"probe_elevation_query_failed")?;probe.token.elevated=Some(elevation.TokenIsElevated!=0);
+            let mut needed=0;let _=GetTokenInformation(token.0,TokenIntegrityLevel,None,0,&mut needed);if needed<size_of::<TOKEN_MANDATORY_LABEL>()as u32||needed>65536{return Err("probe_integrity_size_invalid")}
+            let mut label=vec![0u64;(needed as usize).div_ceil(8)];GetTokenInformation(token.0,TokenIntegrityLevel,Some(label.as_mut_ptr().cast()),needed,&mut needed).map_err(|_|"probe_integrity_query_failed")?;
+            let sid=sid_string((*(label.as_ptr()as *const TOKEN_MANDATORY_LABEL)).Label.Sid).map_err(|_|"probe_integrity_sid_invalid")?;probe.token.integrity_rid=sid.strip_prefix("S-1-16-").and_then(|value|value.parse().ok());
+            let mut admin=PSID::default();let text=wide("S-1-5-32-544");ConvertStringSidToSidW(PCWSTR(text.as_ptr()),&mut admin).map_err(|_|"probe_admin_sid_failed")?;let mut member=windows::core::BOOL::default();let checked=CheckTokenMembership(None,admin,&mut member);let _=LocalFree(Some(HLOCAL(admin.0)));checked.map_err(|_|"probe_admin_query_failed")?;probe.token.admin_enabled=Some(member.as_bool());
+            let(directory,image)=paths().map_err(|_|"probe_service_paths_failed")?;let record=load_receipt(&directory,&image,true).map_err(|_|"probe_service_integrity_failed")?;compatible(&record).map_err(|_|"probe_service_incompatible")?;
+            probe.token.owner_sid_matches=Some(current_sid().map_err(|_|"probe_owner_query_failed")?==record.owner_sid);probe.service_version=Some(record.version);
+            if probe.token.elevated!=Some(false)||probe.token.admin_enabled!=Some(false)||probe.token.integrity_rid!=Some(8192)||probe.token.owner_sid_matches!=Some(true){return Err("probe_not_unelevated_medium_owner")}
+            let root=crate::settings::root();let config=crate::settings::load(&root).map_err(|_|"probe_config_invalid")?;sampler.set_targets(crate::native::traffic_targets_held(&root,&config).map_err(|_|"probe_target_discovery_failed")?).map_err(|_|"probe_targets_invalid")?;
+            PROBE_ACTIVE.store(true,Ordering::Release);sampler.enable(crate::traffic::EnableMode::Normal).map_err(|_|"probe_enable_failed")?;sampling_started=true;
+            let deadline=Instant::now()+Duration::from_secs(30);let mut stamps=HashSet::new();while Instant::now()<deadline{
+                let snapshot=sampler.snapshot();if matches!(snapshot.state,crate::traffic::TrafficState::Unavailable|crate::traffic::TrafficState::NeedsPermission|crate::traffic::TrafficState::NeedsInstallation){return Err("probe_service_sampling_unavailable")}
+                if snapshot.state==crate::traffic::TrafficState::Collecting&&snapshot.received_bytes.is_some()&&snapshot.sent_bytes.is_some(){stamps.insert(snapshot.timestamp_ms);probe.samples=stamps.len();if probe.samples>=2{return Ok(())}}
+                thread::sleep(Duration::from_millis(100));
+            }Err("probe_service_samples_missing")
+        }})();
+        let stopped=sampler.disable();probe.stop_ack=sampling_started&&probe.samples>=2&&stopped.is_ok()&&sampler.snapshot().state==crate::traffic::TrafficState::Disabled;
+        PROBE_ACTIVE.store(false,Ordering::Release);if let Some(process)=PROBE_COLLECTOR.lock().unwrap_or_else(|error|error.into_inner()).take(){probe.collector_exited=unsafe{WaitForSingleObject(process.0,10000)}==WAIT_OBJECT_0;if probe.collector_exited{let mut code=0;if unsafe{GetExitCodeProcess(process.0,&mut code)}.is_ok(){probe.collector_exit_code=Some(code);}}}
+        probe.failure_code=outcome.err().or(if !probe.stop_ack{Some("probe_stop_ack_missing")}else if !probe.collector_exited||probe.collector_exit_code!=Some(0){Some("probe_collector_exit_missing")}else{None});if probe.failure_code.is_none(){probe.status="passed";}probe.elapsed_ms=started.elapsed().as_millis().min(u128::from(u64::MAX))as u64;
+        let bytes=serde_json::to_vec(&probe).unwrap();assert!(bytes.len()<=16384);output.write_all(&bytes).and_then(|_|output.sync_all()).expect("durable probe result");assert_eq!(probe.status,"passed","service client probe failed: {:?}",probe.failure_code);
+    }
     #[test]fn protected_scope_rejects_unrelated_live_targets_keeps_tombstones_and_restores_user_context(){
         let root=std::env::temp_dir().join(format!("codex-traffic-scope-{}-{}",std::process::id(),crate::settings::now()));fs::create_dir(&root).unwrap();
         let mut scope=CollectorScope::new(unsafe{GetCurrentProcess()}).unwrap();scope.root=root.clone();

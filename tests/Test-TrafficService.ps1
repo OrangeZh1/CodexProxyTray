@@ -3,6 +3,7 @@
 param(
     [Parameter(Mandatory=$true)][string]$BinaryPath,
     [Parameter(Mandatory=$true)][string]$EvidenceDirectory,
+    [Parameter(Mandatory=$true)][string]$ServiceProbePath,
     [ValidateRange(5,60)][int]$ProcessTimeoutSeconds=45,
     [ValidateRange(5,30)][int]$ServiceTimeoutSeconds=15
 )
@@ -68,8 +69,7 @@ function Remove-Diagnostics {
     if(-not $diagnosticOwned){return}
     Require (Same-Path ((Get-Item -LiteralPath $diagnosticRoot -Force).FullName) $diagnosticRoot) 'diagnostic_directory_changed'
     No-Reparse $diagnosticRoot
-    $pipeline=Join-Path $diagnosticRoot 'pipeline-data'
-    if(Test-Path -LiteralPath $pipeline){No-Reparse $pipeline;Require ($report.status -eq 'failed') 'pipeline_directory_after_success';return 'retained_for_debugging'}
+    foreach($ownedName in @('pipeline-data','service-client-data')){$ownedWork=Join-Path $diagnosticRoot $ownedName;if(Test-Path -LiteralPath $ownedWork){No-Reparse $ownedWork;Require ($report.status -eq 'failed') 'owned_work_directory_after_success';return 'retained_for_debugging'}}
     $entries=@(Get-ChildItem -LiteralPath $diagnosticRoot -Force)
     foreach($entry in $entries){Require (-not $entry.PSIsContainer -and $diagnosticFiles.Contains($entry.FullName)) 'unknown_diagnostic_file_preserved';No-Reparse $entry.FullName}
     foreach($entry in $entries){[IO.File]::Delete($entry.FullName)}
@@ -106,9 +106,8 @@ namespace CodexProxyTray {
   public static bool LinkedTokenPresent;
   public static int LinkedTokenError;
   public static string TokenPreparationStage;
-  public static string MediumFilesystemStage;
-  public static bool MediumConfigReadable,MediumDataWritable,MediumWebViewWritable;
-  public static int MediumFilesystemError;
+  public static ServiceQaTokenInfo ProbeChildTokenInfo;
+  static readonly Dictionary<uint,IntPtr> GuiHandles=new Dictionary<uint,IntPtr>();
   [StructLayout(LayoutKind.Sequential)] struct Config {public uint type,start,error;public IntPtr binary,group;public uint tag;public IntPtr dependencies,account,display;}
   [StructLayout(LayoutKind.Sequential)] struct Status {public uint type,state,controls,exit,specific,checkpoint,hint,pid,flags;}
   [StructLayout(LayoutKind.Sequential)] struct SidAndAttributes {public IntPtr Sid;public uint Attributes;}
@@ -125,8 +124,6 @@ namespace CodexProxyTray {
   [DllImport("advapi32.dll",EntryPoint="GetTokenInformation",SetLastError=true)] static extern bool GetTokenInformationBuffer(IntPtr token,int kind,IntPtr information,uint length,out uint returned);
   [DllImport("advapi32.dll",SetLastError=true)] static extern bool OpenProcessToken(IntPtr process,uint access,out IntPtr token);
   [DllImport("advapi32.dll",SetLastError=true)] static extern bool CreateRestrictedToken(IntPtr token,uint flags,uint disabledCount,[In] SidAndAttributes[] disabled,uint deletedCount,IntPtr deleted,uint restrictedCount,IntPtr restricted,out IntPtr result);
-  [DllImport("advapi32.dll",SetLastError=true)] static extern bool ImpersonateLoggedOnUser(IntPtr token);
-  [DllImport("advapi32.dll",SetLastError=true)] static extern bool RevertToSelf();
   [DllImport("advapi32.dll",SetLastError=true)] static extern bool SetTokenInformation(IntPtr token,int kind,ref MandatoryLabel information,uint length);
   [DllImport("advapi32.dll",CharSet=CharSet.Unicode,SetLastError=true)] static extern bool ConvertStringSidToSidW(string text,out IntPtr sid);
   [DllImport("advapi32.dll")] static extern uint GetLengthSid(IntPtr sid);
@@ -139,6 +136,8 @@ namespace CodexProxyTray {
   [DllImport("kernel32.dll",SetLastError=true)] static extern uint WaitForSingleObject(IntPtr handle,uint milliseconds);
   [DllImport("kernel32.dll",SetLastError=true)] static extern uint GetProcessId(IntPtr process);
   [DllImport("kernel32.dll",SetLastError=true)] static extern bool GetExitCodeProcess(IntPtr process,out uint code);
+  [DllImport("kernel32.dll")] static extern IntPtr GetCurrentProcess();
+  [DllImport("kernel32.dll",SetLastError=true)] static extern bool DuplicateHandle(IntPtr sourceProcess,IntPtr source,IntPtr targetProcess,out IntPtr target,uint access,bool inherit,uint options);
   [DllImport("advapi32.dll",CharSet=CharSet.Unicode,SetLastError=true)] static extern bool ConvertStringSecurityDescriptorToSecurityDescriptorW(string text,uint revision,out IntPtr descriptor,out uint size);
   [DllImport("kernel32.dll",CharSet=CharSet.Unicode,SetLastError=true)] static extern IntPtr CreateNamedPipeW(string name,uint access,uint mode,uint instances,uint output,uint input,uint timeout,ref SecurityAttributes security);
   [DllImport("kernel32.dll",CharSet=CharSet.Unicode,SetLastError=true)] static extern IntPtr CreateFileW(string name,uint access,uint sharing,IntPtr security,uint disposition,uint flags,IntPtr template);
@@ -194,36 +193,35 @@ namespace CodexProxyTray {
     IntPtr result=restricted;restricted=IntPtr.Zero;return result;
    }} finally {if(linked!=IntPtr.Zero)CloseHandle(linked);if(restricted!=IntPtr.Zero)CloseHandle(restricted);if(admin!=IntPtr.Zero)LocalFree(admin);if(medium!=IntPtr.Zero)LocalFree(medium);}
   }
-  static void ProbeWritableDirectory(string directory) {
-   Directory.CreateDirectory(directory);string path=Path.Combine(directory,".qa-medium-write-"+Guid.NewGuid().ToString("N")+".tmp");bool owned=false;
-   try {using(var file=new FileStream(path,FileMode.CreateNew,FileAccess.ReadWrite,FileShare.None)){owned=true;file.WriteByte(0);file.Flush();}}
-   finally {if(owned)File.Delete(path);}
+  static void PinGuiHandle(IntPtr handle) {
+   uint pid=GetProcessId(handle);if(pid==0)throw new Win32Exception();if(GuiHandles.ContainsKey(pid))return;IntPtr copy;
+   if(!DuplicateHandle(GetCurrentProcess(),handle,GetCurrentProcess(),out copy,0,false,2))throw new Win32Exception();GuiHandles.Add(pid,copy);
   }
-  static void ProbeMediumFilesystem(IntPtr token,string localAppData,string webViewData) {
-   MediumConfigReadable=false;MediumDataWritable=false;MediumWebViewWritable=false;MediumFilesystemError=0;MediumFilesystemStage="impersonate";
-   if(!ImpersonateLoggedOnUser(token)){MediumFilesystemError=Marshal.GetLastWin32Error();throw new Win32Exception(MediumFilesystemError);}
-   try {
-    MediumFilesystemStage="read_config";using(var file=File.Open(Path.Combine(localAppData,"CodexProxyTray","config.json"),FileMode.Open,FileAccess.Read,FileShare.ReadWrite)){file.ReadByte();}MediumConfigReadable=true;
-    MediumFilesystemStage="write_app_data";ProbeWritableDirectory(Path.Combine(localAppData,"CodexProxyTray"));MediumDataWritable=true;
-    MediumFilesystemStage="write_webview_data";ProbeWritableDirectory(webViewData);MediumWebViewWritable=true;MediumFilesystemStage="verified";
-   }catch(Exception error){MediumFilesystemError=error is Win32Exception?((Win32Exception)error).NativeErrorCode:error.HResult&0xffff;throw new InvalidOperationException("medium_filesystem_access_failed",error);}
-   finally {if(!RevertToSelf())Environment.FailFast("Unable to restore the QA controller identity.");}
+  public static void PinGui(Process process) {PinGuiHandle(process.Handle);GC.KeepAlive(process);}
+  public static uint GuiExitCode(uint pid) {
+   IntPtr handle;if(!GuiHandles.TryGetValue(pid,out handle)||GetProcessId(handle)!=pid)throw new InvalidOperationException("qa_gui_native_handle_missing");
+   if(WaitForSingleObject(handle,0)!=0)throw new InvalidOperationException("qa_gui_not_exited");uint code;if(!GetExitCodeProcess(handle,out code))throw new Win32Exception();return code;
   }
-  public static Process StartMedium(string image,string arguments,string localAppData,string webViewData) {
-   if(arguments!="--background"&&arguments!="--quit")throw new InvalidOperationException("restricted_launch_arguments_invalid");
-   image=Path.GetFullPath(image);if(!Path.IsPathFullyQualified(image)||Path.GetFileName(image)!="CodexProxyTray.exe"||image.IndexOf('"')>=0)throw new InvalidOperationException("restricted_launch_image_invalid");
+  public static void ReleaseGui(uint pid) {IntPtr handle;if(GuiHandles.TryGetValue(pid,out handle)){GuiHandles.Remove(pid);CloseHandle(handle);}}
+  public static Process StartMediumProbe(string image,string runtimeDirectory,string localAppData,string resultPath,string marker) {
+   const string arguments="--ignored --exact traffic_service::tests::unelevated_service_client_probe --test-threads=1 --nocapture";
+   if(marker==null||marker.Length!=64)throw new InvalidOperationException("service_probe_marker_invalid");foreach(char value in marker)if(!Uri.IsHexDigit(value)||Char.IsUpper(value))throw new InvalidOperationException("service_probe_marker_invalid");
+   image=Path.GetFullPath(image);if(!Path.IsPathFullyQualified(image)||!System.Text.RegularExpressions.Regex.IsMatch(Path.GetFileName(image),@"^CodexProxyTray-[0-9a-f]+\.exe$",System.Text.RegularExpressions.RegexOptions.IgnoreCase|System.Text.RegularExpressions.RegexOptions.CultureInvariant)||image.IndexOf('"')>=0)throw new InvalidOperationException("restricted_launch_image_invalid");
    var values=new SortedDictionary<string,string>(StringComparer.OrdinalIgnoreCase);foreach(DictionaryEntry pair in Environment.GetEnvironmentVariables())values[(string)pair.Key]=(string)pair.Value;
-   values["LOCALAPPDATA"]=localAppData;values["WEBVIEW2_USER_DATA_FOLDER"]=webViewData;var block=new StringBuilder();foreach(var pair in values){if(pair.Key.IndexOf('\0')>=0||pair.Value.IndexOf('\0')>=0)throw new InvalidOperationException("restricted_environment_invalid");block.Append(pair.Key).Append('=').Append(pair.Value).Append('\0');}block.Append('\0');if(block.Length>1048576)throw new InvalidOperationException("restricted_environment_size");
+   runtimeDirectory=Path.GetFullPath(runtimeDirectory);if(!Directory.Exists(runtimeDirectory))throw new InvalidOperationException("service_probe_runtime_missing");
+   string inheritedPath;values.TryGetValue("PATH",out inheritedPath);values["PATH"]=runtimeDirectory+";"+(inheritedPath??String.Empty);
+   values["LOCALAPPDATA"]=localAppData;values.Remove("WEBVIEW2_USER_DATA_FOLDER");values["CODEX_PROXY_SERVICE_PROBE_RESULT"]=resultPath;values["CODEX_PROXY_SERVICE_PROBE_MARKER"]=marker;var block=new StringBuilder();foreach(var pair in values){if(pair.Key.IndexOf('\0')>=0||pair.Value.IndexOf('\0')>=0)throw new InvalidOperationException("restricted_environment_invalid");block.Append(pair.Key).Append('=').Append(pair.Value).Append('\0');}block.Append('\0');if(block.Length>1048576)throw new InvalidOperationException("restricted_environment_size");
    IntPtr token=IntPtr.Zero,environment=IntPtr.Zero;var created=new ProcessInfo();bool resumed=false;Process managed=null;
    try {
-    token=MediumToken();ProbeMediumFilesystem(token,localAppData,webViewData);environment=Marshal.StringToHGlobalUni(block.ToString());var startup=new StartupInfo {cb=(uint)Marshal.SizeOf(typeof(StartupInfo)),flags=1,show=0};
+    token=MediumToken();environment=Marshal.StringToHGlobalUni(block.ToString());var startup=new StartupInfo {cb=(uint)Marshal.SizeOf(typeof(StartupInfo)),flags=1,show=0};
     // Suspend until the actual child token and process identity have been verified. No inherited handles or console.
-    if(!CreateProcessWithTokenW(token,0,image,new StringBuilder("\""+image+"\" "+arguments),0x08000404,environment,Path.GetDirectoryName(image),ref startup,out created))throw new Win32Exception();
+    if(!CreateProcessWithTokenW(token,0,image,new StringBuilder("\""+image+"\" "+arguments),0x08000404,environment,runtimeDirectory,ref startup,out created))throw new Win32Exception();
     NativeFileTime start,exit,kernel,user;if(!GetProcessTimes(created.process,out start,out exit,out kernel,out user))throw new Win32Exception();var path=new StringBuilder(32768);uint length=(uint)path.Capacity;if(!QueryFullProcessImageNameW(created.process,0,path,ref length)||!String.Equals(Path.GetFullPath(path.ToString()),image,StringComparison.OrdinalIgnoreCase))throw new InvalidOperationException("restricted_child_image_mismatch");
-    var actual=ReadProcessToken(created.process);using(var owner=WindowsIdentity.GetCurrent()){if(actual.Elevated||actual.AdminEnabled||actual.IntegrityRid!=8192||actual.UserSid!=owner.User.Value)throw new InvalidOperationException("restricted_child_token_invalid");}
+    var actual=ReadProcessToken(created.process);ProbeChildTokenInfo=actual;using(var owner=WindowsIdentity.GetCurrent()){if(actual.Elevated||actual.AdminEnabled||actual.IntegrityRid!=8192||actual.UserSid!=owner.User.Value)throw new InvalidOperationException("restricted_child_token_invalid");}
+    PinGuiHandle(created.process);
     managed=Process.GetProcessById((int)created.pid);if(managed.StartTime.ToUniversalTime().ToFileTimeUtc()!=start.Value)throw new InvalidOperationException("restricted_child_identity_changed");
     if(ResumeThread(created.thread)==0xffffffff)throw new Win32Exception();resumed=true;return managed;
-   } finally {if(!resumed&&created.process!=IntPtr.Zero){TerminateProcess(created.process,2);WaitForSingleObject(created.process,5000);if(managed!=null)managed.Dispose();}if(created.thread!=IntPtr.Zero)CloseHandle(created.thread);if(created.process!=IntPtr.Zero)CloseHandle(created.process);if(environment!=IntPtr.Zero)Marshal.FreeHGlobal(environment);if(token!=IntPtr.Zero)CloseHandle(token);}
+   } finally {if(!resumed&&created.process!=IntPtr.Zero){TerminateProcess(created.process,2);WaitForSingleObject(created.process,5000);ReleaseGui(created.pid);if(managed!=null)managed.Dispose();}if(created.thread!=IntPtr.Zero)CloseHandle(created.thread);if(created.process!=IntPtr.Zero)CloseHandle(created.process);if(environment!=IntPtr.Zero)Marshal.FreeHGlobal(environment);if(token!=IntPtr.Zero)CloseHandle(token);}
   }
   static void ValidToken(string token) {if(token==null||token.Length!=32)throw new InvalidOperationException("qa_pipe_token_invalid");foreach(char value in token)if(!Uri.IsHexDigit(value))throw new InvalidOperationException("qa_pipe_token_invalid");}
   public sealed class QaPipe : IDisposable {
@@ -393,26 +391,20 @@ function Run-Case([string]$Name,[scriptblock]$Check) {
     try {$null=&$Check;$cases.Add([ordered]@{name=$Name;status='passed';milliseconds=$clock.ElapsedMilliseconds})}
     catch {$cases.Add([ordered]@{name=$Name;status='failed';milliseconds=$clock.ElapsedMilliseconds;code=(Failure-Code $_)});throw}
 }
-function Run-ServicePipeline([string]$GuiBinary=$binary,[string]$ExpectedError,[switch]$MediumIntegrity) {
+function Run-ServicePipeline([string]$GuiBinary=$binary,[string]$ExpectedError) {
     $sandbox=Join-Path $diagnosticRoot 'pipeline-data'
     Require (-not (Test-Path -LiteralPath $sandbox)) 'pipeline_sandbox_exists'
     [void][IO.Directory]::CreateDirectory((Join-Path $sandbox 'CodexProxyTray'))
     [IO.File]::WriteAllText((Join-Path $sandbox 'CodexProxyTray/config.json'),'{"launch_target":"none","network_enabled":false,"connectivity_enabled":false,"traffic_enabled":true,"auto_check_updates":false}')
     $start={param([string]$Arguments)
-        if($MediumIntegrity){return [CodexProxyTray.ServiceQaNative]::StartMedium($GuiBinary,$Arguments,$sandbox,(Join-Path $sandbox 'webview-data'))}
         $info=[Diagnostics.ProcessStartInfo]::new();$info.FileName=$GuiBinary;$info.Arguments=$Arguments;$info.WorkingDirectory=[IO.Path]::GetDirectoryName($GuiBinary);$info.UseShellExecute=$false;$info.CreateNoWindow=$true;$info.WindowStyle='Hidden'
         $info.EnvironmentVariables['LOCALAPPDATA']=$sandbox;$info.EnvironmentVariables['WEBVIEW2_USER_DATA_FOLDER']=Join-Path $sandbox 'webview-data'
-        return [Diagnostics.Process]::Start($info)
+        $process=[Diagnostics.Process]::Start($info);[CodexProxyTray.ServiceQaNative]::PinGui($process);return $process
     }
     $gui=$null;$pipelineFailure=$null;$final=$null
     try{
         Require (@(Get-Process -Name CodexProxyTray -ErrorAction SilentlyContinue).Count -eq 0) 'pipeline_other_gui_preserved'
         $gui=&$start '--background';$guiStarted=$gui.StartTime.ToUniversalTime();$deadline=[DateTime]::UtcNow.AddSeconds(40);$seen=[Collections.Generic.HashSet[long]]::new()
-        if($MediumIntegrity){
-            $actual=[CodexProxyTray.ServiceQaNative]::ProcessToken($gui.Id)
-            Require (-not $actual.Elevated -and -not $actual.AdminEnabled -and $actual.IntegrityRid -eq 8192 -and $actual.UserSid -ceq $ownerSid) 'pipeline_not_unelevated_medium_owner'
-            $report['medium_gui_token']=[ordered]@{elevated=$actual.Elevated;integrity_rid=$actual.IntegrityRid;administrator_enabled=$actual.AdminEnabled;owner_sid_matches=($actual.UserSid -ceq $ownerSid)}
-        }
         while([DateTime]::UtcNow -lt $deadline){
             Require (-not $gui.HasExited) 'pipeline_gui_exited'
             $path=Join-Path $sandbox 'CodexProxyTray/status.json'
@@ -433,12 +425,12 @@ function Run-ServicePipeline([string]$GuiBinary=$binary,[string]$ExpectedError,[
     finally{
         if($gui){
             try{
-                if(-not $gui.HasExited){Require ($gui.StartTime.ToUniversalTime() -eq $guiStarted -and (Same-Path $gui.Path $GuiBinary)) 'pipeline_gui_identity_changed';$quitter=&$start '--quit';try{Require ($quitter.WaitForExit(10000)) 'pipeline_quit_request_timeout'}finally{$quitter.Dispose()};Require ($gui.WaitForExit(15000)) 'pipeline_gui_stop_timeout'}
+                if(-not $gui.HasExited){Require ($gui.StartTime.ToUniversalTime() -eq $guiStarted -and (Same-Path $gui.Path $GuiBinary)) 'pipeline_gui_identity_changed';$quitter=&$start '--quit';try{Require ($quitter.WaitForExit(10000)) 'pipeline_quit_request_timeout';Require ([CodexProxyTray.ServiceQaNative]::GuiExitCode([uint32]$quitter.Id) -eq 0) 'pipeline_quit_request_failed'}finally{[CodexProxyTray.ServiceQaNative]::ReleaseGui([uint32]$quitter.Id);$quitter.Dispose()};Require ($gui.WaitForExit(15000)) 'pipeline_gui_stop_timeout'}
                 $statusPath=Join-Path $sandbox 'CodexProxyTray/status.json';if(Test-Path -LiteralPath $statusPath){$final=Get-Content -LiteralPath $statusPath -Raw|ConvertFrom-Json}
-                if($gui.HasExited){$report['pipeline_gui_exit_code']=$gui.ExitCode;$report['pipeline_gui_exit_hex']=('{0:X8}' -f ([long]$gui.ExitCode -band 0xffffffff))}
+                if($gui.HasExited){$exitCode=[CodexProxyTray.ServiceQaNative]::GuiExitCode([uint32]$gui.Id);$report['pipeline_gui_exit_code']=$exitCode;$report['pipeline_gui_exit_hex']=('{0:X8}' -f $exitCode)}
                 if($pipelineFailure){$report['pipeline_startup_error_short']=Short-Diagnostic (Join-Path $sandbox 'CodexProxyTray/startup-error.txt');$report['pipeline_ui_error_short']=Short-Diagnostic (Join-Path $sandbox 'CodexProxyTray/ui-error.json')}
             }catch{if(-not $gui.HasExited -and $gui.StartTime.ToUniversalTime() -eq $guiStarted -and (Same-Path $gui.Path $GuiBinary)){$gui.Kill($true);[void]$gui.WaitForExit(10000)};if(-not $pipelineFailure){$pipelineFailure=$_}}
-            finally{$gui.Dispose()}
+            finally{[CodexProxyTray.ServiceQaNative]::ReleaseGui([uint32]$gui.Id);$gui.Dispose()}
         }
         $until=[DateTime]::UtcNow.AddSeconds(12)
         do{$collectors=@(Get-CimInstance Win32_Process -Filter "Name = 'CodexProxyTrayTrafficService.exe'"|Where-Object {$_.CommandLine -like '*--traffic-collector*' -and (Same-Path $_.ExecutablePath $serviceImage)});if($collectors.Count){Start-Sleep -Milliseconds 100}}while($collectors.Count -and [DateTime]::UtcNow -lt $until)
@@ -449,6 +441,55 @@ function Run-ServicePipeline([string]$GuiBinary=$binary,[string]$ExpectedError,[
     if($pipelineFailure){throw $pipelineFailure}
     Require ($final.helper_pid -gt 0 -and -not $final.backend_ready -and $final.traffic.state -eq 'disabled') 'pipeline_stop_ack_not_confirmed'
     $report['service_pipeline_stop_ack']=$true;$report['service_pipeline_collectors_exited']=$true
+}
+function Run-ServiceClientProbe {
+    $sandbox=Join-Path $diagnosticRoot 'service-client-data';Require (-not (Test-Path -LiteralPath $sandbox)) 'service_client_sandbox_exists'
+    $localData=Join-Path $sandbox 'local';[void][IO.Directory]::CreateDirectory((Join-Path $localData 'CodexProxyTray'))
+    [IO.File]::WriteAllText((Join-Path $localData 'CodexProxyTray/config.json'),'{"launch_target":"none","network_enabled":false,"connectivity_enabled":false,"traffic_enabled":false,"auto_check_updates":false}')
+    $resultPath=Join-Path $sandbox 'result.json';$random=[byte[]]::new(32);[Security.Cryptography.RandomNumberGenerator]::Fill($random);$marker=([BitConverter]::ToString($random)).Replace('-','').ToLowerInvariant()
+    $process=$null;$probeFailure=$null;$probeStarted=$null
+    $record=[ordered]@{format='codex-proxy-tray-non-elevated-service-client-v1';status='running';scope='Only the ignored Rust Coordinator service probe; no Tauri or WebView initialization';test_name='traffic_service::tests::unelevated_service_client_probe';test_executable_sha256=$serviceProbeHash;actual_token=$null;native_exit_code=$null;result_present=$false;result_valid=$false;result=$null;collector_cleanup='pending'}
+    try {
+        Require ((Get-FileHash -LiteralPath $serviceProbe -Algorithm SHA256).Hash.ToLowerInvariant() -ceq $serviceProbeHash) 'service_probe_binary_changed'
+        $process=[CodexProxyTray.ServiceQaNative]::StartMediumProbe($serviceProbe,([IO.Path]::GetDirectoryName($binary)),$localData,$resultPath,$marker);$probeStarted=$process.StartTime.ToUniversalTime()
+        $actual=[CodexProxyTray.ServiceQaNative]::ProbeChildTokenInfo;$record.actual_token=Token-Evidence $actual
+        Require ($null -ne $actual -and -not $actual.Elevated -and -not $actual.AdminEnabled -and $actual.IntegrityRid -eq 8192 -and $actual.UserSid -ceq $ownerSid) 'service_client_not_unelevated_medium_owner'
+        Require ($process.WaitForExit($ProcessTimeoutSeconds*1000)) 'service_client_probe_timeout'
+        $record.native_exit_code=[CodexProxyTray.ServiceQaNative]::GuiExitCode([uint32]$process.Id)
+        $record.result_present=Test-Path -LiteralPath $resultPath -PathType Leaf;Require $record.result_present 'service_client_result_missing';No-Reparse $resultPath
+        Require ((Get-Item -LiteralPath $resultPath).Length -le 16384) 'service_client_result_too_large'
+        $stream=[IO.File]::OpenRead($resultPath);$buffer=[byte[]]::new(16385);$length=0
+        try {while($length -lt $buffer.Length){$read=$stream.Read($buffer,$length,$buffer.Length-$length);if($read -eq 0){break};$length+=$read}}finally{$stream.Dispose()}
+        Require ($length -gt 0 -and $length -le 16384) 'service_client_result_too_large'
+        $result=[Text.UTF8Encoding]::new($false,$true).GetString($buffer,0,$length)|ConvertFrom-Json
+        $expected=@('schema','status','marker','scope','token','samples','stop_ack','collector_exited','collector_exit_code','service_version','failure_code','elapsed_ms');$actualFields=@($result.PSObject.Properties.Name)
+        Require ($actualFields.Count -eq $expected.Count -and @($actualFields|Where-Object {$_ -notin $expected}).Count -eq 0) 'service_client_result_schema_invalid'
+        $tokenFields=@($result.token.PSObject.Properties.Name);$expectedToken=@('elevated','admin_enabled','integrity_rid','owner_sid_matches')
+        Require ($tokenFields.Count -eq $expectedToken.Count -and @($tokenFields|Where-Object {$_ -notin $expectedToken}).Count -eq 0) 'service_client_result_token_invalid'
+        Require (($result.schema -is [long] -or $result.schema -is [int]) -and $result.schema -eq 1 -and $result.status -in @('passed','failed') -and $result.marker -ceq $marker -and $result.scope -ceq 'unelevated Rust service client; no Tauri or WebView2') 'service_client_result_binding_invalid'
+        Require (($result.samples -is [long] -or $result.samples -is [int]) -and $result.samples -ge 0 -and $result.samples -le 1024 -and $result.stop_ack -is [bool] -and $result.collector_exited -is [bool]) 'service_client_result_values_invalid'
+        Require (($null -eq $result.token.elevated -or $result.token.elevated -is [bool]) -and ($null -eq $result.token.admin_enabled -or $result.token.admin_enabled -is [bool]) -and ($null -eq $result.token.owner_sid_matches -or $result.token.owner_sid_matches -is [bool]) -and ($null -eq $result.token.integrity_rid -or $result.token.integrity_rid -is [long] -or $result.token.integrity_rid -is [int])) 'service_client_result_token_invalid'
+        Require (($null -eq $result.collector_exit_code -or $result.collector_exit_code -is [long] -or $result.collector_exit_code -is [int]) -and ($null -eq $result.service_version -or $result.service_version -is [string] -and $result.service_version.Length -le 32 -and $result.service_version -cmatch '^\d+\.\d+\.\d+$') -and ($null -eq $result.failure_code -or $result.failure_code -is [string] -and $result.failure_code -cmatch '^[a-z][a-z0-9_]{1,90}$') -and ($result.elapsed_ms -is [long] -or $result.elapsed_ms -is [int]) -and $result.elapsed_ms -ge 0 -and $result.elapsed_ms -le 600000) 'service_client_result_details_invalid'
+        $record.result_valid=$true;$record.result=[ordered]@{schema=1;status=$result.status;marker_matches=$true;samples=$result.samples;stop_ack=$result.stop_ack;collector_exited=$result.collector_exited;collector_exit_code=$result.collector_exit_code;service_version=$result.service_version;failure_code=$result.failure_code;elapsed_ms=$result.elapsed_ms;token=$result.token}
+        Require ($record.native_exit_code -eq 0 -and $result.status -eq 'passed') 'service_client_probe_failed'
+        Require ($result.samples -ge 2 -and $result.stop_ack -and $result.collector_exited -and $null -ne $result.collector_exit_code -and $result.collector_exit_code -eq 0 -and $null -eq $result.failure_code) 'service_client_sampling_or_stop_not_verified'
+        Require ($result.token.elevated -is [bool] -and -not $result.token.elevated -and $result.token.admin_enabled -is [bool] -and -not $result.token.admin_enabled -and $result.token.integrity_rid -eq 8192 -and $result.token.owner_sid_matches -ceq $true) 'service_client_self_token_not_verified'
+        Require ((Assert-OwnedInstall).receipt_hash -ceq $firstReceipt) 'service_client_changed_service_install'
+        $record.status='passed'
+    } catch {$probeFailure=$_;$record.status='failed';$record['failure_code']=Failure-Code $_}
+    finally {
+        if($process){
+            try {if(-not $process.HasExited){Require ($null -ne $probeStarted -and $process.StartTime.ToUniversalTime() -eq $probeStarted -and (Same-Path $process.Path $serviceProbe)) 'service_client_cleanup_identity_changed';$process.Kill($false);Require ($process.WaitForExit(10000)) 'service_client_cleanup_exit_unconfirmed'};$record.native_exit_code=[CodexProxyTray.ServiceQaNative]::GuiExitCode([uint32]$process.Id)}
+            catch {if(-not $probeFailure){$probeFailure=$_};$record.status='failed';$record['cleanup_code']=Failure-Code $_}
+            finally {[CodexProxyTray.ServiceQaNative]::ReleaseGui([uint32]$process.Id);$process.Dispose()}
+        }
+        $until=[DateTime]::UtcNow.AddSeconds(12)
+        do {$collectors=@(Get-CimInstance Win32_Process -Filter "Name = 'CodexProxyTrayTrafficService.exe'"|Where-Object {$_.CommandLine -like '*--traffic-collector*' -and (Same-Path $_.ExecutablePath $serviceImage)});if($collectors.Count){Start-Sleep -Milliseconds 100}}while($collectors.Count -and [DateTime]::UtcNow -lt $until)
+        if($collectors.Count){$record.collector_cleanup='blocked';$record.status='failed';if(-not $probeFailure){$probeFailure='service_client_collectors_remain'}}else{$record.collector_cleanup='passed'}
+        if($record.status -eq 'passed'){try{No-Reparse $sandbox;Require (Is-Within (Full-Path $sandbox) $diagnosticRoot) 'service_client_cleanup_boundary';Remove-Item -LiteralPath $sandbox -Recurse -Force}catch{$record.status='failed';$record['cleanup_code']=Failure-Code $_;$probeFailure=$_}}
+        Write-NewJson (Join-Path $evidenceRoot 'non-elevated-service-client.json') $record;$report['non_elevated_service_client']=$record;$report['non_elevated_client_roundtrip_and_stop_verified']=($record.status -eq 'passed')
+    }
+    if($probeFailure){throw $probeFailure}
 }
 function Run-TargetScopeRejection([switch]$AfterEmptyTargets) {
     $owned=Assert-OwnedInstall
@@ -514,6 +555,10 @@ try {
         $script:sourceLoader=Join-Path ([IO.Path]::GetDirectoryName($binary)) $loaderName
         Require ((Get-FileHash -LiteralPath $sourceLoader -Algorithm SHA256).Hash.ToLowerInvariant() -eq $loaderHash) 'fixed_loader_required'
         $script:binaryHash=(Get-FileHash -LiteralPath $binary -Algorithm SHA256).Hash.ToLowerInvariant();$report.binary_sha256=$binaryHash;$report.loader_sha256=$loaderHash
+        $script:serviceProbe=(Resolve-Path -LiteralPath $ServiceProbePath).Path;No-Reparse $serviceProbe
+        $probeDirectory=Full-Path (Join-Path $env:CARGO_TARGET_DIR 'x86_64-pc-windows-msvc/release/deps')
+        Require ((Is-Within $serviceProbe $probeDirectory) -and [IO.Path]::GetFileName($serviceProbe) -match '^CodexProxyTray-[0-9a-f]+\.exe$') 'current_cargo_service_probe_required'
+        $script:serviceProbeHash=(Get-FileHash -LiteralPath $serviceProbe -Algorithm SHA256).Hash.ToLowerInvariant();$report['service_probe_sha256']=$serviceProbeHash
         $known=Full-Path ([CodexProxyTray.ServiceQaNative]::ProgramFiles());No-Reparse $known
         $script:productDirectory=Join-Path $known 'CodexProxyTray';$script:serviceDirectory=Join-Path $productDirectory 'TrafficService';$script:serviceImage=Join-Path $serviceDirectory $imageName
         Require (Is-Within $serviceDirectory $known) 'service_directory_escaped_known_folder'
@@ -547,11 +592,7 @@ try {
         $report.real_service_main_running=$true
     }
     Run-Case 'service_backed_sampling_roundtrip_and_stop_ack' {Run-ServicePipeline}
-    Run-Case 'unelevated_medium_owner_gui_collects_and_stops' {
-        Run-ServicePipeline -MediumIntegrity
-        Require ((Assert-OwnedInstall).receipt_hash -ceq $firstReceipt) 'medium_gui_changed_service_install'
-        $report['unelevated_medium_service_roundtrip_and_stop_verified']=$true
-    }
+    Run-Case 'non_elevated_medium_service_client_collects_and_stops' {Run-ServiceClientProbe}
     Run-Case 'same_owner_non_gui_client_cannot_start_out_of_scope_targets' {Run-TargetScopeRejection}
     Run-Case 'same_owner_non_gui_client_cannot_add_out_of_scope_targets' {Run-TargetScopeRejection -AfterEmptyTargets}
     Run-Case 'different_gui_hash_reuses_installed_compatible_service' {
@@ -583,7 +624,6 @@ try {
 } catch {$failure=$true;$report.status='failed';$report.failure_case=$currentCase;$report.failure_code=Failure-Code $_}
 finally {
     $report['token_preparation']=[ordered]@{stage=[CodexProxyTray.ServiceQaNative]::TokenPreparationStage;restricted_flags=[CodexProxyTray.ServiceQaNative]::RestrictedTokenFlags;source=(Token-Evidence ([CodexProxyTray.ServiceQaNative]::SourceTokenInfo));linked_token_present=[CodexProxyTray.ServiceQaNative]::LinkedTokenPresent;linked_token_error=[CodexProxyTray.ServiceQaNative]::LinkedTokenError;linked=(Token-Evidence ([CodexProxyTray.ServiceQaNative]::LinkedTokenInfo));restricted=(Token-Evidence ([CodexProxyTray.ServiceQaNative]::RestrictedTokenInfo))}
-    $report['medium_filesystem']=[ordered]@{stage=[CodexProxyTray.ServiceQaNative]::MediumFilesystemStage;config_readable=[CodexProxyTray.ServiceQaNative]::MediumConfigReadable;app_data_writable=[CodexProxyTray.ServiceQaNative]::MediumDataWritable;webview_data_writable=[CodexProxyTray.ServiceQaNative]::MediumWebViewWritable;win32_error=[CodexProxyTray.ServiceQaNative]::MediumFilesystemError}
     try {
         if($installAttempted){
             $present=($null -ne (Inspect-Service)) -or (Test-Path -LiteralPath $serviceDirectory)

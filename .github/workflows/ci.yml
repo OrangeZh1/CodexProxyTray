@@ -99,8 +99,25 @@ jobs:
             target/
           key: ${{ steps.native-cache.outputs.cache-primary-key }}
       - name: Windows 配置迁移与边界检查
+        id: native-tests
         shell: pwsh
-        run: cargo "+$env:RUST_VERSION" test --locked --release --manifest-path src-tauri/Cargo.toml --target x86_64-pc-windows-msvc --bin CodexProxyTray --features custom-protocol
+        run: |
+          $ErrorActionPreference='Stop'
+          $testExecutables=[Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+          cargo "+$env:RUST_VERSION" test --locked --release --manifest-path src-tauri/Cargo.toml --target x86_64-pc-windows-msvc --bin CodexProxyTray --features custom-protocol --message-format=json | ForEach-Object {
+            $line=[string]$_
+            Write-Host $line
+            if($line.StartsWith('{')){
+              try {$message=$line|ConvertFrom-Json -ErrorAction Stop}catch{return}
+              if($message.reason -eq 'compiler-artifact' -and $message.target.name -ceq 'CodexProxyTray' -and $message.profile.test -eq $true -and $message.executable){[void]$testExecutables.Add([IO.Path]::GetFullPath([string]$message.executable))}
+            }
+          }
+          $testExit=$LASTEXITCODE
+          if($testExit -ne 0){exit $testExit}
+          if($testExecutables.Count -ne 1){throw 'Expected exactly one test executable from this cargo test invocation.'}
+          $testExecutable=@($testExecutables)[0]
+          if(-not (Test-Path -LiteralPath $testExecutable -PathType Leaf) -or $testExecutable.Contains("`n") -or $testExecutable.Contains("`r")){throw 'The current test executable is missing or invalid.'}
+          "service_probe_executable=$testExecutable" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
       - name: 真实 ETW 回环流量与会话收尾检查
         timeout-minutes: 3
         shell: pwsh
@@ -128,7 +145,7 @@ jobs:
           if($LASTEXITCODE -ne 0){exit $LASTEXITCODE}
       - name: 隔离验证辅助服务安装与卸载
         shell: pwsh
-        run: ./tests/Test-TrafficService.ps1 -BinaryPath "${{ github.workspace }}/package/CodexProxyTray.exe" -EvidenceDirectory "$env:RUNNER_TEMP/CodexProxyTray-service-evidence"
+        run: ./tests/Test-TrafficService.ps1 -BinaryPath "${{ github.workspace }}/package/CodexProxyTray.exe" -EvidenceDirectory "$env:RUNNER_TEMP/CodexProxyTray-service-evidence" -ServiceProbePath "${{ steps.native-tests.outputs.service_probe_executable }}"
       - name: 真实主窗口与托盘前端启动检查
         shell: pwsh
         run: ./tests/Test-DesktopStartup.ps1 -BinaryPath "${{ github.workspace }}/package/CodexProxyTray.exe" -EvidenceDirectory "$env:RUNNER_TEMP/CodexProxyTray-desktop-evidence"
