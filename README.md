@@ -48,7 +48,7 @@ CodexProxyTray 为 ChatGPT 桌面端和 Windows Codex CLI 提供带代理的启�
 
 ### 下载正式版本
 
-打开 [最新正式 Release](https://github.com/OrangeZh1/CodexProxyTray/releases/latest)，下载其中的 Windows x64 发行 ZIP，例如 `CodexProxyTray-v0.2.0-windows-x64.zip`。这是解压运行的便携发行包，完整解压到固定目录后，双击 `CodexProxyTray.exe`。
+打开 [最新正式 Release](https://github.com/OrangeZh1/CodexProxyTray/releases/latest)，下载其中的 Windows x64 发行 ZIP，例如 `CodexProxyTray-v0.2.2-windows-x64.zip`。这是解压运行的便携发行包，完整解压到固定目录后，双击 `CodexProxyTray.exe`。
 
 GitHub 自动生成的 Source code 是源码归档；日常使用请下载上面的 Windows x64 发行包。Release 同时提供 `SHA256SUMS.txt`、版本说明和 `CodexProxyTray-update.json`。包内 [QUICKSTART.txt](QUICKSTART.txt) 提供离线中文说明。
 
@@ -69,10 +69,11 @@ GitHub 自动生成的 Source code 是源码归档；日常使用请下载上面
 - 已经运行的 ChatGPT 保留原来的启动环境。保存工作后，在方便时手动完整退出并重新打开一次，新的代理环境才会生效。
 - 仅安装一套当前用户 npm Codex CLI。助手内部代理入口不再加入 PATH；从助手打开 CLI 时注入代理，普通终端的官方 `codex` 命令使用终端本来的代理环境。升级时会移除旧版专用入口的用户 PATH 项，其余 PATH 保持原样。
 - 登录自动启动和启动后自动打开应用默认关闭，可在设置中开启。
+- 没有保存记录时代理守护默认暂停；手动开启或暂停后，下次启动恢复该选择。
 
 ## 界面与功能
 
-以下功能说明对应已发布的 [v0.2.1](https://github.com/OrangeZh1/CodexProxyTray/releases/tag/v0.2.1)，发行包内容以对应 Release 说明为准；旧版便携包需要更新后才能使用新增功能。
+以下功能说明对应 [v0.2.2](https://github.com/OrangeZh1/CodexProxyTray/releases/tag/v0.2.2)，发行包内容以对应 Release 说明为准；旧版便携包需要更新后才能使用新增功能。
 
 | 页面 | 可以做什么 |
 | --- | --- |
