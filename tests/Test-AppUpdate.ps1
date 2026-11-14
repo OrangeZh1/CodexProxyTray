@@ -40,7 +40,13 @@ namespace CodexProxyTray {
   [DllImport("user32.dll")] static extern bool IsIconic(IntPtr window);
   [DllImport("user32.dll",SetLastError=true)] static extern bool GetWindowRect(IntPtr window,out Rect rectangle);
   [DllImport("kernel32.dll",CharSet=CharSet.Unicode,SetLastError=true)] static extern Microsoft.Win32.SafeHandles.SafeFileHandle CreateFileW(string path,uint access,uint sharing,IntPtr security,uint disposition,uint flags,IntPtr template);
-  public static Microsoft.Win32.SafeHandles.SafeFileHandle HoldCodeDirectory(string path){var handle=CreateFileW(path,0x80,3,IntPtr.Zero,3,0x02000000,IntPtr.Zero);if(handle.IsInvalid){handle.Dispose();throw new Win32Exception();}return handle;}
+  public static Microsoft.Win32.SafeHandles.SafeFileHandle HoldCodeDirectory(string path){
+   var handle=CreateFileW(path,0x81,3,IntPtr.Zero,3,0x02000000,IntPtr.Zero);if(handle.IsInvalid){int error=Marshal.GetLastWin32Error();handle.Dispose();throw new Win32Exception(error);}
+   // Metadata-only access does not establish the data-sharing constraint. A
+   // DELETE-access open (without deleting anything) must fail before the test.
+   var probe=CreateFileW(path,0x10000,7,IntPtr.Zero,3,0x02000000,IntPtr.Zero);int probeError=Marshal.GetLastWin32Error();bool blocked=probe.IsInvalid;probe.Dispose();
+   if(!blocked||probeError!=32){handle.Dispose();throw new InvalidOperationException("directory_fixture_not_delete_locked");}return handle;
+  }
   public static UpdatedMainWindow[] MainWindows(uint expectedPid){
    var matches=new List<UpdatedMainWindow>();
    if(!EnumWindows((window,parameter)=>{
