@@ -102,8 +102,8 @@ function RecoveryKeys($Value,[string[]]$Keys){if('schema' -cin $Keys -and (-not 
 function RecoveryPath($Value){if($Value -isnot [string] -or -not [IO.Path]::IsPathRooted($Value)){AppFail '切换前恢复路径必须是绝对路径。'};Full $Value}
 function RecoveryFiles($Files,[switch]$Empty){
     if($Empty -and -not @($Files).Count){return ''};if(@($Files).Count -ne $payload.Count){AppFail '切换前恢复文件清单不完整。'};$seen=@{}
-    foreach($file in @($Files)){RecoveryKeys $file @('name','sha256');if($file.name -isnot [string] -or $file.sha256 -isnot [string] -or $file.name -cnotin $payload -or $file.sha256 -cnotmatch '^[a-f0-9]{64}$' -or $seen.ContainsKey([string]$file.name)){AppFail '切换前恢复文件身份无效。'};$seen[[string]$file.name]=$true}
-    (@($Files|Sort-Object name|ForEach-Object {$_.name+':'+$_.sha256}) -join '|')
+    foreach($file in @($Files)){RecoveryKeys $file @('name','sha256');if($file.name -isnot [string] -or $file.sha256 -isnot [string] -or $file.name -cnotin $payload -or $file.sha256 -cnotmatch '^[a-f0-9]{64}$' -or $seen.ContainsKey([string]$file.name)){AppFail '切换前恢复文件身份无效。'};$seen[[string]$file.name]=$file.sha256}
+    (@($seen.Keys|Sort-Object|ForEach-Object {$_+':'+$seen[$_]}) -join '|')
 }
 function RecoveryArchive([string]$Path,[string]$ExpectedVersion,[string]$ExpectedSource){
     Plain $Path;if((Get-Item -LiteralPath $Path).Length -gt 67108864){AppFail '恢复更新包超过读取上限。'};$zip=[IO.Compression.ZipFile]::OpenRead($Path);$files=@();$texts=@{};$total=0L;$seen=@{}

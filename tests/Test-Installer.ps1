@@ -339,7 +339,30 @@ function RefuseOtherRoot {
     $rejected=RunInstaller $setup @('/S',('/D='+$other));$outcome=$report.outcomes[-1]
     Require ($rejected -ne 0 -and $outcome.phase -ceq 'error' -and $outcome.error -match '原安装目录升级' -and -not(Test-Path -LiteralPath $other) -and (RootSnapshot) -ceq $before -and (Get-ItemProperty -LiteralPath $reg).CodexProxyTrayOwner -ceq $entry.CodexProxyTrayOwner -and (Get-ItemProperty -LiteralPath $reg).InstallLocation -ceq $entry.InstallLocation) 'registered_installation_cannot_move_or_create_second_root'
 }
+function RecoveryFileComparison {
+    $scriptPath=Join-Path $work 'recovery-file-comparison.ps1';$nonce=[Guid]::NewGuid().ToString('N')
+    $probeSource=@'
+param([string]$Source,[string]$Nonce)
+$ErrorActionPreference='Stop'
+if($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_ENVIRONMENT -ne 'github-hosted'){throw 'isolated_runner_required'}
+$tokens=$null;$errors=$null;$ast=[Management.Automation.Language.Parser]::ParseFile($Source,[ref]$tokens,[ref]$errors);if($errors.Count){throw 'source_parse_failed'}
+foreach($name in @('AppFail','RecoveryKeys','RecoveryFiles')){$definition=$ast.Find({param($node)$node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq $name},$true);if(-not $definition){throw 'source_function_missing'};. ([scriptblock]::Create($definition.Extent.Text))}
+$payload=@('CodexProxyTray.exe','codex-proxy-cli.exe','WebView2Loader.dll','LICENSE','THIRD_PARTY_NOTICES.md','flag-icons-license.txt','package-receipt.json','QUICKSTART.txt','fluent-icons-license.txt','SHA256SUMS.txt')
+$hashRows=@($payload|ForEach-Object {@{name=$_;sha256=('a'*64)}});$jsonRows=ConvertFrom-Json -InputObject (ConvertTo-Json -InputObject $hashRows -Depth 4)
+if($hashRows.Count -ne 10 -or $jsonRows.Count -ne 10){throw 'fixture_shape_invalid'}
+$canonical=RecoveryFiles $jsonRows;if((RecoveryFiles $hashRows) -cne $canonical){throw 'dictionary_and_json_comparison_differs'}
+[Array]::Reverse($hashRows);if((RecoveryFiles $hashRows) -cne $canonical){throw 'input_order_changes_comparison'}
+$jsonRows[0].sha256='b'*64;if((RecoveryFiles $jsonRows) -ceq $canonical){throw 'changed_hash_not_rejected'}
+@{schema=1;status='passed';nonce=$Nonce;version=$PSVersionTable.PSVersion.ToString()}|ConvertTo-Json -Compress
+'@
+    [IO.File]::WriteAllText($scriptPath,$probeSource,[Text.UTF8Encoding]::new($true));$info=[Diagnostics.ProcessStartInfo]::new((Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'));$info.UseShellExecute=$false;$info.CreateNoWindow=$true;$info.WindowStyle='Hidden';$info.RedirectStandardOutput=$true;$info.RedirectStandardError=$true
+    foreach($argument in @('-NoLogo','-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',$scriptPath,'-Source',(Join-Path $PSScriptRoot '..\src-tauri\src\install_application.ps1'),'-Nonce',$nonce)){$info.ArgumentList.Add($argument)}
+    $process=[Diagnostics.Process]::Start($info);$stdout=$process.StandardOutput.ReadToEndAsync();$stderr=$process.StandardError.ReadToEndAsync()
+    try{Require ($process.WaitForExit(15000)) 'winps51_recovery_file_comparison_exits';Require ([Threading.Tasks.Task]::WaitAll(@($stdout,$stderr),2000)) 'winps51_recovery_file_comparison_streams_close';Require ($process.ExitCode -eq 0 -and $stdout.Result.Length -le 4096 -and -not $stderr.Result) 'winps51_recovery_file_comparison_succeeds';$result=$stdout.Result|ConvertFrom-Json;Require ($result.schema -eq 1 -and $result.status -ceq 'passed' -and $result.nonce -ceq $nonce -and $result.version -like '5.1.*') 'winps51_recovery_file_comparison_binds_source_and_nonce';$report.recovery_file_comparison=@{status='passed';version=$result.version;order_and_representation_independent=$true;changed_hash_rejected=$true}}
+    finally{if(-not $process.HasExited){$process.Kill($false);[void]$process.WaitForExit(5000)};$process.Dispose()}
+}
 function PathBoundaries {
+    RecoveryFileComparison
     # Load only the existing path guards, not either installation entry point.
     $repo=[IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'));$tokens=$null;$errors=$null
     foreach($source in @(@{file='install_update.ps1';names=@('Plain')},@{file='install_application.ps1';names=@('AppFail','Full','Within','PlainParent','InstallDirectory')})){
