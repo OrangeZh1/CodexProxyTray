@@ -13,7 +13,7 @@ param(
     [switch]$Silent
 )
 $ErrorActionPreference='Stop'
-$exitCode=2;$outerLock=$null;$codeLock=$null;$applicationJob=$null;$applicationResult=$null;$healthy=$false;$removalStarted=$false;$bootstrapPhase='load_engine'
+$exitCode=2;$outerLock=$null;$codeLock=$null;$applicationJob=$null;$applicationResult=$null;$healthy=$false;$removalStarted=$false;$bootstrapPhase='load_engine';$failureLocation=$null
 function AppFail([string]$Text){throw $Text}
 function Full([string]$Path){if(-not $Path -or $Path.Contains([char]0) -or $Path.Contains('"')){AppFail '安装路径无效。'};[IO.Path]::GetFullPath($Path).TrimEnd('\')}
 function Within([string]$Path,[string]$Directory){$Path.StartsWith($Directory.TrimEnd('\')+'\',[StringComparison]::OrdinalIgnoreCase)}
@@ -28,6 +28,7 @@ function Event([string]$State){if(-not $applicationJob){return};$record=@{at=[Da
 function SaveOutcome([string]$State,[string]$Message){
     $status=if($State -in @('installed','idempotent','uninstalled')){'passed'}elseif($State -like '*cleanup_pending'){'partial'}else{'failed'}
     $value=@{schema=1;product='CodexProxyTray.Installation';action=$Action;status=$status;phase=$State;version=$Version;root=$installRoot;job=$applicationJob;error=$Message;completed_at=[DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds();optional_service='unchanged'}
+    if($failureLocation){$value.error_location=$failureLocation}
     if($applicationJob){Event $State;Durable (Join-Path $applicationJob 'result.json') $value}
     $latest=Join-Path $data 'installation-result-v1.json';if(Test-Path -LiteralPath $latest){$old=Json $latest;if($old.schema -ne 1 -or $old.product -cne 'CodexProxyTray.Installation'){AppFail '最近安装结果的归属不明，原文件已保留。'}};Durable $latest $value
     if($ResultPath){$destination=Full $ResultPath;PlainParent $destination;if(Test-Path -LiteralPath $destination){AppFail '调用方结果文件已存在，未覆盖。'};Durable $destination $value};$script:applicationResult=$value
@@ -46,14 +47,14 @@ function InstallPlan([string]$Path){
     foreach($line in ([IO.File]::ReadAllText($Path) -split '\r?\n')){if(-not $line.Trim()){continue};if($line -ceq '[Application]'){if($section){AppFail '安装调用计划含重复分节。'};$section=$true;continue};if(-not $section -or $line -cnotmatch '^([A-Za-z][A-Za-z0-9]*)=(.*)$' -or $values.ContainsKey($Matches[1])){AppFail '安装调用计划格式无效。'};$values[$Matches[1]]=$Matches[2]}
     $keys=@('Action','InstallRoot','PayloadZip','ZipSha256','Version','SourceCommit','UninstallerPath','UpdateEnginePath','ResultPath','Silent');if($values.Count -notin @(10,11) -or @($keys|Where-Object {-not $values.ContainsKey($_)}).Count -or @($values.Keys|Where-Object {$_ -cnotin ($keys+@('DesktopShortcut'))}).Count -or $values.Action -cnotin @('Install','Uninstall') -or $values.Silent -cnotin @('0','1') -or ($values.ContainsKey('DesktopShortcut') -and $values.DesktopShortcut -cnotin @('0','1')) -or (Full $values.UpdateEnginePath) -ine $UpdateEnginePath){AppFail '安装调用计划与当前处理程序不匹配。'};if(-not $values.ContainsKey('DesktopShortcut')){$values.DesktopShortcut='0'};$values
 }
-function ExactGone([int]$ProcessId,[long]$Created,[int]$Seconds){$end=[DateTime]::UtcNow.AddSeconds($Seconds);do{$process=Get-Process -Id $ProcessId -ErrorAction SilentlyContinue;try{if(-not $process -or $process.StartTime.ToUniversalTime().ToFileTimeUtc() -ne $Created){return $true}}finally{if($process){$process.Dispose()}};Start-Sleep -Milliseconds 100}while([DateTime]::UtcNow -lt $end);return $false}
 function Helpers([switch]$RejectForeign){
     $matches=@();foreach($process in @(Get-CimInstance Win32_Process -Filter "name='CodexProxyTray.exe'")){if(-not $process.ExecutablePath){AppFail '某个助手进程的路径无法核验，未停止或替换任何程序。'};if($process.ExecutablePath -ieq $exe){$matches+=,$process}elseif($RejectForeign){AppFail '另一目录的助手仍在运行，请先从该助手正常退出；原便携目录不会自动移动或删除。'}};if($matches.Count -gt 1){AppFail '当前安装目录存在多个助手进程，请先正常退出。'};@($matches)
 }
 function NoCliUse {foreach($process in @(Get-CimInstance Win32_Process -Filter "name='codex-proxy-cli.exe'")){if(-not $process.ExecutablePath){AppFail '无法核验某个 CLI 入口的路径，安装操作已停止。'};if((Within $process.ExecutablePath $target) -or (Within $process.ExecutablePath $previous)){AppFail '当前安装目录的 Codex CLI 仍在使用，请先结束对应 CLI；其他 ChatGPT 和 CLI 进程不会被停止。'}}}
-function StopRootHelper {
-    $owned=@(Helpers);if(-not $owned.Count){return};$process=Get-Process -Id $owned[0].ProcessId -ErrorAction Stop
-    try{if($process.Path -ine $exe){AppFail '助手进程身份已变化，未发送退出请求。'};$created=$process.StartTime.ToUniversalTime().ToFileTimeUtc();RunOwned $exe @('--quit') 15;if(-not(ExactGone $process.Id $created 25)){AppFail '当前助手未正常退出，代码和资料均已保留。'}}finally{$process.Dispose()}
+function StopRootHelper([Diagnostics.Process]$ExpectedProcess=$null) {
+    $disposeProcess=$null -eq $ExpectedProcess;$process=$ExpectedProcess
+    if(-not $process){$owned=@(Helpers);if(-not $owned.Count){return};$process=Get-Process -Id $owned[0].ProcessId -ErrorAction Stop}
+    try{[void]$process.Handle;if($process.HasExited){return};if($process.Path -ine $exe){AppFail '助手进程身份已变化，未发送退出请求。'};RunOwned $exe @('--quit') 15;if(-not $process.WaitForExit(25000)){AppFail '当前助手未正常退出，代码和资料均已保留。'}}finally{if($disposeProcess){$process.Dispose()}}
 }
 function TakeCodeLock {$script:codeLock=[IO.File]::Open((Join-Path $installRoot '.current-update.lock'),'OpenOrCreate','ReadWrite','None')}
 function ReleaseCodeLock {if($codeLock){$codeLock.Dispose();$script:codeLock=$null}}
@@ -220,7 +221,7 @@ function Upgrade($OwnedState){
     }
     NoCliUse;$parent=$null;$apply=$null;$updateJob=$null
     try{
-        $running=@(Helpers -RejectForeign);$parent=if($running.Count){Get-Process -Id $running[0].ProcessId -ErrorAction Stop}else{StartHelper '--background --after-update'};if(-not(Ready $parent)){AppFail '原健康助手未能就绪，未开始升级。'}
+        $running=@(Helpers -RejectForeign);$parent=if($running.Count){Get-Process -Id $running[0].ProcessId -ErrorAction Stop}else{StartHelper '--background --after-update'};[void]$parent.Handle;if($parent.Path -ine $exe -or -not(Ready $parent)){AppFail '原健康助手未能就绪，未开始升级。'}
         # This explicit user preference survives a failed update; code/config rollback is independent.
         WritePreferences $OwnedState.marker
         $updateJob=Join-Path (Join-Path $data 'updates') ($PID.ToString()+'-'+[DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds());[void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($updateJob));[void][IO.Directory]::CreateDirectory($updateJob)
@@ -231,7 +232,7 @@ function Upgrade($OwnedState){
         $apply=StartUpdate 'Apply' $updateJob;$end=[DateTime]::UtcNow.AddSeconds(20);$handoff=Join-Path $updateJob 'handoff-ready.json'
         while(-not(Test-Path -LiteralPath $handoff)){if($apply.HasExited -or [DateTime]::UtcNow -ge $end){AppFail '更新执行器未完成交接，原助手保持运行。'};Start-Sleep -Milliseconds 100}
         $receipt=Json $handoff;if($receipt.schema -ne 1 -or $receipt.pid -ne $apply.Id -or $receipt.state -cne 'waiting-parent'){AppFail '更新交接回执身份无效。'}
-        Event 'applying-update';StopRootHelper;if(-not $apply.WaitForExit(120000)){AppFail '更新执行器仍在工作，请保留目录并等待，不要重复运行。'}
+        Event 'applying-update';StopRootHelper $parent;if(-not $apply.WaitForExit(120000)){AppFail '更新执行器仍在工作，请保留目录并等待，不要重复运行。'}
         $outcome=Json (Join-Path $updateJob 'result.json');TakeCodeLock
         if($outcome.phase -ceq 'installed_cleanup_pending'){$script:healthy=$true;SaveOutcome 'installed_cleanup_pending' $outcome.error;$script:exitCode=3;return}
         if($outcome.phase -cne 'installed' -or $apply.ExitCode -ne 0){SaveOutcome $(if($outcome.phase -ceq 'rolled_back'){'rolled_back'}else{'error'}) $outcome.error;$script:exitCode=2;return}
@@ -275,6 +276,7 @@ try {
         if(Test-Path -LiteralPath (Join-Path $installRoot 'installation.json')){$owned=Owned;if([version]$Version -lt [version]$owned.active.current.version){AppFail '目标版本低于当前健康版本，未执行降级。'};if($owned.recovery){$payloadLease=[IO.File]::Open($PayloadZip,'Open','Read','Read');try{if((Hash $PayloadZip) -cne $ZipSha256){AppFail '恢复前新安装包摘要发生变化。'};[void](RecoveryArchive $PayloadZip $Version $SourceCommit);$owned=RecoverPreSwitch $owned}finally{$payloadLease.Dispose()}};Upgrade $owned}else{Initialise}
     }else{if(-not(Test-Path -LiteralPath $installRoot -PathType Container)){AppFail '安装归属记录缺失，未执行卸载。'};Plain $installRoot;[void](Owned -Removing);TakeCodeLock;Uninstall}
 }catch {
+    $failureFrames=@();foreach($frame in @($_.ScriptStackTrace -split '\r?\n'|Select-Object -First 6)){if($frame -match '^at ([^,]+), .*: line (\d+)$'){$frameFunction=$Matches[1];$frameLine=[int]$Matches[2];if($frameFunction -cmatch '^(?:[A-Za-z][A-Za-z0-9_-]*|<ScriptBlock>)$'){$failureFrames+=@{function=$frameFunction;line=$frameLine}}}};$failureLocation=@{stage=$bootstrapPhase;line=[int]$_.InvocationInfo.ScriptLineNumber;frames=$failureFrames}
     $message=$_.Exception.Message;if($message.Length -gt 2000){$message=$message.Substring(0,2000)};$outcomePhase=if($healthy){'installed_cleanup_pending'}elseif($removalStarted){'uninstall_cleanup_pending'}else{'error'};$exitCode=if($outcomePhase -like '*cleanup_pending'){3}else{2}
     try{if($applicationJob){SaveOutcome $outcomePhase $message}}catch{[Console]::Error.WriteLine('安装结果保存未完成，原恢复材料已保留。')};[Console]::Error.WriteLine('CodexProxyTray.Installation stage='+$bootstrapPhase+'; '+$message)
 }finally{ReleaseCodeLock;if($outerLock){$outerLock.Dispose()}}

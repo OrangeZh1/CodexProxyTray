@@ -52,7 +52,8 @@ function CaptureOutcome([int]$ExitCode,[long]$Started){
         $value=Get-Content -LiteralPath $path -Raw|ConvertFrom-Json
         if($value.completed_at -lt $Started){$report.outcomes.Add(@{exit_code=$ExitCode;result_present=$false;stale_previous_result_preserved=$true});return}
         $text=[string]$value.error;foreach($prefix in @($installRoot,$data,$work)){if($prefix){$text=$text.Replace($prefix,'<owned-path>')}};$text=[regex]::Replace($text,'S-\d-(?:\d+-)*\d+','<SID>')
-        $report.outcomes.Add([ordered]@{action=$value.action;status=$value.status;phase=$value.phase;version=$value.version;exit_code=$ExitCode;error=$text;completed_at=$value.completed_at})
+        $location=$null;if($value.error_location){$frames=@();foreach($frame in @($value.error_location.frames|Select-Object -First 6)){if($frame.function -is [string] -and $frame.function -cmatch '^(?:[A-Za-z][A-Za-z0-9_-]*|<ScriptBlock>)$' -and $frame.line -gt 0 -and $frame.line -lt 100000){$frames+=@{function=$frame.function;line=$frame.line}}};$location=@{line=$value.error_location.line;frames=$frames}}
+        $report.outcomes.Add([ordered]@{action=$value.action;status=$value.status;phase=$value.phase;version=$value.version;exit_code=$ExitCode;error=$text;completed_at=$value.completed_at;error_location=$location})
     }else{$report.outcomes.Add(@{exit_code=$ExitCode;result_present=$false})}
 }
 function RunApp([string]$File,[string[]]$Arguments){
