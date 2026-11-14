@@ -1,6 +1,6 @@
 [package]
 name = "codex-proxy-tray"
-version = "0.2.6"
+version = "0.2.7"
 description = "ChatGPT desktop and Codex CLI proxy companion"
 edition = "2021"
 default-run = "CodexProxyTray"
