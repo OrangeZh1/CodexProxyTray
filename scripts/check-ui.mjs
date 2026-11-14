@@ -291,7 +291,7 @@ try {
   assert.match(absentUsage,/data-usage-state="empty"/);assert.match(absentUsage,/未找到本机可读取的 Codex 用量记录/);assert.doesNotMatch(absentUsage,/\$0\.00/,'Missing source data must not imply a zero bill.');
   checks++;
 
-  const collector=(service,result={state:'disabled'},pending=new Set())=>renderToStaticMarkup(React.createElement(CollectorSettings,{result,service,trafficEnabled:false,observed:true,writable:true,busy:name=>pending.has(name),onEnable:noop,onDisable:noop,onInstall:noop,onUninstall:noop}));
+  const collector=(service,result={state:'disabled'},pending=new Set(),trafficEnabled=false)=>renderToStaticMarkup(React.createElement(CollectorSettings,{result,service,trafficEnabled,observed:true,writable:true,busy:name=>pending.has(name),onEnable:noop,onDisable:noop,onInstall:noop,onUpdate:noop,onUninstall:noop}));
   const uninstalled=collector({state:'not_installed',version:'9.9.9'});
   assert.match(uninstalled,/未安装/);assert.ok(control(uninstalled,'button','install-traffic-service'));assert.doesNotMatch(uninstalled,/\bid="uninstall-traffic-service"|版本 9\.9\.9/);
   assert.equal(disabled(control(uninstalled,'input','traffic-enabled')),true);
@@ -303,7 +303,7 @@ try {
   assert.doesNotMatch(installed,/授权采集|不安装 Windows 服务/);
   const outdated=collector({state:'outdated',version:'0.0.1'});
   assert.match(outdated,/需要更新服务/);assert.match(outdated,/辅助服务协议或最低版本不满足要求/);assert.match(outdated,/卸载辅助服务/);
-  assert.doesNotMatch(outdated,/更新辅助服务|\bid="install-traffic-service"/);
+  assert.match(outdated,/更新辅助服务/);assert.equal(disabled(control(outdated,'button','update-traffic-service')),false);assert.doesNotMatch(outdated,/先卸载|卸载后重新安装|\bid="install-traffic-service"/);
   assert.equal(disabled(control(outdated,'input','traffic-enabled')),true);
   const deniedCollector=collector({state:'error',version:null,error:'无法读取服务状态'});
   assert.match(deniedCollector,/无法读取服务状态/);assert.doesNotMatch(deniedCollector,/\bid="(?:install|uninstall)-traffic-service"|版本 /);
@@ -312,6 +312,11 @@ try {
   const installing=collector({state:'not_installed'},{state:'disabled'},new Set(['install-traffic-service']));
   assert.match(control(installing,'button','install-traffic-service'),/aria-busy="true"/);
   assert.match(control(installing,'input','traffic-enabled'),/aria-busy="false"/);assert.equal(disabled(control(installing,'input','traffic-enabled')),true);
+  for(const state of ['outdated','running']){
+    const updating=collector({state,version:'1.0.0'},{state:'disabled'},new Set(['update-traffic-service']),true);
+    assert.match(control(updating,'button','update-traffic-service'),/aria-busy="true"/);assert.match(control(updating,'button','uninstall-traffic-service'),/aria-busy="false"/);assert.equal(disabled(control(updating,'button','uninstall-traffic-service')),true);assert.match(control(updating,'input','traffic-enabled'),/\bchecked(?:=|\s|>)/);assert.match(control(updating,'input','traffic-enabled'),/aria-busy="false"/);assert.equal(disabled(control(updating,'input','traffic-enabled')),true);
+  }
+  const uninstallingOld=collector({state:'outdated',version:'1.0.0'},{state:'disabled'},new Set(['uninstall-traffic-service']));assert.match(control(uninstallingOld,'button','uninstall-traffic-service'),/aria-busy="true"/);assert.match(control(uninstallingOld,'button','update-traffic-service'),/aria-busy="false"/);assert.equal(disabled(control(uninstallingOld,'button','update-traffic-service')),true);
   checks++;
 
   const ownSettings=collector(runningService,{state:'starting'},new Set(['settings-enable-traffic']));

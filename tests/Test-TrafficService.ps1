@@ -69,7 +69,7 @@ function Remove-Diagnostics {
     if(-not $diagnosticOwned){return}
     Require (Same-Path ((Get-Item -LiteralPath $diagnosticRoot -Force).FullName) $diagnosticRoot) 'diagnostic_directory_changed'
     No-Reparse $diagnosticRoot
-    foreach($ownedName in @('pipeline-data','service-client-data','guard-traffic-data','scope-handoff-data')){$ownedWork=Join-Path $diagnosticRoot $ownedName;if(Test-Path -LiteralPath $ownedWork){No-Reparse $ownedWork;Require ($report.status -eq 'failed') 'owned_work_directory_after_success';return 'retained_for_debugging'}}
+    foreach($ownedName in @('pipeline-data','service-client-data','guard-traffic-data','scope-handoff-data','upgrade-fixture')){$ownedWork=Join-Path $diagnosticRoot $ownedName;if(Test-Path -LiteralPath $ownedWork){No-Reparse $ownedWork;Require ($report.status -eq 'failed') 'owned_work_directory_after_success';return 'retained_for_debugging'}}
     $entries=@(Get-ChildItem -LiteralPath $diagnosticRoot -Force)
     foreach($entry in $entries){Require (-not $entry.PSIsContainer -and $diagnosticFiles.Contains($entry.FullName)) 'unknown_diagnostic_file_preserved';No-Reparse $entry.FullName}
     foreach($entry in $entries){[IO.File]::Delete($entry.FullName)}
@@ -318,21 +318,21 @@ function Assert-ProcessAcl([uint32]$ProcessId) {
         Require ($ace.AccessMask -eq $expected) 'process_acl_rights_invalid'
     }
 }
-function Assert-OwnedInstall([switch]$AllowPrepared,[switch]$AllowMissingService) {
+function Assert-OwnedInstall([switch]$AllowPrepared,[switch]$AllowMissingService,[string]$ExpectedHash=$binaryHash,[string]$ExpectedVersion='1.0.1') {
     Require (Test-Path -LiteralPath $serviceDirectory -PathType Container) 'owned_directory_missing'
     Require (Same-Path ((Get-Item -LiteralPath $serviceDirectory -Force).FullName) $serviceDirectory) 'owned_directory_changed'
     Assert-FileAcl $productDirectory;Assert-FileAcl $serviceDirectory
     $entries=@(Get-ChildItem -LiteralPath $serviceDirectory -Force)
     Require ($entries.Count -eq 3) 'owned_inventory_incomplete_or_unknown'
     foreach($entry in $entries){Require (-not $entry.PSIsContainer -and $entry.Name -in @($imageName,$loaderName,'receipt.json')) 'unknown_install_file_preserved';Assert-FileAcl $entry.FullName}
-    Require ((Get-FileHash -LiteralPath $serviceImage -Algorithm SHA256).Hash.ToLowerInvariant() -eq $binaryHash) 'installed_image_hash_mismatch'
+    Require ((Get-FileHash -LiteralPath $serviceImage -Algorithm SHA256).Hash.ToLowerInvariant() -eq $ExpectedHash) 'installed_image_hash_mismatch'
     Require ((Get-FileHash -LiteralPath (Join-Path $serviceDirectory $loaderName) -Algorithm SHA256).Hash.ToLowerInvariant() -eq $loaderHash) 'installed_loader_hash_mismatch'
     $receiptPath=Join-Path $serviceDirectory 'receipt.json';Require ((Get-Item -LiteralPath $receiptPath).Length -le 16384) 'receipt_too_large'
     $receipt=Get-Content -LiteralPath $receiptPath -Raw -Encoding utf8|ConvertFrom-Json
     $keys=@('schema','product','owner_sid','version','protocol','sha256','loader_sha256','image','service_command','phase','readiness','previous','created_parent')
     foreach($key in $keys){Require ($key -in $receipt.PSObject.Properties.Name) 'receipt_schema_missing_field'}
     Require ($receipt.schema -eq 1 -and $receipt.product -eq 'CodexProxyTray.TrafficService' -and $receipt.owner_sid -ceq $ownerSid) 'receipt_owner_or_product_invalid'
-    Require ($receipt.version -ceq '1.0.1' -and $receipt.protocol -eq 2 -and $receipt.sha256 -ceq $binaryHash -and $receipt.loader_sha256 -ceq $loaderHash) 'receipt_version_or_hash_invalid'
+    Require ($receipt.version -ceq $ExpectedVersion -and $receipt.protocol -eq 2 -and $receipt.sha256 -ceq $ExpectedHash -and $receipt.loader_sha256 -ceq $loaderHash) 'receipt_version_or_hash_invalid'
     Require ($receipt.image -ceq $serviceImage -and $receipt.service_command -ceq $expectedCommand -and $null -eq $receipt.previous) 'receipt_paths_or_previous_invalid'
     Require ($receipt.created_parent -is [bool] -and $receipt.created_parent -eq (-not $parentInitiallyExisted)) 'receipt_parent_ownership_invalid'
     $installed=$receipt.phase -eq 'installed' -and $receipt.readiness -eq 'scm_configuration_verified'
@@ -342,15 +342,15 @@ function Assert-OwnedInstall([switch]$AllowPrepared,[switch]$AllowMissingService
     if($null -ne $info){Assert-ServiceConfig $info}elseif(-not $AllowMissingService){throw 'service_not_registered'}
     return [pscustomobject]@{receipt_hash=(Get-FileHash -LiteralPath $receiptPath -Algorithm SHA256).Hash.ToLowerInvariant();version=$receipt.version;service=$info}
 }
-function Stop-OwnedInstaller([Diagnostics.Process]$Process,[datetime]$Created) {
+function Stop-OwnedInstaller([Diagnostics.Process]$Process,[datetime]$Created,[string]$ExpectedImage=$binary) {
     if($Process.HasExited){return}
-    Require ($Process.StartTime.ToUniversalTime() -eq $Created -and (Same-Path $Process.Path $binary)) 'installer_identity_changed_not_killed'
+    Require ($Process.StartTime.ToUniversalTime() -eq $Created -and (Same-Path $Process.Path $ExpectedImage)) 'installer_identity_changed_not_killed'
     # Installer CLI has no descendants. Never kill by name, and never terminate the SCM service process.
     $Process.Kill($false);Require ($Process.WaitForExit(5000)) 'owned_installer_did_not_exit'
 }
-function Run-Installer([ValidateSet('--install-traffic-service','--uninstall-traffic-service')][string]$Action) {
-    Require ((Get-FileHash -LiteralPath $binary -Algorithm SHA256).Hash.ToLowerInvariant() -eq $binaryHash) 'source_binary_changed'
-    Require ((Get-FileHash -LiteralPath $sourceLoader -Algorithm SHA256).Hash.ToLowerInvariant() -eq $loaderHash) 'source_loader_changed'
+function Run-Installer([ValidateSet('--install-traffic-service','--uninstall-traffic-service')][string]$Action,[string]$Image=$binary,[string]$ExpectedHash=$binaryHash) {
+    Require ((Get-FileHash -LiteralPath $Image -Algorithm SHA256).Hash.ToLowerInvariant() -eq $ExpectedHash) 'source_binary_changed'
+    Require ((Get-FileHash -LiteralPath (Join-Path ([IO.Path]::GetDirectoryName($Image)) $loaderName) -Algorithm SHA256).Hash.ToLowerInvariant() -eq $loaderHash) 'source_loader_changed'
     $process=$null;$created=$null;$exit=$null
     $script:diagnosticSequence++
     $stderr=Join-Path $diagnosticRoot ('installer-'+$diagnosticSequence+'.stderr')
@@ -358,14 +358,14 @@ function Run-Installer([ValidateSet('--install-traffic-service','--uninstall-tra
     [void]$diagnosticFiles.Add($stderr);[void]$diagnosticFiles.Add($stdout)
     Require (-not (Test-Path -LiteralPath $stderr) -and -not (Test-Path -LiteralPath $stdout)) 'diagnostic_file_collision'
     try {
-        $process=Start-Process -FilePath $binary -ArgumentList @($Action,'--owner-sid',$ownerSid) -WorkingDirectory ([IO.Path]::GetDirectoryName($binary)) -WindowStyle Hidden -PassThru -RedirectStandardError $stderr -RedirectStandardOutput $stdout -ErrorAction Stop -Verbose:$false -Debug:$false
+        $process=Start-Process -FilePath $Image -ArgumentList @($Action,'--owner-sid',$ownerSid) -WorkingDirectory ([IO.Path]::GetDirectoryName($Image)) -WindowStyle Hidden -PassThru -RedirectStandardError $stderr -RedirectStandardOutput $stdout -ErrorAction Stop -Verbose:$false -Debug:$false
         $created=$process.StartTime.ToUniversalTime()
-        if(-not $process.WaitForExit($ProcessTimeoutSeconds*1000)){$script:writeUncertain=$true;Stop-OwnedInstaller $process $created;throw 'installer_timeout_preserved'}
+        if(-not $process.WaitForExit($ProcessTimeoutSeconds*1000)){$script:writeUncertain=$true;Stop-OwnedInstaller $process $created $Image;throw 'installer_timeout_preserved'}
         $exit=$process.ExitCode;$report.installer_exit_codes.Add($exit)
         if($exit -eq 3){$script:writeUncertain=$true}
         Require ($exit -eq 0) ('installer_exit_'+$exit)
     } finally {
-        if($process){try{if(-not $process.HasExited){$script:writeUncertain=$true;if($null -ne $created){Stop-OwnedInstaller $process $created}}}finally{$process.Dispose()}}
+        if($process){try{if(-not $process.HasExited){$script:writeUncertain=$true;if($null -ne $created){Stop-OwnedInstaller $process $created $Image}}}finally{$process.Dispose()}}
         if($null -eq $exit -or $exit -ne 0){$report.installer_diagnostics.Add([ordered]@{action=if($Action -eq '--install-traffic-service'){'install'}else{'uninstall'};exit_code=$exit;stderr_short=(Short-Diagnostic $stderr)})}
     }
 }
@@ -570,6 +570,45 @@ function Run-ScopeHandoffProbe {
     }
     if($probeFailure){throw $probeFailure}
 }
+function Run-LegacyHelperUpgrade {
+    $work=Join-Path $diagnosticRoot 'upgrade-fixture';Require (-not(Test-Path -LiteralPath $work) -and $null -eq (Inspect-Service) -and -not(Test-Path -LiteralPath $serviceDirectory)) 'upgrade_fixture_not_fresh';[void][IO.Directory]::CreateDirectory($work)
+    $archive=Join-Path $work 'official-v024.zip';$payload=Join-Path $work 'old-payload';$oldHash='89c545fbf86a66a159caf284a177ec666f6c4992aee9ca96138e2a1fd8ec8955'
+    Invoke-WebRequest -Uri 'https://github.com/OrangeZh1/CodexProxyTray/releases/download/v0.2.4/CodexProxyTray-v0.2.4-windows-x64.zip' -OutFile $archive -TimeoutSec 60
+    Require ((Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant() -ceq $oldHash) 'legacy_helper_archive_not_official';[IO.Compression.ZipFile]::ExtractToDirectory($archive,$payload)
+    $legacy=Join-Path $payload 'CodexProxyTray.exe';$legacyHash=(Get-FileHash -LiteralPath $legacy -Algorithm SHA256).Hash.ToLowerInvariant();Require ((Get-Item -LiteralPath $legacy).VersionInfo.ProductVersion -ceq '0.2.4') 'legacy_helper_pe_version_wrong'
+    $payloadHashes=@{};foreach($file in Get-ChildItem -LiteralPath $payload -File){$payloadHashes[$file.Name]=(Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()};Require ($payloadHashes.Count -eq 10) 'legacy_helper_payload_inventory_wrong'
+    $upgradeProfile=Join-Path ([CodexProxyTray.ServiceQaNative]::LocalAppData()) 'CodexProxyTray';$configPath=Join-Path $upgradeProfile 'config.json';$guardPath=Join-Path $upgradeProfile 'guard-v1.json';$profileCreated=$false;$configCreated=$false;$guardCreated=$false;$configHash=$null;$guardHash=$null;$blocked=$null
+    $record=[ordered]@{status='running';legacy_version='1.0.0';target_version='1.0.1';legacy_image_sha256=$legacyHash;new_image_sha256=$binaryHash;authorization='already elevated isolated CI CLI; no runas';rollback_verified=$false;interrupted_recovery_verified=$false;preferences_unchanged=$false;no_downgrade_verified=$false;sampling_stop_verified=$false};$report['in_place_update']=$record
+    try{
+        $cursor=$upgradeProfile;while($cursor){if(Test-Path -LiteralPath $cursor){No-Reparse $cursor};$cursor=[IO.Path]::GetDirectoryName($cursor)};Require (-not(Test-Path -LiteralPath $configPath) -and -not(Test-Path -LiteralPath $guardPath)) 'upgrade_existing_user_preferences_preserved'
+        if(-not(Test-Path -LiteralPath $upgradeProfile)){[void][IO.Directory]::CreateDirectory($upgradeProfile);$profileCreated=$true}
+        [IO.File]::WriteAllText($configPath,'{"launch_target":"none","network_enabled":false,"traffic_enabled":true,"cli_command":[]}',[Text.UTF8Encoding]::new($false));$configCreated=$true;$configHash=(Get-FileHash -LiteralPath $configPath -Algorithm SHA256).Hash.ToLowerInvariant()
+        [IO.File]::WriteAllText($guardPath,'{"schema":1,"enabled":true}',[Text.UTF8Encoding]::new($false));$guardCreated=$true;$guardHash=(Get-FileHash -LiteralPath $guardPath -Algorithm SHA256).Hash.ToLowerInvariant()
+        Run-Installer '--install-traffic-service' $legacy $legacyHash;$old=Assert-OwnedInstall -ExpectedHash $legacyHash -ExpectedVersion '1.0.0';$oldReceipt=Get-Content -LiteralPath (Join-Path $serviceDirectory 'receipt.json') -Raw|ConvertFrom-Json
+        Start-Service -Name $serviceName;$controller=Get-Service -Name $serviceName;try{$controller.WaitForStatus([ServiceProcess.ServiceControllerStatus]::Running,[TimeSpan]::FromSeconds($ServiceTimeoutSeconds))}finally{$controller.Dispose()}
+        # Denying rename of this exact owned image exercises real rollback after broker STOP.
+        $blocked=[IO.File]::Open($serviceImage,'Open','Read','Read');$refused=$false;try{Run-Installer '--install-traffic-service'}catch{$refused=$true}finally{$blocked.Dispose();$blocked=$null}
+        $restored=Assert-OwnedInstall -ExpectedHash $legacyHash -ExpectedVersion '1.0.0';Require ($refused -and $restored.service.State -eq 4 -and $restored.receipt_hash -ceq $old.receipt_hash) 'legacy_update_failure_did_not_restore_exact_receipt_and_running_service';$record.rollback_verified=$true
+        $recovery=Join-Path $productDirectory 'TrafficServiceRecovery';Require (-not(Test-Path -LiteralPath $recovery)) 'upgrade_rollback_left_unresolved_recovery';[void][IO.Directory]::CreateDirectory($recovery);Set-Acl -LiteralPath $recovery -AclObject (Get-Acl -LiteralPath $serviceDirectory);Assert-FileAcl $recovery
+        $next=$oldReceipt|ConvertTo-Json -Depth 8|ConvertFrom-Json;$next.version='1.0.1';$next.protocol=2;$next.sha256=$binaryHash;$next.readiness='scm_configuration_verified'
+        $journal=@{schema=1;owner_sid=$ownerSid;phase='prepared';old=$oldReceipt;new=$next;previous=$null;was_running=$true};$journalPath=Join-Path $recovery 'journal.json';$bytes=[Text.UTF8Encoding]::new($false).GetBytes(($journal|ConvertTo-Json -Depth 12));$stream=[IO.File]::Open($journalPath,'CreateNew','Write','None');try{$stream.Write($bytes,0,$bytes.Length);$stream.Flush($true)}finally{$stream.Dispose()};Set-Acl -LiteralPath $journalPath -AclObject (Get-Acl -LiteralPath $serviceImage)
+        $candidate=Join-Path $recovery 'candidate.exe';[IO.File]::Copy($binary,$candidate,$false);Set-Acl -LiteralPath $candidate -AclObject (Get-Acl -LiteralPath $serviceImage);$stream=[IO.File]::Open($candidate,'Open','Write','Read');try{$stream.Flush($true)}finally{$stream.Dispose()}
+        Run-Installer '--install-traffic-service';$upgraded=Assert-OwnedInstall;$script:firstReceipt=$upgraded.receipt_hash;$record.new_receipt_sha256=$upgraded.receipt_hash;$record.old_receipt_sha256=$old.receipt_hash;$record.interrupted_recovery_verified=$true
+        $receiptBefore=$upgraded.receipt_hash;Run-Installer '--install-traffic-service' $legacy $legacyHash;Require ((Assert-OwnedInstall).receipt_hash -ceq $receiptBefore) 'old_installer_downgraded_new_helper';$record.no_downgrade_verified=$true
+        $variant=Join-Path $diagnosticRoot 'CodexProxyTray.exe';$variantHash=(Get-FileHash -LiteralPath $variant -Algorithm SHA256).Hash.ToLowerInvariant();Run-Installer '--install-traffic-service' $variant $variantHash;Require ((Assert-OwnedInstall).receipt_hash -ceq $receiptBefore) 'same_helper_version_gui_hash_replaced_service'
+        $unknown=Join-Path $recovery 'unknown-note.txt';[IO.File]::WriteAllText($unknown,'owned unknown-file rejection fixture');$unknownHash=(Get-FileHash -LiteralPath $unknown -Algorithm SHA256).Hash.ToLowerInvariant();$refused=$false
+        try{try{Run-Installer '--install-traffic-service'}catch{$refused=$true};Require ($refused -and (Get-FileHash -LiteralPath $unknown -Algorithm SHA256).Hash.ToLowerInvariant() -ceq $unknownHash -and (Assert-OwnedInstall).receipt_hash -ceq $receiptBefore) 'update_unknown_recovery_file_not_preserved'}finally{if((Test-Path -LiteralPath $unknown) -and (Get-FileHash -LiteralPath $unknown -Algorithm SHA256).Hash.ToLowerInvariant() -ceq $unknownHash){[IO.File]::Delete($unknown)}}
+        Run-ServicePipeline;$record.sampling_stop_verified=$true;Require ((Get-FileHash -LiteralPath $configPath -Algorithm SHA256).Hash.ToLowerInvariant() -ceq $configHash -and (Get-FileHash -LiteralPath $guardPath -Algorithm SHA256).Hash.ToLowerInvariant() -ceq $guardHash) 'helper_update_changed_guard_or_traffic_preferences';$record.preferences_unchanged=$true
+        $entries=@(Get-ChildItem -LiteralPath $serviceDirectory -Force);$backups=@(Get-ChildItem -LiteralPath $recovery -Force);Require ($entries.Count -eq 3 -and $backups.Count -eq 2 -and @(Get-ChildItem -LiteralPath $recovery -Filter '*.exe').Count -eq 1 -and (Get-FileHash -LiteralPath (Join-Path $recovery 'previous.exe') -Algorithm SHA256).Hash.ToLowerInvariant() -ceq $legacyHash) 'helper_upgrade_did_not_keep_exactly_one_previous'
+        Run-Installer '--uninstall-traffic-service';Assert-Removed;Require (-not(Test-Path -LiteralPath $recovery)) 'helper_uninstall_left_owned_recovery';$record.status='passed'
+    }finally{
+        if($blocked){$blocked.Dispose()}
+        if($guardCreated){No-Reparse $guardPath;Require ((Get-FileHash -LiteralPath $guardPath -Algorithm SHA256).Hash.ToLowerInvariant() -ceq $guardHash) 'upgrade_guard_fixture_changed_preserved';[IO.File]::Delete($guardPath)}
+        if($configCreated){No-Reparse $configPath;Require ((Get-FileHash -LiteralPath $configPath -Algorithm SHA256).Hash.ToLowerInvariant() -ceq $configHash) 'upgrade_config_fixture_changed_preserved';[IO.File]::Delete($configPath)}
+        if($profileCreated){No-Reparse $upgradeProfile;Require (@(Get-ChildItem -LiteralPath $upgradeProfile -Force).Count -eq 0) 'upgrade_profile_fixture_not_empty';[IO.Directory]::Delete($upgradeProfile)}
+    }
+    foreach($file in Get-ChildItem -LiteralPath $payload -Force){Require (-not $file.PSIsContainer -and $payloadHashes.ContainsKey($file.Name) -and (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant() -ceq $payloadHashes[$file.Name]) 'upgrade_payload_fixture_changed';No-Reparse $file.FullName;[IO.File]::Delete($file.FullName)};[IO.Directory]::Delete($payload);Require ((Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant() -ceq $oldHash) 'legacy_archive_fixture_changed';[IO.File]::Delete($archive);[IO.Directory]::Delete($work)
+}
 function Run-TargetScopeRejection([switch]$AfterEmptyTargets) {
     $owned=Assert-OwnedInstall
     if($owned.service.State -eq 1){Start-Service -Name $serviceName -ErrorAction Stop -WarningAction Stop;$controller=Get-Service -Name $serviceName;try{$controller.WaitForStatus([ServiceProcess.ServiceControllerStatus]::Running,[TimeSpan]::FromSeconds($ServiceTimeoutSeconds))}finally{$controller.Dispose()}}
@@ -701,6 +740,7 @@ try {
     Run-Case 'uninstall_removes_registration_and_owned_directory' {
         $null=Assert-OwnedInstall;$script:uninstallAttempted=$true;Run-Installer '--uninstall-traffic-service';Assert-Removed;$report.uninstall_verified=$true
     }
+    Run-Case 'legacy_helper_direct_update_rollback_recovery_and_preferences' {Run-LegacyHelperUpgrade}
     $report.status='passed'
 } catch {$failure=$true;$report.status='failed';$report.failure_case=$currentCase;$report.failure_code=Failure-Code $_}
 finally {

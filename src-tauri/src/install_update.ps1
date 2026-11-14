@@ -26,6 +26,23 @@ function OwnProcesses([string]$Image){@(Get-CimInstance Win32_Process -Filter "n
 function WaitGone([int]$Id,[string]$Created,[int]$Seconds){$end=[DateTime]::UtcNow.AddSeconds($Seconds);do{if(Test-Path -LiteralPath (Join-Path $Job 'cancelled.json')){return $false};$process=Get-Process -Id $Id -ErrorAction SilentlyContinue;if(-not $process -or $process.StartTime.ToUniversalTime().ToFileTimeUtc().ToString() -cne $Created){return $true};Start-Sleep -Milliseconds 200}while([DateTime]::UtcNow -lt $end);return $false}
 function StartHelper([string]$Arguments='--after-update'){if($Arguments -ceq '--after-update' -and $plan.launch_background -eq $true){$Arguments='--background --after-update'};$start=[Diagnostics.ProcessStartInfo]::new($exe);$start.Arguments=$Arguments;$start.UseShellExecute=$false;$start.CreateNoWindow=$true;$start.WindowStyle='Hidden';$start.WorkingDirectory=$target;if($originalModulesPresent){$start.EnvironmentVariables['PSModulePath']=$originalModulePath}else{$start.EnvironmentVariables.Remove('PSModulePath')};if($originalPolicyPresent){$start.EnvironmentVariables['PSExecutionPolicyPreference']=$originalPolicy}else{$start.EnvironmentVariables.Remove('PSExecutionPolicyPreference')};$start.EnvironmentVariables.Remove('CODEX_PROXY_UPDATER_POLICY');$start.EnvironmentVariables.Remove('CODEX_PROXY_UPDATER_POLICY_PRESENT');$start.EnvironmentVariables.Remove('CODEX_PROXY_UPDATER_MODULES');$start.EnvironmentVariables.Remove('CODEX_PROXY_UPDATER_MODULES_PRESENT');[Diagnostics.Process]::Start($start)}
 function Ready($Process){$end=[DateTime]::UtcNow.AddSeconds(40);do{if($Process.HasExited){return $false};$ok=$true;foreach($window in @('main','tray')){try{$ready=Json (Join-Path $data "ui-ready-$window.json");if($ready.helper_pid -ne $Process.Id -or $ready.rendered -ne $true -or $ready.at -lt ([DateTimeOffset]$Process.StartTime.ToUniversalTime()).ToUnixTimeMilliseconds()){$ok=$false}}catch{$ok=$false}};if($ok){$errorFile=Join-Path $data 'ui-error.json';if(Test-Path -LiteralPath $errorFile){$errorRecord=Json $errorFile;if($errorRecord.helper_pid -eq $Process.Id){return $false}};return $true};Start-Sleep -Milliseconds 250}while([DateTime]::UtcNow -lt $end);return $false}
+function RestoreBeforeSwitch($Proof,[string]$SwitchHash){
+    if(-not $SwitchHash -or (Hash $journalPath) -cne $SwitchHash -or $Proof.old_metadata.schema -ne 1){throw '切换前恢复记录无法确认，已保留现场。'}
+    Verify $target $Proof.before;Verify $candidate $Proof.after
+    if($movedPrevious){if((Test-Path -LiteralPath $previous) -or -not(Test-Path -LiteralPath $obsolete) -or -not @($Proof.old_previous).Count){throw '原回退目录的切换状态无法确认。'};Verify $obsolete $Proof.old_previous;NoCodeUse @($obsolete)}
+    elseif(Test-Path -LiteralPath $obsolete){throw '出现未确认的退役目录，未继续恢复。'}
+    if(-not $movedPrevious){if(@($Proof.old_previous).Count){Verify $previous $Proof.old_previous}elseif(Test-Path -LiteralPath $previous){throw '原回退目录为空，但现目录存在未知内容。'}}
+    $records=@(@{key='active';backup='pre-active-version.json';path=$activePath},@{key='journal';backup='pre-install-journal.json';path=$journalPath})
+    foreach($record in $records){$original=$Proof.old_metadata.($record.key);if($original.present -isnot [bool]){throw '原安装收据的存在状态无法确认。'};if($original.present){if($original.sha256 -cnotmatch '^[a-f0-9]{64}$' -or (Hash (Join-Path $Job $record.backup)) -cne $original.sha256){throw '原安装收据恢复副本发生变化。'}}elseif(Test-Path -LiteralPath (Join-Path $Job $record.backup)){throw '恢复目录存在未声明的原安装收据。'};if($record.key -eq 'active'){if($original.present){if((Hash $record.path) -cne $original.sha256){throw '原活动收据发生变化，未覆盖。'}}elseif(Test-Path -LiteralPath $record.path){throw '活动收据归属无法确认，未移除。'}}}
+    if($movedPrevious){SafeMove $obsolete $previous};Verify $target $Proof.before;if(@($Proof.old_previous).Count){Verify $previous $Proof.old_previous}
+    $lifecycle=@{schema=1;state='pre-switch-candidate-retired';current=@{path=$target;files=$Proof.before};retained_rollback=@{path=$previous;files=$Proof.old_previous};retired_candidate=@{path=$candidate;files=$Proof.after;recovery_status='not-a-rollback-target'};historical_receipts=@((Join-Path $Job 'pre-active-version.json'),(Join-Path $Job 'pre-install-journal.json'));original_metadata=$Proof.old_metadata;candidate_removed=$false;original_receipts_restored=$false;old_helper_ready=$false}
+    Durable (Join-Path $Job 'receipt-lifecycle.json') $lifecycle
+    foreach($record in $records){$original=$Proof.old_metadata.($record.key);if($original.present){if(-not(Test-Path -LiteralPath $record.path) -or (Hash $record.path) -cne $original.sha256){if($record.key -ne 'journal' -or (Hash $journalPath) -cne $SwitchHash){throw '待恢复收据不属于本次切换，已保留。'};RestoreConfig (Join-Path $Job $record.backup) $record.path};if((Hash $record.path) -cne $original.sha256){throw '原安装收据未能精确恢复。'}}elseif($record.key -eq 'journal'){if((Hash $journalPath) -cne $SwitchHash){throw '本次临时切换收据发生变化。'};Remove-Item -LiteralPath $journalPath}}
+    $lifecycle.original_receipts_restored=$true;Durable (Join-Path $Job 'receipt-lifecycle.json') $lifecycle
+    RemoveCode $candidate $Proof.after;$lifecycle.candidate_removed=$true
+    $running=@(OwnProcesses $exe);if($running.Count -gt 1){throw '旧助手出现多个实例，恢复就绪状态无法确认。'};$old=if($running.Count){Get-Process -Id $running[0].ProcessId -ErrorAction Stop}else{StartHelper};try{if($old.MainModule.FileName -ine $exe -or -not(Ready $old)){throw '原助手未通过恢复就绪检查。'};$lifecycle.old_helper_pid=$old.Id;$lifecycle.old_helper_ready=$true}finally{$old.Dispose()}
+    $lifecycle.state='pre-switch-restored';Durable (Join-Path $Job 'receipt-lifecycle.json') $lifecycle
+}
 function ExpandPayload([string]$ZipPath,[string]$Destination,[string]$ExpectedVersion,[string]$ExpectedSource=''){
     Plain $ZipPath;Plain $Destination;if(@(Get-ChildItem -LiteralPath $Destination -Force).Count){throw '安装暂存目录非空，原内容已保留。'}
     $zip=[IO.Compression.ZipFile]::OpenRead($ZipPath)
@@ -42,10 +59,15 @@ function ExpandPayload([string]$ZipPath,[string]$Destination,[string]$ExpectedVe
 $payload=@('CodexProxyTray.exe','codex-proxy-cli.exe','WebView2Loader.dll','LICENSE','THIRD_PARTY_NOTICES.md','flag-icons-license.txt','package-receipt.json','QUICKSTART.txt','fluent-icons-license.txt','SHA256SUMS.txt')
 if($Phase -eq 'Library'){return}
 if($Phase -notin @('Prepare','Apply') -or -not $Job){throw '更新阶段或任务目录缺失。'}
+if(-not [IO.Path]::IsPathRooted($Job)){throw '更新任务目录必须是绝对路径。'}
 $Job=[IO.Path]::GetFullPath($Job);Plain $Job
 $plan=Json (Join-Path $Job 'plan.json');$data=[IO.Path]::GetFullPath($plan.data_root);$exe=[IO.Path]::GetFullPath($plan.executable);$target=[IO.Path]::GetDirectoryName($exe);$installRoot=[IO.Path]::GetDirectoryName($target)
 if($plan.schema -ne 1 -or $plan.product -cne 'CodexProxyTray' -or $plan.version -cnotmatch '^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$' -or [IO.Path]::GetFileName($exe) -cne 'CodexProxyTray.exe' -or [IO.Path]::GetDirectoryName($Job) -ine (Join-Path $data 'updates') -or $data -ine (Join-Path $env:LOCALAPPDATA 'CodexProxyTray') -or $target.StartsWith($data+'\',[StringComparison]::OrdinalIgnoreCase) -or $data.StartsWith($target+'\',[StringComparison]::OrdinalIgnoreCase)){throw '安装计划与本机助手不匹配。'}
 Plain $target;Plain $installRoot;Plain $data
+if($Job -ieq $target -or $Job.StartsWith($target+'\',[StringComparison]::OrdinalIgnoreCase)){throw '更新工作目录不能位于待切换代码目录内。'}
+# PowerShell location and the Windows process CWD are independent. Neither may pin current.
+Set-Location -LiteralPath $Job
+[Environment]::CurrentDirectory=$Job
 $id=[IO.Path]::GetFileName($Job);if($id -cnotmatch '^\d+-\d+$'){throw '更新任务标识无效。'}
 $managed=([IO.Path]::GetFileName($target) -ieq 'current') -and (Test-Path -LiteralPath (Join-Path $installRoot 'active-version.json'))
 $candidate=Join-Path $installRoot ('.candidate-update-'+$id);$obsolete=Join-Path $installRoot ('.obsolete-update-'+$id)
@@ -53,7 +75,7 @@ $previous=if($managed){Join-Path $installRoot 'previous'}else{Join-Path $install
 $activePath=if($managed){Join-Path $installRoot 'active-version.json'}else{Join-Path $installRoot ('.'+[IO.Path]::GetFileName($target)+'-active-version.json')}
 $journalPath=if($managed){Join-Path $installRoot 'install-journal.json'}else{Join-Path $installRoot ('.'+[IO.Path]::GetFileName($target)+'-install-journal.json')}
 $lockPath=Join-Path $installRoot ('.'+[IO.Path]::GetFileName($target)+'-update.lock')
-$lock=$null;$committed=$false;$switched=$false;$movedPrevious=$false;$movedCurrent=$false;$new=$null
+$lock=$null;$committed=$false;$switched=$false;$movedPrevious=$false;$movedCurrent=$false;$new=$null;$switchingStarted=$false;$switchingHash=$null
 try {
     $lock=[IO.File]::Open($lockPath,'OpenOrCreate','ReadWrite','None')
     $parent=Get-Process -Id ([int]$plan.parent_pid) -ErrorAction SilentlyContinue
@@ -71,16 +93,17 @@ try {
         [void](New-Item -ItemType Directory -Path $candidate)
         $package=ExpandPayload (Join-Path $Job 'package.zip') $candidate $plan.version
         $sums=@($package.files);$receipt=$package.receipt
-        Durable (Join-Path $Job 'verified.json') @{schema=1;before=$before;after=$sums;old_previous=$oldPrevious;source_commit=$receipt.source_commit;old_active=$oldActive;target=$target;previous=$previous;candidate=$candidate;obsolete=$obsolete}
+        $metadata=@{schema=1};foreach($pair in @(@('active','pre-active-version.json'),@('journal','pre-install-journal.json'))){$path=Join-Path $Job $pair[1];$present=Test-Path -LiteralPath $path;$metadata[$pair[0]]=@{present=[bool]$present;sha256=if($present){Hash $path}else{$null}}}
+        Durable (Join-Path $Job 'verified.json') @{schema=1;before=$before;after=$sums;old_previous=$oldPrevious;source_commit=$receipt.source_commit;old_active=$oldActive;old_metadata=$metadata;target=$target;previous=$previous;candidate=$candidate;obsolete=$obsolete}
         exit 0
     }
     $verified=Json (Join-Path $Job 'verified.json');if($verified.target -ine $target -or $verified.previous -ine $previous -or $verified.candidate -ine $candidate -or $verified.obsolete -ine $obsolete){throw '已校验计划路径发生变化。'}
     Verify $target $verified.before;Verify $candidate $verified.after;if(Test-Path -LiteralPath $previous){Verify $previous $verified.old_previous}
-    Durable (Join-Path $Job 'handoff-ready.json') @{schema=1;pid=$PID;state='waiting-parent'}
+    Durable (Join-Path $Job 'handoff-ready.json') @{schema=1;pid=$PID;state='waiting-parent';process_cwd_is_job=([Environment]::CurrentDirectory -ieq $Job);powershell_location_is_job=((Get-Location).ProviderPath -ieq $Job)}
     if(-not(WaitGone $parent.Id $plan.parent_created 30)){throw '助手尚未退出，已取消替换。'}
     if(@(OwnProcesses $exe).Count){throw '新的助手实例仍在运行，已取消替换。'}
     foreach($name in @('config.json','logs\events-v1.json')){$path=Join-Path $data $name;if(Test-Path -LiteralPath $path){Plain $path;CopyDurable $path (Join-Path $Job ([IO.Path]::GetFileName($name)));if((Hash $path) -cne (Hash (Join-Path $Job ([IO.Path]::GetFileName($name))))){throw '配置或日志备份未通过校验。'}}}
-    $journal=@{schema=1;state='switching';current=$target;previous=$previous;source_commit=$verified.source_commit;recovery=$Job;candidate=$candidate;obsolete=$obsolete};Durable $journalPath $journal
+    $journal=@{schema=1;state='switching';current=$target;previous=$previous;source_commit=$verified.source_commit;recovery=$Job;candidate=$candidate;obsolete=$obsolete};$switchingStarted=$true;Durable $journalPath $journal;$switchingHash=Hash $journalPath
     if(Test-Path -LiteralPath $previous){SafeMove $previous $obsolete;$movedPrevious=$true}
     SafeMove $target $previous;$movedCurrent=$true;SafeMove $candidate $target;$switched=$true
     $journal.state='awaiting-readiness';Durable $journalPath $journal
@@ -107,6 +130,7 @@ try {
             try{SafeMove $target $candidate;SafeMove $previous $target;if($movedPrevious){SafeMove $obsolete $previous};$configBackup=Join-Path $Job 'config.json';if(Test-Path -LiteralPath $configBackup){if(Test-Path -LiteralPath (Join-Path $data 'config.json')){CopyDurable (Join-Path $data 'config.json') (Join-Path $Job 'config-after-failed-update.json')};RestoreConfig $configBackup (Join-Path $data 'config.json')};foreach($pair in @(@('pre-active-version.json',$activePath),@('pre-install-journal.json',$journalPath))){if(Test-Path -LiteralPath (Join-Path $Job $pair[0])){Durable $pair[1] (Json (Join-Path $Job $pair[0]))}};$old=StartHelper;if(-not(Ready $old)){throw '回退程序未通过就绪检查。'};Result 'rolled_back' ($failure+' 已恢复上一版本；配置、日志及失败材料保留在本机。')}catch{Result 'error' ($failure+' 自动回退未完成，请保留恢复目录并手动处理。')}
         }else{Result 'error' ($failure+' 新助手尚未正常退出，未强制关闭或继续替换。')}
     }elseif($movedCurrent){try{SafeMove $previous $target;if($movedPrevious){SafeMove $obsolete $previous};$old=StartHelper;if(-not(Ready $old)){throw '回退程序未通过就绪检查。'};Result 'rolled_back' $failure}catch{Result 'error' ($failure+' 代码切换恢复未完成。')}}
+    elseif($switchingStarted){try{RestoreBeforeSwitch $verified $switchingHash;Result 'rolled_back' ($failure+' 代码尚未切换；原版本、回退目录及安装收据已恢复，旧助手已重新就绪。')}catch{Result 'error' ($failure+' 切换前恢复收尾未完成：'+$_.Exception.Message+' 请保留本次恢复目录。')}}
     else{Result 'error' $failure}
     exit 1
 } finally {if($lock){$lock.Dispose()}}

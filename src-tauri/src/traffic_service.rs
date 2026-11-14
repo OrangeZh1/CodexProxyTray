@@ -15,6 +15,12 @@ const LOADER_PENDING:&str="WebView2Loader.dll.pending";
 const LOADER_HASH:&str="86545b66cdb0603bc26b626fb9ad610cb6e71f28d468f5ea66df23b03dda96d5";
 const RECEIPT:&str="receipt.json";
 const PENDING:&str="receipt.pending.json";
+const RECOVERY:&str="TrafficServiceRecovery";
+const JOURNAL:&str="journal.json";
+const JOURNAL_PENDING:&str="journal.pending.json";
+const CANDIDATE:&str="candidate.exe";
+const PREVIOUS:&str="previous.exe";
+const RETIRED:&str="retired.exe";
 const PRODUCT:&str="CodexProxyTray.TrafficService";
 const FILE_SDDL:&str="O:BAG:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)";
 const PROTOCOL:u32=2;
@@ -31,6 +37,8 @@ impl ServiceSnapshot {fn new(state:&str,version:Option<String>,error:Option<Stri
 #[derive(Clone,Serialize,Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Receipt {schema:u32,product:String,owner_sid:String,version:String,#[serde(default)]protocol:u32,sha256:String,loader_sha256:String,image:String,service_command:String,phase:String,readiness:String,previous:Option<String>,created_parent:bool}
+#[derive(Clone,Serialize,Deserialize)]#[serde(deny_unknown_fields)]
+struct UpdateJournal{schema:u32,owner_sid:String,phase:String,old:Receipt,new:Receipt,previous:Option<Receipt>,was_running:bool}
 #[derive(Serialize,Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Request {protocol:u32,token:String,parent:ProcessIdentity}
@@ -140,6 +148,7 @@ fn snapshot_checked()->Result<ServiceSnapshot,String>{
     let(directory,image)=paths()?;let manager=manager(SC_MANAGER_CONNECT)?;let service=service(&manager,SERVICE_QUERY_CONFIG|SERVICE_QUERY_STATUS|READ_CONTROL.0)?;
     let Some(service)=service else{if directory.exists()&&directory.join(RECEIPT).exists(){let record=load_receipt(&directory,&image,false)?;return Ok(ServiceSnapshot::new("error",Some(record.version),Some("安装记录存在，但辅助服务未完成注册。".into())))}return Ok(ServiceSnapshot::new("not_installed",None,None))};
     let record=load_receipt(&directory,&image,false)?;validate_config(&service,&image,&record.owner_sid)?;if record.owner_sid!=current_sid()?{return Err("辅助服务属于其他 Windows 用户。".into())}if record.phase!="installed"{return Err("辅助服务安装尚未完成。".into())}
+    if let Some(journal)=read_update(&directory,&image)?{if journal.owner_sid!=record.owner_sid{return Err("辅助服务更新记录属于其他用户。".into())}let recovery=recovery_directory(&directory)?;if journal.phase!="committed"||journal.previous.is_some()||[JOURNAL_PENDING,CANDIDATE,RETIRED].iter().any(|name|recovery.join(name).exists()){validate_update_layout(&directory,&image,&journal)?;return Ok(ServiceSnapshot::new("outdated",Some(record.version.clone()),Some("辅助服务更新尚待恢复或收尾，请直接更新辅助服务重试；原偏好已保留。".into())))}}
     if let Err(error)=compatible(&record){return Ok(ServiceSnapshot::new("outdated",Some(record.version),Some(error)))}
     let state=if status(&service)?.dwCurrentState==SERVICE_RUNNING{"running"}else{"stopped"};Ok(ServiceSnapshot::new(state,Some(record.version),None))
 }
@@ -178,6 +187,120 @@ fn secure_directory(path:&Path)->Result<(),String>{
 fn stop_service(service:&Sc)->Result<(),String>{
     let deadline=Instant::now()+Duration::from_secs(10);loop{let state=status(service)?.dwCurrentState;if state==SERVICE_STOPPED{return Ok(())}if state!=SERVICE_STOP_PENDING{unsafe{let mut value=SERVICE_STATUS::default();match ControlService(service.0,SERVICE_CONTROL_STOP,&mut value){Ok(())=>{},Err(error)if matches!(code(&error),1061|1062)=>{},Err(error)=>return Err(win(error))}}}if Instant::now()>=deadline{return Err("请先停止流量统计，辅助服务仍在使用或收尾；安装文件已保留。".into())}thread::sleep(Duration::from_millis(50));}
 }
+fn recovery_directory(directory:&Path)->Result<PathBuf,String>{Ok(directory.parent().ok_or("辅助服务目录无效。")?.join(RECOVERY))}
+fn receipt_equal(a:&Receipt,b:&Receipt)->bool{serde_json::to_vec(a).ok().is_some_and(|bytes|serde_json::to_vec(b).ok()==Some(bytes))}
+fn previous_equal(a:Option<&Receipt>,b:Option<&Receipt>)->bool{match(a,b){(None,None)=>true,(Some(a),Some(b))=>receipt_equal(a,b),_=>false}}
+fn update_inventory(directory:&Path)->Result<(),String>{
+    if !directory.exists(){return Ok(())}no_reparse(directory)?;check_file_acl(directory)?;
+    for entry in fs::read_dir(directory).map_err(|_|"辅助服务恢复目录不可读取。")?{let entry=entry.map_err(|_|"辅助服务恢复目录不可读取。")?;if !matches!(entry.file_name().to_str(),Some(JOURNAL)|Some(JOURNAL_PENDING)|Some(CANDIDATE)|Some(PREVIOUS)|Some(RETIRED))||!entry.file_type().map_err(|_|"辅助服务恢复文件无效。")?.is_file(){return Err("辅助服务恢复目录存在未知文件，已保留。".into())}no_reparse(&entry.path())?;check_file_acl(&entry.path())?;}Ok(())
+}
+fn update_policy(record:&Receipt)->Result<bool,String>{
+    if record.protocol!=PROTOCOL||record.phase!="installed"||record.readiness!="scm_configuration_verified"||record.version.starts_with('v')||crate::core::version_parts(&record.version).is_none(){return Err("辅助服务旧版本、协议或就绪记录无法确认，未覆盖。".into())}
+    // GUI rebuilds do not require replacing a compatible helper of the same/newer version.
+    Ok(crate::core::newer_version(SERVICE_VERSION,&record.version))
+}
+fn validate_update(journal:&UpdateJournal,directory:&Path,image:&Path)->Result<(),String>{
+    if journal.schema!=1||!matches!(journal.phase.as_str(),"prepared"|"committed")||journal.owner_sid!=journal.old.owner_sid||journal.owner_sid!=journal.new.owner_sid||journal.old.phase!="installed"||journal.new.phase!="installed"||journal.old.readiness!="scm_configuration_verified"||journal.new.readiness!="scm_configuration_verified"||journal.old.protocol!=PROTOCOL||journal.new.protocol!=PROTOCOL||journal.old.sha256==journal.new.sha256||journal.old.created_parent!=journal.new.created_parent||!crate::core::newer_version(&journal.new.version,&journal.old.version){return Err("辅助服务更新记录无效，恢复材料已保留。".into())}
+    for record in [&journal.old,&journal.new]{validate_record(record,directory,image,false)?;if record.version.starts_with('v')||crate::core::version_parts(&record.version).is_none(){return Err("辅助服务更新版本无效。".into())}}
+    if let Some(previous)=&journal.previous{validate_record(previous,directory,image,false)?;if previous.owner_sid!=journal.owner_sid||previous.protocol!=PROTOCOL||previous.phase!="installed"||previous.created_parent!=journal.old.created_parent||!crate::core::newer_version(&journal.old.version,&previous.version){return Err("辅助服务上一版本恢复记录无效。".into())}}Ok(())
+}
+fn read_update_bytes(path:&Path)->Result<Vec<u8>,String>{let file=File::open(path).map_err(|_|"辅助服务更新记录不可读取。")?;let mut bytes=vec![];file.take(32769).read_to_end(&mut bytes).map_err(|_|"辅助服务更新记录不可读取。")?;if bytes.len()>32768{return Err("辅助服务更新记录过大。".into())}Ok(bytes)}
+fn read_update_file(path:&Path)->Result<UpdateJournal,String>{serde_json::from_slice(&read_update_bytes(path)?).map_err(|_|"辅助服务更新记录损坏，已保留。".into())}
+fn update_pending_prefix(journal:&UpdateJournal,bytes:&[u8])->bool{
+    let mut next=journal.clone();if next.phase=="prepared"{next.phase="committed".into();}else{next.previous=None;}
+    if serde_json::to_vec_pretty(&next).is_ok_and(|expected|bytes.len()<expected.len()&&expected.starts_with(bytes)){return true}
+    if journal.phase=="prepared"{if let Some(previous)=&journal.previous{let restored=UpdateJournal{schema:1,owner_sid:journal.owner_sid.clone(),phase:"committed".into(),old:previous.clone(),new:journal.old.clone(),previous:None,was_running:journal.was_running};return serde_json::to_vec_pretty(&restored).is_ok_and(|expected|bytes.len()<expected.len()&&expected.starts_with(bytes))}}false
+}
+fn update_transition(old:&UpdateJournal,next:&UpdateJournal)->bool{
+    if old.owner_sid!=next.owner_sid{return false}
+    if receipt_equal(&old.old,&next.old)&&receipt_equal(&old.new,&next.new)&&old.was_running==next.was_running{return match(old.phase.as_str(),next.phase.as_str()){
+        ("prepared","prepared"|"committed")=>previous_equal(old.previous.as_ref(),next.previous.as_ref()),
+        ("committed","committed")=>previous_equal(old.previous.as_ref(),next.previous.as_ref())||next.previous.is_none(),_=>false}}
+    if old.phase=="committed"&&next.phase=="prepared"{return receipt_equal(&old.new,&next.old)&&next.previous.as_ref().is_some_and(|previous|receipt_equal(previous,&old.old))}
+    old.phase=="prepared"&&next.phase=="committed"&&old.was_running==next.was_running&&receipt_equal(&old.old,&next.new)&&old.previous.as_ref().is_some_and(|previous|receipt_equal(previous,&next.old))&&next.previous.is_none()
+}
+fn read_update(directory:&Path,image:&Path)->Result<Option<UpdateJournal>,String>{
+    check_chain(directory)?;let recovery=recovery_directory(directory)?;update_inventory(&recovery)?;if !recovery.exists(){return Ok(None)}
+    let committed=recovery.join(JOURNAL);let pending=recovery.join(JOURNAL_PENDING);let old=if committed.exists(){let value=read_update_file(&committed)?;validate_update(&value,directory,image)?;Some(value)}else{None};
+    if pending.exists(){let bytes=read_update_bytes(&pending)?;let next=match serde_json::from_slice::<UpdateJournal>(&bytes){Ok(next)=>next,Err(_)=>{if let Some(old)=&old{if update_pending_prefix(old,&bytes){return Ok(Some(old.clone()))}}return Err("辅助服务更新暂存记录损坏，未知内容已保留。".into())}};validate_update(&next,directory,image)?;if let Some(old)=&old{if !update_transition(old,&next){return Err("辅助服务更新前后记录不匹配，已保留。".into())}}else if next.phase!="prepared"||next.previous.is_some()||!receipt_equal(&read_record(&directory.join(RECEIPT))?,&next.old)||sha256(image)?!=next.old.sha256||fs::read_dir(&recovery).map_err(|_|"辅助服务恢复目录不可读取。")?.any(|entry|entry.map_or(true,|entry|entry.file_name()!=JOURNAL_PENDING)){return Err("辅助服务更新缺少已验证的前序状态。".into())}return Ok(Some(next))}
+    if old.is_none()&&fs::read_dir(&recovery).map_err(|_|"辅助服务恢复目录不可读取。")?.next().is_some(){return Err("辅助服务恢复文件缺少归属记录。".into())}Ok(old)
+}
+fn write_update(directory:&Path,journal:&UpdateJournal)->Result<(),String>{
+    update_inventory(directory)?;let pending=directory.join(JOURNAL_PENDING);if pending.exists(){return Err("辅助服务更新记录尚未恢复。".into())}let bytes=serde_json::to_vec_pretty(journal).map_err(|_|"辅助服务更新记录编码失败。")?;if bytes.len()>32768{return Err("辅助服务更新记录过大。".into())}let mut file=OpenOptions::new().create_new(true).write(true).open(&pending).map_err(|_|"辅助服务更新记录不可写入。")?;protect(&pending)?;file.write_all(&bytes).and_then(|_|file.sync_all()).map_err(|_|"辅助服务更新记录未能持久保存。".into())?;drop(file);let from=wide(&pending);let to=wide(directory.join(JOURNAL));unsafe{MoveFileExW(PCWSTR(from.as_ptr()),PCWSTR(to.as_ptr()),MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH).map_err(win)}
+}
+fn update_hash(path:&Path)->Result<Option<String>,String>{if path.exists(){no_reparse(path)?;check_file_acl(path)?;sha256(path).map(Some)}else{Ok(None)}}
+fn move_update_file(from:&Path,to:&Path,hash:&str)->Result<(),String>{if update_hash(from)?.as_deref()!=Some(hash)||to.exists(){return Err("辅助服务更新文件已变化，原文件已保留。".into())}let from=wide(from);let to=wide(to);unsafe{MoveFileExW(PCWSTR(from.as_ptr()),PCWSTR(to.as_ptr()),MOVEFILE_WRITE_THROUGH).map_err(win)}}
+fn remove_update_file(path:&Path,hash:&str)->Result<(),String>{if let Some(actual)=update_hash(path)?{if actual!=hash{return Err("辅助服务恢复文件校验不匹配，已保留。".into())}fs::remove_file(path).map_err(|_|"辅助服务恢复文件仍在使用，已保留。")?}Ok(())}
+fn validate_update_layout(directory:&Path,image:&Path,journal:&UpdateJournal)->Result<(),String>{
+    let recovery=recovery_directory(directory)?;let current=update_hash(image)?;let previous=update_hash(&recovery.join(PREVIOUS))?;let retired=update_hash(&recovery.join(RETIRED))?;
+    let prior=journal.previous.as_ref().map(|record|record.sha256.as_str());
+    if retired.as_deref().is_some_and(|hash|Some(hash)!=prior){return Err("辅助服务历史恢复副本无法确认。".into())}
+    if journal.phase=="committed"{if current.as_deref()!=Some(journal.new.sha256.as_str())||previous.as_deref()!=Some(journal.old.sha256.as_str())||recovery.join(CANDIDATE).exists()||!receipt_equal(&read_record(&directory.join(RECEIPT))?,&journal.new){return Err("辅助服务已提交布局与更新记录不匹配。".into())}return Ok(())}
+    if current.as_deref()==Some(journal.old.sha256.as_str()){
+        if previous.as_deref()!=prior&&!(previous.is_none()&&retired.as_deref()==prior){return Err("辅助服务更新前的恢复副本不匹配。".into())}
+    }else if current.as_deref()==Some(journal.new.sha256.as_str())||current.is_none(){
+        if previous.as_deref()!=Some(journal.old.sha256.as_str())||retired.as_deref()!=prior{return Err("辅助服务上一版本或历史副本缺失。".into())}
+        if let Some(candidate)=update_hash(&recovery.join(CANDIDATE))?{if current.is_some()||candidate!=journal.new.sha256{return Err("辅助服务更新暂存副本不匹配。".into())}}
+    }else{return Err("辅助服务映像不属于本次更新。".into())}
+    let record=read_record(&directory.join(RECEIPT))?;if !receipt_equal(&record,&journal.old)&&!receipt_equal(&record,&journal.new){return Err("辅助服务安装记录不属于本次更新。".into())}Ok(())
+}
+fn service_process(service:&Sc,image:&Path,hash:&str)->Result<Option<OwnedHandle>,String>{unsafe{
+    let state=status(service)?;if state.dwCurrentState==SERVICE_STOPPED{return Ok(None)}if state.dwCurrentState!=SERVICE_RUNNING||state.dwProcessId==0{return Err("辅助服务仍在启停，尚不能核验运行实例，请稍后重试。".into())}let process=OwnedHandle(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION|PROCESS_SYNCHRONIZE,false,state.dwProcessId).map_err(win)?);let identity=identity_on(process.0).map_err(win)?;let confirmed=status(service)?;
+    if process_sid(process.0)?!="S-1-5-18"||process_image(process.0)?!=image.canonicalize().map_err(|_|"辅助服务映像不存在。")?||sha256(image)?!=hash||confirmed.dwCurrentState!=SERVICE_RUNNING||confirmed.dwProcessId!=identity.pid{return Err("辅助服务运行实例身份无法确认。".into())}Ok(Some(process))
+}}
+fn stop_update_service(service:&Sc,image:&Path,hash:&str)->Result<(),String>{let process=service_process(service,image,hash)?;let identity=process.as_ref().map(|process|identity_on(process.0).map_err(win)).transpose()?;stop_service(service)?;if let Some(process)=process{if unsafe{WaitForSingleObject(process.0,5000)}!=WAIT_OBJECT_0||identity_on(process.0).map_err(win)?!=identity.unwrap(){return Err("辅助服务进程尚未退出，未替换程序。".into())}}Ok(())}
+fn check_update_health(service:&Sc,image:&Path,record:&Receipt)->Result<(),String>{unsafe{
+    validate_config(service,image,&record.owner_sid)?;match StartServiceW(service.0,None){Ok(())=>{},Err(error)if code(&error)==1056=>{},Err(error)=>return Err(win(error))}
+    let deadline=Instant::now()+Duration::from_secs(10);let mut ready=None;loop{let state=status(service)?;if state.dwCurrentState==SERVICE_RUNNING{let process=service_process(service,image,&record.sha256)?.ok_or("辅助服务运行标识缺失。")?;let identity=identity_on(process.0).map_err(win)?;if let Some((before,at))=ready{if before==identity&&Instant::now().duration_since(at)>=Duration::from_millis(300){return Ok(())}}else{ready=Some((identity,Instant::now()));}}else{ready=None;}if Instant::now()>=deadline{return Err("新辅助服务未通过真实 SCM 就绪检查。".into())}thread::sleep(Duration::from_millis(50));}
+}}
+fn discard_update_receipt(directory:&Path,journal:&UpdateJournal)->Result<(),String>{let path=directory.join(PENDING);if !path.exists(){return Ok(())}no_reparse(&path)?;check_file_acl(&path)?;let mut bytes=Vec::new();File::open(&path).and_then(|file|file.take(16385).read_to_end(&mut bytes)).map_err(|_|"辅助服务待恢复记录不可读取。")?;if bytes.len()>16384||![&journal.old,&journal.new].iter().any(|record|serde_json::to_vec_pretty(record).is_ok_and(|expected|expected.starts_with(&bytes))){return Err("辅助服务待恢复记录不属于本次更新，已保留。".into())}fs::remove_file(path).map_err(|_|"辅助服务待恢复记录仍在使用。".into())}
+fn finish_update(directory:&Path,image:&Path,journal:&mut UpdateJournal)->Result<(),String>{
+    let recovery=recovery_directory(directory)?;update_inventory(&recovery)?;if update_hash(image)?.as_deref()!=Some(journal.new.sha256.as_str())||!receipt_equal(&read_record(&directory.join(RECEIPT))?,&journal.new)||update_hash(&recovery.join(PREVIOUS))?.as_deref()!=Some(journal.old.sha256.as_str())||recovery.join(CANDIDATE).exists(){return Err("已提交辅助服务与恢复记录不匹配。".into())}
+    if let Some(previous)=&journal.previous{remove_update_file(&recovery.join(RETIRED),&previous.sha256)?;}else if recovery.join(RETIRED).exists(){return Err("辅助服务有未知的历史副本，已保留。".into())}
+    if journal.previous.take().is_some(){write_update(&recovery,journal)?;}Ok(())
+}
+fn rollback_update(directory:&Path,image:&Path,service:&Sc,journal:&UpdateJournal)->Result<(),String>{
+    let recovery=recovery_directory(directory)?;update_inventory(&recovery)?;let previous=recovery.join(PREVIOUS);let retired=recovery.join(RETIRED);let candidate=recovery.join(CANDIDATE);let actual=update_hash(image)?;
+    if actual.as_ref().is_some_and(|hash|hash!=&journal.old.sha256&&hash!=&journal.new.sha256){return Err("辅助服务现有映像无法归属到本次更新。".into())}
+    if let Some(hash)=&actual{stop_update_service(service,image,hash)?;}else if status(service)?.dwCurrentState!=SERVICE_STOPPED{return Err("辅助服务映像缺失且系统实例仍在运行。".into())}
+    if actual.as_deref()!=Some(journal.old.sha256.as_str()){if update_hash(&previous)?.as_deref()!=Some(journal.old.sha256.as_str()){return Err("辅助服务上一版本副本缺失，恢复材料已保留。".into())}if actual.is_some(){move_update_file(image,&candidate,&journal.new.sha256)?;}move_update_file(&previous,image,&journal.old.sha256)?;}
+    discard_update_receipt(directory,journal)?;write_receipt(directory,&journal.old)?;
+    if let Some(old_previous)=&journal.previous{match(update_hash(&previous)?,update_hash(&retired)?){(Some(hash),None)if hash==old_previous.sha256=>{},(None,Some(hash))if hash==old_previous.sha256=>move_update_file(&retired,&previous,&old_previous.sha256)?,_=>return Err("辅助服务较早恢复副本无法确认。".into())}}else if previous.exists()||retired.exists(){return Err("辅助服务恢复目录出现未知历史副本。".into())}
+    // The journal was durable before candidate creation; an incomplete candidate is owned staging only.
+    if candidate.exists(){no_reparse(&candidate)?;check_file_acl(&candidate)?;fs::remove_file(&candidate).map_err(|_|"辅助服务暂存副本仍在使用。")?;}
+    check_update_health(service,image,&journal.old)?;if !journal.was_running{stop_update_service(service,image,&journal.old.sha256)?;}
+    if let Some(previous)=&journal.previous{write_update(&recovery,&UpdateJournal{schema:1,owner_sid:journal.owner_sid.clone(),phase:"committed".into(),old:previous.clone(),new:journal.old.clone(),previous:None,was_running:journal.was_running})?;}else{fs::remove_file(recovery.join(JOURNAL)).map_err(|_|"辅助服务回退记录清理未完成。")?;fs::remove_dir(&recovery).map_err(|_|"辅助服务空恢复目录清理未完成。")?;}Ok(())
+}
+fn recover_update(directory:&Path,image:&Path,owner:&str,service:Option<&Sc>)->Result<(),String>{
+    let Some(mut journal)=read_update(directory,image)?else{return Ok(())};if journal.owner_sid!=owner{return Err("辅助服务更新记录属于其他用户。".into())}let recovery=recovery_directory(directory)?;
+    if journal.phase=="committed"&&service.is_none()&&!directory.exists(){remove_update_recovery(directory,image,&journal.new)?;return Ok(())}
+    validate_update_layout(directory,image,&journal)?;
+    if recovery.join(JOURNAL_PENDING).exists(){let pending=recovery.join(JOURNAL_PENDING);if read_update_file(&pending).is_err(){if !update_pending_prefix(&journal,&read_update_bytes(&pending)?){return Err("辅助服务更新暂存记录无法归属。".into())}fs::remove_file(pending).map_err(|_|"辅助服务更新暂存记录仍在使用。")?;}else{let from=wide(pending);let to=wide(recovery.join(JOURNAL));unsafe{MoveFileExW(PCWSTR(from.as_ptr()),PCWSTR(to.as_ptr()),MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH).map_err(win)?;}}}
+    if journal.phase=="committed"{return finish_update(directory,image,&mut journal)}if crate::core::newer_version(&journal.new.version,SERVICE_VERSION){return Err("请使用较新的助手继续辅助服务更新恢复。".into())}
+    let service=service.ok_or("辅助服务更新恢复缺少已验证的 SCM 注册，已保留。")?;validate_config(service,image,owner)?;rollback_update(directory,image,service,&journal)
+}
+fn check_update_removal(directory:&Path,image:&Path,record:&Receipt)->Result<(),String>{
+    let Some(journal)=read_update(directory,image)?else{return Ok(())};let recovery=recovery_directory(directory)?;
+    if journal.phase!="committed"||journal.owner_sid!=record.owner_sid||journal.new.sha256!=record.sha256||journal.new.version!=record.version||recovery.join(CANDIDATE).exists()||recovery.join(JOURNAL_PENDING).exists(){return Err("辅助服务更新恢复尚未完成，已保留。".into())}
+    if let Some(hash)=update_hash(&recovery.join(PREVIOUS))?{if hash!=journal.old.sha256{return Err("辅助服务上一版本校验不匹配。".into())}}else if record.phase!="removing"{return Err("辅助服务上一版本恢复副本缺失。".into())}
+    if let Some(hash)=update_hash(&recovery.join(RETIRED))?{if journal.previous.as_ref().is_none_or(|previous|previous.sha256!=hash){return Err("辅助服务存在未知历史恢复副本。".into())}}Ok(())
+}
+fn remove_update_recovery(directory:&Path,image:&Path,record:&Receipt)->Result<(),String>{
+    check_update_removal(directory,image,record)?;
+    let recovery=recovery_directory(directory)?;let Some(journal)=read_update(directory,image)?else{if recovery.exists(){fs::remove_dir(recovery).map_err(|_|"辅助服务空恢复目录仍在使用。")?;}return Ok(())};
+    if journal.phase!="committed"||journal.owner_sid!=record.owner_sid||journal.new.sha256!=record.sha256||journal.new.version!=record.version||recovery.join(CANDIDATE).exists()||recovery.join(JOURNAL_PENDING).exists(){return Err("辅助服务恢复资料尚未归档，已保留。".into())}
+    if let Some(previous)=&journal.previous{remove_update_file(&recovery.join(RETIRED),&previous.sha256)?;}else if recovery.join(RETIRED).exists(){return Err("辅助服务恢复目录存在未知历史副本。".into())}remove_update_file(&recovery.join(PREVIOUS),&journal.old.sha256)?;fs::remove_file(recovery.join(JOURNAL)).map_err(|_|"辅助服务恢复记录清理失败。")?;fs::remove_dir(recovery).map_err(|_|"辅助服务恢复目录仍在使用。".into())?;Ok(())
+}
+fn upgrade_inner(directory:&Path,image:&Path,service:&Sc,old:Receipt,source:&Path)->Result<(),String>{
+    let recovery=recovery_directory(directory)?;let prior=read_update(directory,image)?;if let Some(prior)=&prior{if prior.phase!="committed"||!receipt_equal(&prior.new,&old){return Err("辅助服务已有未结束更新，已保留。".into())}}
+    secure_directory(&recovery)?;let mut next=old.clone();next.version=SERVICE_VERSION.into();next.protocol=PROTOCOL;next.sha256=self_hash()?;next.phase="installed".into();next.readiness="scm_configuration_verified".into();
+    let mut journal=UpdateJournal{schema:1,owner_sid:old.owner_sid.clone(),phase:"prepared".into(),old,new:next,previous:prior.map(|value|value.old),was_running:status(service)?.dwCurrentState!=SERVICE_STOPPED};validate_update(&journal,directory,image)?;write_update(&recovery,&journal)?;
+    let result=(||->Result<(),String>{
+        let candidate=recovery.join(CANDIDATE);if candidate.exists(){return Err("辅助服务暂存文件已经存在，已保留。".into())}let mut input=File::open(source).map_err(|_|"辅助服务源文件不可读取。")?;let mut output=OpenOptions::new().create_new(true).write(true).open(&candidate).map_err(|_|"辅助服务暂存文件不可创建。")?;protect(&candidate)?;std::io::copy(&mut input,&mut output).and_then(|_|output.sync_all()).map_err(|_|"辅助服务新副本未能持久保存。")?;drop(output);if update_hash(&candidate)?.as_deref()!=Some(journal.new.sha256.as_str()){return Err("辅助服务新副本校验不匹配。".into())}
+        stop_update_service(service,image,&journal.old.sha256)?;if let Some(previous)=&journal.previous{move_update_file(&recovery.join(PREVIOUS),&recovery.join(RETIRED),&previous.sha256)?;}move_update_file(image,&recovery.join(PREVIOUS),&journal.old.sha256)?;move_update_file(&candidate,image,&journal.new.sha256)?;
+        write_receipt(directory,&journal.new)?;check_update_health(service,image,&journal.new)?;if !journal.was_running{stop_update_service(service,image,&journal.new.sha256)?;}journal.phase="committed".into();write_update(&recovery,&journal)?;finish_update(directory,image,&mut journal)
+    })();if let Err(error)=result{if journal.phase=="committed"{return Err(format!("新辅助服务已就绪，但恢复副本收尾未完成：{error}"))}return match recover_update(directory,image,&journal.owner_sid,Some(service)){Ok(())=>Err(format!("辅助服务更新未完成，已恢复原版本：{error}")),Err(recovery)=>Err(format!("辅助服务更新未完成；恢复材料已保留：{error} {recovery}"))}}Ok(())
+}
 fn install_file(source:&Path,target:&Path,pending:&Path,expected:&str)->Result<(),String>{
     if target.exists(){return if sha256(target)?==expected{Ok(())}else{Err("受保护辅助程序校验不匹配。".into())}}
     // A prepared receipt declares these fixed pending names before the first byte is copied.
@@ -187,11 +310,12 @@ fn install_file(source:&Path,target:&Path,pending:&Path,expected:&str)->Result<(
 }
 fn install_inner(owner:String)->Result<(),String>{
     let source_image=own_image()?;let source_loader=source_image.parent().ok_or("当前程序目录无效。")?.join(LOADER);if sha256(&source_loader)?!=LOADER_HASH{return Err("WebView2Loader.dll 校验失败，已拒绝安装。".into())}
-    let(directory,image)=paths()?;check_chain(&directory)?;let manager=manager(SC_MANAGER_CONNECT|SC_MANAGER_CREATE_SERVICE)?;let existing=service(&manager,SERVICE_QUERY_CONFIG|SERVICE_QUERY_STATUS|SERVICE_STOP|WRITE_DAC.0|WRITE_OWNER.0|READ_CONTROL.0)?;
+    let(directory,image)=paths()?;check_chain(&directory)?;let manager=manager(SC_MANAGER_CONNECT|SC_MANAGER_CREATE_SERVICE)?;let existing=service(&manager,SERVICE_QUERY_CONFIG|SERVICE_QUERY_STATUS|SERVICE_START|SERVICE_STOP|WRITE_DAC.0|WRITE_OWNER.0|READ_CONTROL.0)?;
+    recover_update(&directory,&image,&owner,existing.as_ref())?;
     recover_pending(&directory,&image,&owner,existing.as_ref())?;
     let prior=if directory.join(RECEIPT).exists(){Some(load_receipt(&directory,&image,true)?)}else{None};
-    if let Some(existing)=&existing{let record=prior.as_ref().ok_or("同名服务缺少本程序安装记录，已拒绝覆盖。")?;validate_config_inner(existing,&image,&record.owner_sid,record.phase!="prepared")?;if record.phase=="installed"&&record.owner_sid==owner&&compatible(record).is_ok(){return Ok(())}}
-    if let Some(record)=&prior{if record.owner_sid!=owner{return Err("辅助服务属于其他用户，已拒绝覆盖。".into())}if record.phase=="removing"{return Err("辅助服务卸载尚未完成，请继续卸载。".into())}if record.sha256!=self_hash()?{return Err("辅助服务版本不同，请先卸载再安装。".into())}}
+    if let Some(existing)=&existing{let record=prior.as_ref().ok_or("同名服务缺少本程序安装记录，已拒绝覆盖。")?;validate_config_inner(existing,&image,&record.owner_sid,record.phase!="prepared")?;if record.owner_sid!=owner{return Err("辅助服务属于其他用户，已拒绝覆盖。".into())}if record.phase=="installed"{if update_policy(record)?{return upgrade_inner(&directory,&image,existing,record.clone(),&source_image)}compatible(record)?;return Ok(())}}
+    if let Some(record)=&prior{if record.owner_sid!=owner{return Err("辅助服务属于其他用户，已拒绝覆盖。".into())}if record.phase=="removing"{return Err("辅助服务卸载尚未完成，请继续卸载。".into())}if record.sha256!=self_hash()?{return Err("辅助服务存在其他版本的未完成安装，原文件已保留。".into())}}
     else if directory.exists(){inventory(&directory)?;if fs::read_dir(&directory).map_err(|_|"辅助服务目录不可读取。")?.next().is_some(){return Err("辅助服务目录缺少归属记录，已保留。".into())}}
     let created_parent=prior.as_ref().map_or(!directory.parent().ok_or("辅助服务目录无效。")?.exists(),|record|record.created_parent);
     secure_directory(directory.parent().ok_or("辅助服务目录无效。")?)?;secure_directory(&directory)?;
@@ -202,13 +326,14 @@ fn install_inner(owner:String)->Result<(),String>{
     record.phase="installed".into();record.readiness="scm_configuration_verified".into();write_receipt(&directory,&record)?;Ok(())
 }
 fn uninstall_inner(owner:String)->Result<(),String>{
-    let(directory,image)=paths()?;let manager=manager(SC_MANAGER_CONNECT)?;let service=service(&manager,SERVICE_QUERY_CONFIG|SERVICE_QUERY_STATUS|SERVICE_STOP|DELETE.0|READ_CONTROL.0)?;
-    if service.is_none()&&!directory.exists(){return Ok(())}recover_pending(&directory,&image,&owner,service.as_ref())?;let mut record=load_receipt(&directory,&image,true)?;if record.owner_sid!=owner{return Err("辅助服务属于其他用户，已拒绝删除。".into())}
-    if directory.join(PENDING).exists(){return Err("辅助服务有待恢复记录，已保留安装。".into())}if let Some(service)=service{validate_config_inner(&service,&image,&owner,record.phase!="prepared")?;stop_service(&service)?;record.phase="removing".into();record.readiness="service_stopped_for_removal".into();write_receipt(&directory,&record)?;unsafe{DeleteService(service.0).map_err(win)?;}drop(service);
+    let(directory,image)=paths()?;let manager=manager(SC_MANAGER_CONNECT)?;let service=service(&manager,SERVICE_QUERY_CONFIG|SERVICE_QUERY_STATUS|SERVICE_START|SERVICE_STOP|DELETE.0|READ_CONTROL.0)?;
+    if let Some(journal)=read_update(&directory,&image)?{if journal.owner_sid!=owner{return Err("辅助服务恢复记录属于其他用户。".into())}if journal.phase=="prepared"{recover_update(&directory,&image,&owner,service.as_ref())?;}else if service.is_none()&&!directory.exists(){remove_update_recovery(&directory,&image,&journal.new)?;return Ok(())}}
+    if service.is_none()&&!directory.exists(){return Ok(())}recover_pending(&directory,&image,&owner,service.as_ref())?;let mut record=load_receipt(&directory,&image,true)?;if record.owner_sid!=owner{return Err("辅助服务属于其他用户，已拒绝删除。".into())}check_update_removal(&directory,&image,&record)?;
+    if directory.join(PENDING).exists(){return Err("辅助服务有待恢复记录，已保留安装。".into())}if let Some(service)=service{validate_config_inner(&service,&image,&owner,record.phase!="prepared")?;stop_update_service(&service,&image,&record.sha256)?;record.phase="removing".into();record.readiness="service_stopped_for_removal".into();write_receipt(&directory,&record)?;unsafe{DeleteService(service.0).map_err(win)?;}drop(service);
         let deadline=Instant::now()+Duration::from_secs(5);loop{match self::service(&manager,SERVICE_QUERY_STATUS){Ok(None)=>break,Err(_)=>return Err("辅助服务删除尚未确认，文件已保留。".into()),Ok(Some(_))=>{if Instant::now()>=deadline{return Err("辅助服务仍在删除，文件已保留。".into())}thread::sleep(Duration::from_millis(50));}}}}
     // Exact owned allowlist only. Never recursively remove Program Files or the parent product directory.
     if record.phase!="removing"{record.phase="removing".into();record.readiness="service_absent_for_removal".into();write_receipt(&directory,&record)?;}
-    inventory(&directory)?;for path in [&image,&directory.join(LOADER),&directory.join(IMAGE_PENDING),&directory.join(LOADER_PENDING)]{if path.exists(){fs::remove_file(path).map_err(|_|"辅助服务文件仍被使用，已保留卸载恢复记录。")?;}}fs::remove_file(directory.join(RECEIPT)).map_err(|_|"辅助服务安装记录清理未完成。")?;
+    inventory(&directory)?;for path in [&image,&directory.join(LOADER),&directory.join(IMAGE_PENDING),&directory.join(LOADER_PENDING)]{if path.exists(){fs::remove_file(path).map_err(|_|"辅助服务文件仍被使用，已保留卸载恢复记录。")?;}}remove_update_recovery(&directory,&image,&record)?;fs::remove_file(directory.join(RECEIPT)).map_err(|_|"辅助服务安装记录清理未完成。")?;
     if fs::remove_dir(&directory).is_err(){
         // Keep an attributable retry path when an otherwise empty directory is still locked.
         // Never overwrite a new file or restore into a replaced/unprotected directory.
@@ -248,8 +373,9 @@ impl BrokerPipe{
 }
 fn valid_token(token:&str)->bool{token.len()==32&&token.bytes().all(|v|v.is_ascii_hexdigit())}
 fn compatible(record:&Receipt)->Result<(),String>{
-    if record.protocol!=PROTOCOL||crate::core::version_parts(&record.version).is_none()||crate::core::newer_version(MIN_SERVICE_VERSION,&record.version){return Err("辅助服务协议或最低版本不满足要求，请卸载后重新安装一次；后续兼容的助手更新无需重装服务。".into())}Ok(())
+    if record.protocol!=PROTOCOL{return Err("辅助服务协议不匹配，请使用匹配的新版本助手更新辅助服务；未降级或覆盖现有程序。".into())}if crate::core::version_parts(&record.version).is_none(){return Err("辅助服务版本记录无效，原文件已保留。".into())}if crate::core::newer_version(MIN_SERVICE_VERSION,&record.version){return Err("辅助服务版本较旧，请直接更新辅助服务；不需要手动卸载，原统计偏好会保留。".into())}Ok(())
 }
+fn update_in_progress(directory:&Path,image:&Path,owner:&str)->Result<bool,String>{let Some(journal)=read_update(directory,image)?else{return Ok(false)};if journal.owner_sid!=owner{return Err("辅助服务更新归属不匹配。".into())}Ok(journal.phase!="committed"||recovery_directory(directory)?.join(JOURNAL_PENDING).exists())}
 // The trust boundary is the installed owner SID, not a particular GUI build.
 // Requests can only start our protected collector; application scope and SID/lifetime are independently checked there.
 fn trusted_gui(parent:HANDLE,record:&Receipt)->Result<(),String>{if process_sid(parent)?!=record.owner_sid{return Err("辅助服务客户端用户身份不匹配。".into())}Ok(())}
@@ -355,6 +481,7 @@ fn broker(handle:SERVICE_STATUS_HANDLE)->Result<(),String>{
     Ok(())
 }
 fn serve_request(pipe:&BrokerPipe,record:&Receipt,children:&mut Vec<Child>)->Result<(),String>{unsafe{
+    let(directory,image)=paths()?;if update_in_progress(&directory,&image,&record.owner_sid)?{return Err("辅助服务正在更新，未启动新的采集器。".into())}
     let mut client=0;GetNamedPipeClientProcessId(pipe.0.0,&mut client).map_err(win)?;let peer=OwnedHandle(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION|PROCESS_SYNCHRONIZE|PROCESS_DUP_HANDLE,false,client).map_err(win)?);trusted_gui(peer.0,record)?;let identity=identity_on(peer.0).map_err(win)?;
     let deadline=Instant::now()+Duration::from_secs(3);let request:Request=loop{if STOP.load(Ordering::Acquire)||WaitForSingleObject(peer.0,0)!=WAIT_TIMEOUT{return Err("辅助服务请求已取消。".into())}if let Some(request)=pipe.read()?{break request}if Instant::now()>=deadline{return Err("辅助服务请求超时。".into())}thread::sleep(Duration::from_millis(10));};
     if request.protocol!=PROTOCOL||request.parent!=identity||!valid_token(&request.token){return Err("辅助服务请求身份不匹配。".into())}if children.len()>=4{return Err("辅助服务采集器数量已达上限。".into())}
@@ -367,6 +494,7 @@ fn serve_request(pipe:&BrokerPipe,record:&Receipt,children:&mut Vec<Child>)->Res
 }}
 pub(crate) fn start_collector(token:&str,parent:ProcessIdentity)->Result<OwnedHandle,String>{unsafe{
     if !valid_token(token)||identity_on(GetCurrentProcess()).map_err(win)?!=parent{return Err("采集请求身份无效。".into())}let(directory,image)=paths()?;let record=load_receipt(&directory,&image,true)?;compatible(&record)?;if record.phase!="installed"||record.owner_sid!=current_sid()?{return Err("辅助服务未安装或用户身份不同。".into())}
+    if update_in_progress(&directory,&image,&record.owner_sid)?{return Err("辅助服务更新尚未完成，请重试更新；统计偏好已保留。".into())}
     let manager=manager(SC_MANAGER_CONNECT)?;let service=service(&manager,SERVICE_QUERY_CONFIG|SERVICE_QUERY_STATUS|SERVICE_START|READ_CONTROL.0)?.ok_or("辅助服务未安装。")?;validate_config(&service,&image,&record.owner_sid)?;
     match StartServiceW(service.0,None){Ok(())=>{},Err(error)if code(&error)==1056=>{},Err(error)=>return Err(win(error))}
     let deadline=Instant::now()+Duration::from_secs(8);let pipe=loop{let state=status(&service)?.dwCurrentState;if state==SERVICE_RUNNING{if let Ok(pipe)=BrokerPipe::client(){break pipe}}else if state==SERVICE_STOPPED{match StartServiceW(service.0,None){Ok(())=>{},Err(error)if code(&error)==1056=>{},Err(error)=>return Err(win(error))}}if Instant::now()>=deadline{return Err("辅助服务启动尚未完成。".into())}thread::sleep(Duration::from_millis(25));};
@@ -526,6 +654,17 @@ pub(crate) fn start_collector(token:&str,parent:ProcessIdentity)->Result<OwnedHa
         record.version="0.9.0".into();assert!(compatible(&record).is_err());record.version="bad".into();assert!(compatible(&record).is_err());record.version=SERVICE_VERSION.into();record.protocol=0;assert!(compatible(&record).is_err());record.protocol=PROTOCOL+1;assert!(compatible(&record).is_err());
         // Legacy receipts stay readable for a safe explicit uninstall, but cannot claim compatibility.
         let mut legacy=serde_json::to_value(&record).unwrap();legacy.as_object_mut().unwrap().remove("protocol");let legacy:Receipt=serde_json::from_value(legacy).unwrap();assert_eq!(legacy.protocol,0);assert!(compatible(&legacy).is_err());
+    }
+    #[test]fn explicit_helper_updates_are_versioned_and_journal_transitions_reject_unrelated_backups(){
+        let directory=std::env::temp_dir().join(format!("codex-update-policy-{}-{}",std::process::id(),crate::settings::now())).join("TrafficService");let image=directory.join(IMAGE);
+        let old=Receipt{schema:1,product:PRODUCT.into(),owner_sid:"S-1-5-21-1".into(),version:"1.0.0".into(),protocol:PROTOCOL,sha256:"a".repeat(64),loader_sha256:LOADER_HASH.into(),image:image.to_string_lossy().into(),service_command:command(&image).unwrap(),phase:"installed".into(),readiness:"scm_configuration_verified".into(),previous:None,created_parent:true};
+        assert!(update_policy(&old).unwrap());let mut current=old.clone();current.version=SERVICE_VERSION.into();current.sha256="b".repeat(64);assert!(!update_policy(&current).unwrap());current.sha256="d".repeat(64);assert!(!update_policy(&current).unwrap(),"GUI hash changes do not force helper replacement");current.sha256="b".repeat(64);
+        let mut future=current.clone();future.version="1.9.0".into();assert!(!update_policy(&future).unwrap());future.protocol=PROTOCOL+1;assert!(update_policy(&future).is_err());future.protocol=PROTOCOL;future.version="bad".into();assert!(update_policy(&future).is_err());
+        let prepared=UpdateJournal{schema:1,owner_sid:old.owner_sid.clone(),phase:"prepared".into(),old:old.clone(),new:current.clone(),previous:None,was_running:true};assert!(validate_update(&prepared,&directory,&image).is_ok());let mut committed=prepared.clone();committed.phase="committed".into();assert!(update_transition(&prepared,&committed));
+        let bytes=serde_json::to_vec_pretty(&committed).unwrap();assert!(update_pending_prefix(&prepared,&bytes[..bytes.len()/2]));assert!(!update_pending_prefix(&prepared,b"unowned content"));assert!(!update_pending_prefix(&prepared,&bytes));
+        let mut unrelated=committed.clone();unrelated.new.owner_sid="S-1-5-21-2".into();assert!(validate_update(&unrelated,&directory,&image).is_err());unrelated=committed.clone();unrelated.new.version="0.9.0".into();assert!(validate_update(&unrelated,&directory,&image).is_err());
+        let mut previous=old.clone();previous.version="0.9.0".into();previous.sha256="c".repeat(64);unrelated=committed.clone();unrelated.previous=Some(previous.clone());assert!(!update_transition(&prepared,&unrelated));let mut with_previous=prepared.clone();with_previous.previous=Some(previous);assert!(validate_update(&with_previous,&directory,&image).is_ok());let mut changed=with_previous.clone();changed.previous.as_mut().unwrap().sha256="e".repeat(64);assert!(!update_transition(&with_previous,&changed));
+        let mut value=serde_json::to_value(&prepared).unwrap();value.as_object_mut().unwrap().insert("path".into(),serde_json::Value::String("arbitrary".into()));assert!(serde_json::from_value::<UpdateJournal>(value).is_err());
     }
     #[test]fn broker_protocol_rejects_commands_and_unbounded_tokens(){
         assert!(valid_token("0123456789abcdef0123456789abcdef"));assert!(!valid_token("../codex.exe"));assert!(!valid_token(&"a".repeat(33)));
