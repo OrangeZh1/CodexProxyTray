@@ -68,7 +68,14 @@ function RunUninstaller {
     Require ((Hash $copy) -ceq (Hash $source)) 'owned_uninstaller_copy_verified'
     RunInstaller $copy @('/S',('_?='+$installRoot))
 }
-function RegisteredUpgradeFixture([switch]$UnknownDesktopOff) {
+function RunNonSilentBackend([string]$Fixture){
+    $folder=Join-Path $Fixture 'non-silent-backend';Require (-not(Test-Path -LiteralPath $folder)) 'non_silent_backend_fixture_is_fresh';[void][IO.Directory]::CreateDirectory($folder);$repo=[IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
+    foreach($name in @('install_application.ps1','install_update.ps1')){$source=Join-Path $repo ('src-tauri/src/'+$name);$text=[IO.File]::ReadAllText($source,[Text.UTF8Encoding]::new($false,$true));$copy=Join-Path $folder $name;[IO.File]::WriteAllText($copy,$text,[Text.UTF8Encoding]::new($true));Require ([IO.File]::ReadAllText($copy,[Text.UTF8Encoding]::new($false,$true)) -ceq $text) 'non_silent_backend_winps_source_text_is_exact'}
+    $zip=Join-Path $release ("CodexProxyTray-v$($manifest.version)-windows-x64.zip");$result=Join-Path $folder 'result.json';$info=[Diagnostics.ProcessStartInfo]::new((Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'));$info.UseShellExecute=$false;$info.CreateNoWindow=$true;$info.WindowStyle='Hidden';$info.WorkingDirectory=$folder
+    foreach($argument in @('-NoLogo','-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',(Join-Path $folder 'install_application.ps1'),'-Action','Install','-InstallRoot',$installRoot,'-PayloadZip',$zip,'-ZipSha256',(Hash $zip),'-Version',$manifest.version,'-SourceCommit',$env:GITHUB_SHA,'-UninstallerPath',(Join-Path $installRoot 'uninstall.exe'),'-UpdateEnginePath',(Join-Path $folder 'install_update.ps1'),'-ResultPath',$result,'-DesktopShortcut','1')){$info.ArgumentList.Add($argument)}
+    $started=[DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds();$backend=[Diagnostics.Process]::Start($info);try{Require ($backend.WaitForExit(120000)) 'non_silent_backend_real_upgrade_finishes';CaptureOutcome $backend.ExitCode $started;$outcome=Get-Content -LiteralPath $result -Raw|ConvertFrom-Json;Require ($outcome.action -ceq 'Install' -and $outcome.version -ceq $manifest.version -and $outcome.root -ieq $installRoot -and $outcome.completed_at -ge $started -and $outcome.phase -ceq 'installed') 'non_silent_backend_result_matches_requested_owned_upgrade';return $backend.ExitCode}finally{$backend.Dispose()}
+}
+function RegisteredUpgradeFixture([switch]$UnknownDesktopOff,[switch]$NonSilentBackend) {
     # v0.2.2 shipped as a portable ZIP. This is a synthetic registered layout
     # using its real, immutable code, not a claim that v0.2.2 had a Setup EXE.
     $oldVersion='0.2.2';$oldSource='568789e7e3e9d1096725e682e5da4f5a210b0530'
@@ -99,7 +106,7 @@ function RegisteredUpgradeFixture([switch]$UnknownDesktopOff) {
     foreach($file in Get-ChildItem -LiteralPath $old -File){[IO.File]::Copy($file.FullName,(Join-Path $current $file.Name),$false)}
     $oldActive.current.version=$oldVersion;$oldActive.current.source_commit=$oldSource
     $oldActive.current.files=@(Get-ChildItem -LiteralPath $current -File|ForEach-Object {@{name=$_.Name;sha256=Hash $_.FullName}})
-    $helper=RunApp (Join-Path $current 'CodexProxyTray.exe') @('--background')
+    $helper=RunApp (Join-Path $current 'CodexProxyTray.exe') @('--background');$oldFixturePid=$helper.Id
     try {
         $deadline=[DateTime]::UtcNow.AddSeconds(45)
         do {
@@ -112,13 +119,14 @@ function RegisteredUpgradeFixture([switch]$UnknownDesktopOff) {
         Set-ItemProperty -LiteralPath $reg -Name DisplayVersion -Value $oldVersion
         if($UnknownDesktopOff){[IO.File]::WriteAllText($desktopShortcut,'Synthetic unknown desktop retained while turning preference off.');$unknownDesktopHash=Hash $desktopShortcut}
         $setupArguments=if($UnknownDesktopOff){@('/S','/DESKTOP=0')}else{@('/S')}
-        Require ((RunInstaller $setup $setupArguments) -eq 0 -and $helper.WaitForExit(10000)) 'registered_layout_upgrade_uses_real_handoff_and_restart'
+        $upgradeExit=if($NonSilentBackend){RunNonSilentBackend $fixture}else{RunInstaller $setup $setupArguments};Require ($upgradeExit -eq 0 -and $helper.WaitForExit(10000)) 'registered_layout_upgrade_uses_real_handoff_and_restart'
         if($UnknownDesktopOff){Require ((Hash $desktopShortcut) -ceq $unknownDesktopHash) 'upgrade_off_applies_new_choice_before_registration_and_retains_unknown_desktop';[IO.File]::Delete($desktopShortcut);AssertDesktop $false;Require ((RunInstaller $setup @('/S','/DESKTOP=1')) -eq 0) 'restore_owned_desktop_after_upgrade_off_fixture';AssertDesktop $true}
     }finally{$helper.Dispose()}
     $active=Get-Content -LiteralPath (Join-Path $installRoot 'active-version.json') -Raw|ConvertFrom-Json
     Require ($active.current.version -ceq $manifest.version -and $active.current.source_commit -ceq $env:GITHUB_SHA -and $active.previous.source_commit -ceq $oldSource -and (Get-Item -LiteralPath (Join-Path $installRoot 'previous\CodexProxyTray.exe')).VersionInfo.ProductVersion -ceq $oldVersion) 'registered_upgrade_commits_new_version_and_one_real_previous'
     Require ((Hash (Join-Path $installRoot 'uninstall.exe')) -ceq $uninstallerHash) 'registered_upgrade_preserves_existing_uninstaller_and_marker_contract'
     AssertRegistration
+    if($NonSilentBackend){Require ($active.readiness.helper_pid -ne $oldFixturePid) 'non_silent_backend_commits_a_new_helper_identity';OpenOwnedStartMenu -RequireHidden -DirectActivation}
 }
 function RootSnapshot {
     $result=[ordered]@{};foreach($file in Get-ChildItem -LiteralPath (Join-Path $installRoot 'current') -File|Sort-Object Name){$result[$file.Name]=Hash $file.FullName};$result|ConvertTo-Json -Compress
@@ -296,7 +304,7 @@ function AssertDesktop([bool]$Wanted){
     $diagnostic=RecordShortcut 'desktop' $desktopShortcut
     if($Wanted){Require ($diagnostic.link_exists -and $diagnostic.native_valid) 'desktop_shortcut_is_normal_current_helper'}else{Require (-not(Test-Path -LiteralPath $desktopShortcut)) 'desktop_choice_off_removes_only_owned_entry'}
 }
-function OpenOwnedStartMenu {
+function OpenOwnedStartMenu([switch]$RequireHidden,[switch]$DirectActivation) {
     $diagnostic=RecordShortcut 'custom_start_menu_before_shell_open' $shortcut
     Require ($diagnostic.link_exists -and $diagnostic.native_valid) 'unicode_start_menu_validated_before_shell_execute'
     $linkHash=Hash $shortcut;$active=Get-Content -LiteralPath (Join-Path $installRoot 'active-version.json') -Raw|ConvertFrom-Json;$expected=Join-Path $installRoot 'current\CodexProxyTray.exe'
@@ -305,17 +313,18 @@ function OpenOwnedStartMenu {
     try{
         [void]$helper.SafeHandle;$created=$helper.StartTime.ToUniversalTime().ToFileTimeUtc();$started=([DateTimeOffset]$helper.StartTime.ToUniversalTime()).ToUnixTimeMilliseconds();$image=@($active.current.files|Where-Object name -CEQ 'CodexProxyTray.exe')
         Require (-not $helper.HasExited -and $helper.Path -ieq $expected -and $image.Count -eq 1 -and (Hash $expected) -ceq $image[0].sha256) 'shortcut_shell_open_binds_exact_live_image'
-        $ready=Get-Content -LiteralPath (Join-Path $data 'ui-ready-main.json') -Raw|ConvertFrom-Json
-        Require ($ready.window -ceq 'main' -and $ready.helper_pid -eq $helper.Id -and $ready.rendered -and $ready.at -ge $started) 'shortcut_shell_open_has_fresh_main_readiness'
+        foreach($view in @('main','tray')){$ready=Get-Content -LiteralPath (Join-Path $data ('ui-ready-'+$view+'.json')) -Raw|ConvertFrom-Json;Require ($ready.window -ceq $view -and $ready.helper_pid -eq $helper.Id -and $ready.rendered -and $ready.at -ge $started) ('shortcut_shell_open_has_fresh_'+$view+'_readiness')}
         Require ((Hash $shortcut) -ceq $linkHash) 'shortcut_shell_open_link_unchanged_after_validation'
-        $before=@([CodexProxyTray.InstallerShortcutNative]::MainWindows([uint32]$helper.Id));$info=[Diagnostics.ProcessStartInfo]::new($shortcut);$info.UseShellExecute=$true;$info.Verb='open';$info.WindowStyle='Normal';$activation=[Diagnostics.Process]::Start($info)
+        $before=@([CodexProxyTray.InstallerShortcutNative]::MainWindows([uint32]$helper.Id));$hiddenSamples=0;if($RequireHidden){$hiddenUntil=[DateTime]::UtcNow.AddMilliseconds(1500);do{$helper.Refresh();if($helper.HasExited -or $helper.StartTime.ToUniversalTime().ToFileTimeUtc() -ne $created -or $helper.Path -ine $expected){throw 'non_silent_setup_hidden_helper_identity_changed'};$hidden=@([CodexProxyTray.InstallerShortcutNative]::MainWindows([uint32]$helper.Id));if($hidden.Count -ne 1 -or @($hidden|Where-Object Visible).Count){throw 'non_silent_setup_main_visible_before_explicit_activation'};$hiddenSamples++;Start-Sleep -Milliseconds 100}while([DateTime]::UtcNow -lt $hiddenUntil);Require ($hiddenSamples -ge 2) 'non_silent_setup_backend_renders_new_main_hidden_before_explicit_activation'}
+        if($DirectActivation){$activation=RunApp $expected @()}else{$info=[Diagnostics.ProcessStartInfo]::new($shortcut);$info.UseShellExecute=$true;$info.Verb='open';$info.WindowStyle='Normal';$activation=[Diagnostics.Process]::Start($info)}
         $deadline=[DateTime]::UtcNow.AddSeconds(15);$visible=@()
         do{
             $helper.Refresh();if($helper.HasExited -or $helper.StartTime.ToUniversalTime().ToFileTimeUtc() -ne $created -or $helper.Path -ine $expected){throw 'shortcut_shell_open_helper_identity_changed'}
             $visible=@([CodexProxyTray.InstallerShortcutNative]::MainWindows([uint32]$helper.Id)|Where-Object {$_.Visible -and -not $_.Minimized -and $_.Width -gt 0 -and $_.Height -gt 0});if($visible.Count -eq 1){break};Start-Sleep -Milliseconds 100
         }while([DateTime]::UtcNow -lt $deadline)
-        Require ($visible.Count -eq 1 -and $visible[0].ProcessId -eq $active.readiness.helper_pid) 'unicode_owned_start_menu_shell_execute_shows_same_main_helper'
-        $report['custom_shortcut_shell_open']=[ordered]@{helper_pid=$helper.Id;created_filetime=[string]$created;image_sha256=$image[0].sha256;link_sha256=$linkHash;visible_before=@($before|Where-Object Visible).Count -gt 0;visible=$true;minimized=$false;width=$visible[0].Width;height=$visible[0].Height;activation='ShellExecute owned StartMenu LNK';foreground_not_required=$true}
+        Require ($visible.Count -eq 1 -and $visible[0].ProcessId -eq $active.readiness.helper_pid) $(if($DirectActivation){'non_silent_setup_same_helper_shows_only_after_explicit_activation'}else{'unicode_owned_start_menu_shell_execute_shows_same_main_helper'})
+        if($DirectActivation){Require ($activation.Id -ne $helper.Id -and $activation.WaitForExit(10000) -and $activation.ExitCode -eq 0) 'non_silent_setup_explicit_activation_reuses_the_existing_helper'}
+        $record=[ordered]@{helper_pid=$helper.Id;created_filetime=[string]$created;image_sha256=$image[0].sha256;link_sha256=$linkHash;visible_before=@($before|Where-Object Visible).Count -gt 0;hidden_samples=$hiddenSamples;visible=$true;minimized=$false;width=$visible[0].Width;height=$visible[0].Height;activation=$(if($DirectActivation){'Explicit current EXE with no arguments after non-Silent production backend'}else{'ShellExecute owned StartMenu LNK'});foreground_not_required=$true};$report[$(if($DirectActivation){'non_silent_setup_activation'}else{'custom_shortcut_shell_open'})]=$record
     }finally{if($activation){$activation.Dispose()};$helper.Dispose()}
 }
 
@@ -461,7 +470,7 @@ try {
     Require (-not(Test-Path -LiteralPath $installRoot) -and $installRoot.Contains('自选安装 目录')) 'fresh_custom_directory_is_chinese_space_path_on_local_drive'
     Require ((RunInstaller $setup @('/S','/DESKTOP=1',('/D='+$installRoot))) -eq 0) 'custom_directory_real_install_succeeds'
     AssertRegistration;AssertDesktop $true;OpenOwnedStartMenu;RefuseOtherRoot
-    RegisteredUpgradeFixture
+    RegisteredUpgradeFixture -NonSilentBackend
     AssertDesktop $true
     Require ((RunUninstaller) -eq 0 -and -not(Test-Path -LiteralPath $installRoot) -and -not(Test-Path -LiteralPath $reg) -and -not(Test-Path -LiteralPath $shortcut) -and -not(Test-Path -LiteralPath $desktopShortcut)) 'custom_directory_upgrade_and_owned_desktop_uninstall_succeed'
     Require ((Hash (Join-Path $data 'config.json')) -ceq $configHash -and (Hash $logSentinel) -ceq $logHash -and (Hash $usageSentinel) -ceq $usageHash) 'custom_directory_uninstall_preserves_exact_user_data'

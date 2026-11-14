@@ -226,7 +226,8 @@ function Upgrade($OwnedState){
         WritePreferences $OwnedState.marker
         $updateJob=Join-Path (Join-Path $data 'updates') ($PID.ToString()+'-'+[DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds());[void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($updateJob));[void][IO.Directory]::CreateDirectory($updateJob)
         CopyDurable $PayloadZip (Join-Path $updateJob 'package.zip');CopyDurable $UpdateEnginePath (Join-Path $updateJob 'installer.ps1');Durable (Join-Path $updateJob 'manifest.json') @{schema=1;product='CodexProxyTray';version=$Version;notes='Windows 安装器提供的已校验更新包。'}
-        Durable (Join-Path $updateJob 'plan.json') @{schema=1;product='CodexProxyTray';version=$Version;zip_sha256=$ZipSha256;manifest_sha256=(Hash (Join-Path $updateJob 'manifest.json'));executable=$exe;data_root=$data;parent_pid=$parent.Id;parent_created=$parent.StartTime.ToUniversalTime().ToFileTimeUtc().ToString();launch_background=[bool]$Silent}
+        # Setup verifies readiness in the background; its Finish-page Run choice opens the window.
+        Durable (Join-Path $updateJob 'plan.json') @{schema=1;product='CodexProxyTray';version=$Version;zip_sha256=$ZipSha256;manifest_sha256=(Hash (Join-Path $updateJob 'manifest.json'));executable=$exe;data_root=$data;parent_pid=$parent.Id;parent_created=$parent.StartTime.ToUniversalTime().ToFileTimeUtc().ToString();launch_background=$true}
         ReleaseCodeLock;Event 'preparing-update';$prepare=StartUpdate 'Prepare' $updateJob;try{if(-not $prepare.WaitForExit(90000) -or $prepare.ExitCode -ne 0){AppFail '更新准备未完成，原版本和失败记录已保留。'}}finally{$prepare.Dispose()}
         $verified=Json (Join-Path $updateJob 'verified.json');if($verified.source_commit -cne $SourceCommit){AppFail '更新包来源与安装器不一致，未交接执行。'}
         $apply=StartUpdate 'Apply' $updateJob;$end=[DateTime]::UtcNow.AddSeconds(20);$handoff=Join-Path $updateJob 'handoff-ready.json'
