@@ -56,7 +56,7 @@ impl Summary {
 #[derive(Clone,Debug,Default,Serialize)]pub struct ScanProgress{pub files_total:usize,pub files_complete:usize,pub bytes_total:u64,pub bytes_read:u64,pub total_known:bool}
 #[derive(Clone,Debug,Serialize)]pub struct UsageSnapshot{
     pub start_ms:u64,pub end_ms:u64,pub updated_at:u64,pub source_available:bool,pub scan_pending:bool,pub partial:bool,
-    pub files_scanned:usize,pub unreadable_files:usize,pub skipped_records:u64,pub duplicate_records:u64,pub partial_tail_files:usize,pub scan_progress:ScanProgress,
+    pub files_scanned:usize,pub unreadable_files:usize,pub skipped_records:u64,pub source_skipped_records:u64,pub range_skipped_records:u64,pub duplicate_records:u64,pub partial_tail_files:usize,pub scan_progress:ScanProgress,
     pub summary:Summary,pub series:Vec<Bucket>,pub models:Vec<ModelUsage>,pub providers:Vec<ProviderUsage>,pub records:Vec<UsageRecord>,pub records_truncated:bool,
     pub request_count_kind:String,pub scope:String,pub notes:Vec<String>,pub scan_limits:ScanLimits,pub cache_error:Option<String>,
 }
@@ -126,7 +126,7 @@ impl ResponseTiming{
     meta_seen:bool,session:Option<String>,model:String,provider:Option<String>,created_at:Option<u64>,history_start:Option<u64>,continuation:bool,modern_start:Option<u64>,
     events:Vec<RawUsage>,baseline:Option<RawUsage>,skipped:u64,timing:ResponseTiming,
 }
-#[derive(Default,Serialize,Deserialize)]#[serde(deny_unknown_fields)]struct Cache{root:PathBuf,floor:u64,files:HashMap<PathBuf,FileCache>,limited:bool,evicted_through:Option<u64>,#[serde(default)]limits:ScanLimits}
+#[derive(Default,Serialize,Deserialize)]#[serde(deny_unknown_fields)]struct Cache{#[serde(skip)]order:OnceLock<EventOrder>,root:PathBuf,floor:u64,files:HashMap<PathBuf,FileCache>,limited:bool,evicted_through:Option<u64>,#[serde(default)]limits:ScanLimits}
 #[derive(Clone,Debug,Default,Serialize,Deserialize)]#[serde(deny_unknown_fields)]pub struct ScanLimits{pub linked_paths:usize,pub compressed_files:usize,pub scan_limit:bool,pub history_limited:bool}
 #[derive(Default)]struct PersistentCache{cache:Cache,loaded:bool,writable:bool,saved:u64,warning:Option<String>}
 #[derive(Serialize,Deserialize)]#[serde(deny_unknown_fields)]struct SavedUsage{schema:u32,cache:Cache}
@@ -142,11 +142,29 @@ fn reparse(metadata:&Metadata)->bool{
     #[cfg(windows)]{use std::os::windows::fs::MetadataExt;metadata.file_attributes()&0x400!=0}
     #[cfg(not(windows))]{metadata.file_type().is_symlink()}
 }
+fn check_local_volume(path:&Path)->Result<(),String>{
+    #[cfg(windows)]{
+        use std::path::{Component,Prefix};
+        #[link(name="kernel32")]extern "system"{fn GetDriveTypeW(root:*const u16)->u32;}
+        let drive=match path.components().next(){
+            Some(Component::Prefix(prefix))=>match prefix.kind(){
+                Prefix::Disk(letter)|Prefix::VerbatimDisk(letter)=>letter,
+                _=>return Err("用量统计只读取本机磁盘目录。".into())
+            },
+            _=>return Err("用量目录需要本机盘符。".into())
+        };
+        let volume=[drive as u16,58,92,0];
+        if !matches!(unsafe{GetDriveTypeW(volume.as_ptr())},2|3|5|6){return Err("用量统计只读取本机磁盘目录，不访问网络卷。".into())}
+    }
+    let _=path;
+    Ok(())
+}
 fn local_home()->Result<PathBuf,String>{
     let root=if let Some(value)=std::env::var_os("CODEX_HOME").filter(|value|!value.is_empty()){PathBuf::from(value)}else{PathBuf::from(std::env::var_os("USERPROFILE").or_else(||std::env::var_os("HOME")).ok_or("无法确定本机 Codex 数据目录。")?).join(".codex")};
     if !root.is_absolute(){return Err("CODEX_HOME 需要是本机绝对路径。".into())}
+    check_local_volume(&root)?;
     let root=match root.canonicalize(){Ok(root)=>root,Err(error)if error.kind()==std::io::ErrorKind::NotFound=>root,Err(_)=>return Err("无法访问本机 Codex 数据目录。".into())};
-    let text=root.to_string_lossy().to_ascii_lowercase();if text.starts_with("\\\\?\\unc\\")||(text.starts_with("\\\\")&&!text.starts_with("\\\\?\\")){return Err("用量统计只读取本机目录，不扫描网络共享。".into())}Ok(root)
+    check_local_volume(&root)?;Ok(root)
 }
 fn list_files(root:&Path)->Result<(Vec<(PathBuf,Metadata)>,usize,ScanLimits),String>{
     let mut files=vec![];let mut unreadable=0;let mut limits=ScanLimits::default();let mut visited=0usize;
@@ -235,16 +253,37 @@ fn scan_file(path:&Path,metadata:&Metadata,cache:&mut FileCache,floor:u64,budget
         if cache.events.len()-original_events>=event_room{*budget=budget.saturating_sub(spent);return Ok(cache.offset<metadata.len())}
     }*budget=budget.saturating_sub(spent);Ok(false)
 }
+#[derive(Default)]
+struct EventOrder{files:Vec<PathBuf>,positions:Vec<(usize,Option<usize>)>}
+fn ordered_events(cache:&Cache)->Vec<(&RawUsage,bool)>{
+    let order=cache.order.get_or_init(||{
+        let mut files=cache.files.keys().cloned().collect::<Vec<_>>();
+        files.sort();
+        let groups=files.iter().map(|path|&cache.files[path]).collect::<Vec<_>>();
+        let mut keys=Vec::new();
+        for (file,group) in groups.iter().enumerate(){
+            if let Some(base)=&group.baseline{keys.push(((file,None),base));}
+            keys.extend(group.events.iter().enumerate().map(|(i,e)|((file,Some(i)),e)));
+        }
+        keys.sort_by(|(_,a),(_,b)|a.at.cmp(&b.at).then_with(||a.session.cmp(&b.session)).then_with(||a.modern.cmp(&b.modern)).then_with(||(a.model=="unknown").cmp(&(b.model=="unknown"))).then_with(||a.timing.duration_ms.is_none().cmp(&b.timing.duration_ms.is_none())));
+        EventOrder{files,positions:keys.into_iter().map(|(position,_)|position).collect()}
+    });
+    let groups=order.files.iter().map(|path|&cache.files[path]).collect::<Vec<_>>();
+    order.positions.iter().map(|&(file,index)|{
+        let group=groups[file];match index{Some(i)=>(&group.events[i],false),None=>(group.baseline.as_ref().unwrap(),true)}
+    }).collect()
+}
 fn aggregate(cache:&Cache,start_ms:u64,end_ms:u64,pending:bool,unreadable:usize,available:bool)->UsageSnapshot{
-    let mut events=vec![];let mut modern_start:HashMap<String,u64>=HashMap::new();let mut skipped=0;let mut partial_tail_files=0;
-    for file in cache.files.values(){skipped+=file.skipped;if file.waiting{partial_tail_files+=1;}if let(Some(session),Some(at))=(&file.session,file.modern_start){modern_start.entry(session.clone()).and_modify(|previous|*previous=(*previous).min(at)).or_insert(at);}events.extend(file.baseline.iter().map(|event|(event,true)));events.extend(file.events.iter().map(|event|(event,false)));}
-    events.sort_by(|(a,_),(b,_)|a.at.cmp(&b.at).then_with(||a.session.cmp(&b.session)).then_with(||a.modern.cmp(&b.modern)).then_with(||(a.model=="unknown").cmp(&(b.model=="unknown"))).then_with(||a.timing.duration_ms.is_none().cmp(&b.timing.duration_ms.is_none())));
+    let events=ordered_events(cache);let mut modern_start:HashMap<String,u64>=HashMap::new();let mut partial_tail_files=0;
+    let source_skipped=cache.files.values().map(|file|file.skipped).sum::<u64>();
+    let mut range_skipped=0u64;
+    for file in cache.files.values(){if file.waiting{partial_tail_files+=1;}if let(Some(session),Some(at))=(&file.session,file.modern_start){modern_start.entry(session.clone()).and_modify(|previous|*previous=(*previous).min(at)).or_insert(at);}}
     let chart_start=if start_ms==0{events.iter().filter(|(event,baseline)|!baseline&&event.at<end_ms).map(|(event,_)|event.at).min().unwrap_or(end_ms.saturating_sub(DAY))}else{start_ms};
     // At most about 180 bins, including for all-history/custom ranges. The
     // original requested bounds remain in the snapshot; no history is invented.
     let span=end_ms.saturating_sub(chart_start);let bucket=if span<=2*DAY{3_600_000}else{DAY*(span/(180*DAY)+u64::from(span%(180*DAY)!=0)).max(1)};
     let bucket_start=|at:u64|if bucket>=DAY{(((at+8*3_600_000)/bucket)*bucket).saturating_sub(8*3_600_000)}else{at/bucket*bucket};
-    let mut legacy_seen:HashSet<(String,u64,Tokens)>=HashSet::new();let mut modern_seen:HashSet<String>=HashSet::new();let mut totals:HashMap<String,Tokens>=HashMap::new();let mut duplicate=0;let mut model_limited=false;let mut provider_limited=false;let mut summary=Summary{missing_price:true,..Summary::default()};let mut records=vec![];let mut models:BTreeMap<String,Summary>=BTreeMap::new();let mut providers:BTreeMap<Option<String>,(Summary,BTreeMap<String,Summary>)>=BTreeMap::new();let mut bins:BTreeMap<u64,Summary>=BTreeMap::new();let mut bin_models:BTreeMap<u64,BTreeMap<String,Summary>>=BTreeMap::new();
+    let mut legacy_seen:HashSet<(String,u64,Tokens)>=HashSet::new();let mut modern_seen:HashSet<String>=HashSet::new();let mut totals:HashMap<String,Tokens>=HashMap::new();let mut duplicate=0;let mut model_limited=false;let mut provider_limited=false;let mut summary=Summary{missing_price:true,..Summary::default()};let mut records=std::collections::VecDeque::with_capacity(500);let mut models:BTreeMap<String,Summary>=BTreeMap::new();let mut providers:BTreeMap<Option<String>,(Summary,BTreeMap<String,Summary>)>=BTreeMap::new();let mut bins:BTreeMap<u64,Summary>=BTreeMap::new();let mut bin_models:BTreeMap<u64,BTreeMap<String,Summary>>=BTreeMap::new();
     for (event,baseline) in events{
         if event.at>=end_ms{continue}
         let value=if event.modern{
@@ -256,28 +295,31 @@ fn aggregate(cache:&Cache,start_ms:u64,end_ms:u64,pending:bool,unreadable:usize,
                 if !legacy_seen.insert((event.session.clone(),event.at,total))||totals.get(&event.session)==Some(&total){duplicate+=1;continue}
                 let previous=totals.insert(event.session.clone(),total);
                 if let Some(last)=event.last.filter(|last|last.positive()){last}
-                else if let Some(previous)=previous{match total.difference(previous){Some(delta)=>delta,None=>{skipped+=1;continue}}}
-                else if event.continuation{skipped+=1;continue}else{total}
+                else if let Some(previous)=previous{match total.difference(previous){Some(delta)=>delta,None=>{range_skipped+=u64::from(!baseline&&event.at>=start_ms);continue}}}
+                else if event.continuation{range_skipped+=u64::from(!baseline&&event.at>=start_ms);continue}else{total}
             }else{let Some(last)=event.last else{continue};let key=format!("legacy:{}:{}:{last:?}",event.session,event.at);if !modern_seen.insert(key){duplicate+=1;continue}last}
         };
         if baseline||!value.positive()||event.at<start_ms{continue}
-        if !summary.add(value){skipped+=1;continue}
+        if !summary.add(value){range_skipped+=u64::from(!baseline&&event.at>=start_ms);continue}
         let model_key=if models.len()<128||models.contains_key(&event.model){event.model.clone()}else{model_limited=true;"其他模型（合并）".into()};models.entry(model_key.clone()).or_default().add_record(value,event.timing);
         let provider_key=if providers.len()<128||providers.contains_key(&event.provider){event.provider.clone()}else{provider_limited=true;None};
         let(provider_summary,provider_models)=providers.entry(provider_key).or_default();
         provider_summary.add_record(value,event.timing);
         provider_models.entry(model_key.clone()).or_default().add_record(value,event.timing);
         let at=bucket_start(event.at);bins.entry(at).or_default().add(value);bin_models.entry(at).or_default().entry(model_key).or_default().add(value);
-        records.push(UsageRecord{at:event.at,model:event.model.clone(),provider:event.provider.clone(),source_kind:if event.modern{"token_usage_record"}else{"token_count"}.into(),tokens:value,timing:event.timing,estimated_cost_usd:None,missing_price:true});
+        if records.len()==500{records.pop_front();}
+        records.push_back((event,value));
     }
-    let records_truncated=records.len()>500;if records_truncated{records.drain(..records.len()-500);}records.reverse();
+    let records_truncated=summary.request_count>500;
+    let records=records.into_iter().rev().map(|(event,value)|UsageRecord{at:event.at,model:event.model.clone(),provider:event.provider.clone(),source_kind:if event.modern{"token_usage_record"}else{"token_count"}.into(),tokens:value,timing:event.timing,estimated_cost_usd:None,missing_price:true}).collect();
+    let skipped=source_skipped+range_skipped;
     let mut series=vec![];let mut at=bucket_start(chart_start);while at<end_ms{series.push(Bucket{start_ms:at,end_ms:(at+bucket).min(end_ms),summary:bins.remove(&at).unwrap_or(Summary{missing_price:true,..Summary::default()}),models:bin_models.remove(&at).unwrap_or_default().into_iter().map(|(model,summary)|ModelUsage{model,summary}).collect()});at+=bucket;}
     let mut models=models.into_iter().map(|(model,summary)|ModelUsage{model,summary}).collect::<Vec<_>>();models.sort_by(|a,b|b.summary.tokens.total_tokens.cmp(&a.summary.tokens.total_tokens).then_with(||a.model.cmp(&b.model)));
     let mut providers=providers.into_iter().map(|(provider,(summary,models))|ProviderUsage{provider,summary,models:models.into_iter().map(|(model,summary)|ModelUsage{model,summary}).collect()}).collect::<Vec<_>>();providers.sort_by(|a,b|b.summary.tokens.total_tokens.cmp(&a.summary.tokens.total_tokens).then_with(||a.provider.cmp(&b.provider)));
     let mut notes=vec!["仅统计本机现存 Codex 会话中的用量元数据，不代表官方账单、真实付款或订阅剩余额度。".into(),"输入已包含缓存输入，输出已包含推理输出；合计只计算输入与输出。".into(),"记录数表示去重后的有效用量记录，不包含无用量记录的失败请求。".into(),"费用由界面结合公开参考价或本机自定义单价估算；缺少完整单价时保持未知。".into()];
     let history_limited=cache.evicted_through.is_some_and(|at|at>=start_ms);
-    if pending{notes.push("正在增量扫描本机记录，当前结果尚未完整。".into());}if partial_tail_files>0{notes.push("部分会话尾部尚未写入完成，完成后将继续读取。".into());}if history_limited{notes.push(format!("仅保留最近 {MAX_EVENTS} 条用量元数据，更早记录未计入当前结果。"));}if cache.limits.linked_paths>0{notes.push(format!("跳过了 {} 个链接路径，避免重复统计或扫描到其他目录。",cache.limits.linked_paths));}if cache.limits.compressed_files>0{notes.push(format!("发现 {} 个暂不支持的压缩记录文件，尚未计入。",cache.limits.compressed_files));}if cache.limits.scan_limit{notes.push("目录深度或文件数量达到扫描上限，超出部分尚未计入。".into());}if model_limited||provider_limited{notes.push("模型或提供方种类超过显示范围，其余用量已合并展示。".into());}if skipped>0{notes.push(format!("跳过了 {skipped} 条无法解析或可靠归属的记录；不能据此认定原文件已损坏。"));}if unreadable>0{notes.push(format!("本轮有 {unreadable} 个文件或目录无法读取。"));}if !available{notes.push("未找到可读取的本机 Codex 会话记录。".into());}
-    UsageSnapshot{start_ms,end_ms,updated_at:crate::settings::now(),source_available:available,scan_pending:pending,partial:pending||partial_tail_files>0||history_limited||cache.limited||skipped>0||unreadable>0,files_scanned:cache.files.values().filter(|file|file.opened).count(),unreadable_files:unreadable,skipped_records:skipped,duplicate_records:duplicate,partial_tail_files,scan_progress:ScanProgress::default(),summary,series,models,providers,records,records_truncated,request_count_kind:"deduplicated_usage_records".into(),scope:"existing_local_codex_session_metadata".into(),notes,scan_limits:ScanLimits{history_limited,..cache.limits.clone()},cache_error:None}
+    if pending{notes.push("正在增量扫描本机记录，当前结果尚未完整。".into());}if partial_tail_files>0{notes.push("部分会话尾部尚未写入完成，完成后将继续读取。".into());}if history_limited{notes.push(format!("仅保留最近 {MAX_EVENTS} 条用量元数据，更早记录未计入当前结果。"));}if cache.limits.linked_paths>0{notes.push(format!("跳过了 {} 个链接路径，避免重复统计或扫描到其他目录。",cache.limits.linked_paths));}if cache.limits.compressed_files>0{notes.push(format!("发现 {} 个暂不支持的压缩记录文件，尚未计入。",cache.limits.compressed_files));}if cache.limits.scan_limit{notes.push("目录深度或文件数量达到扫描上限，超出部分尚未计入。".into());}if model_limited||provider_limited{notes.push("模型或提供方种类超过显示范围，其余用量已合并展示。".into());}if source_skipped>0{notes.push(format!("扫描来源累计 {source_skipped} 条元数据无法解析或归属，无法确定所属日期。"));}if range_skipped>0{notes.push(format!("当前时间范围跳过 {range_skipped} 条用量记录，原因是计数异常或缺少可靠的累计基线。"));}if unreadable>0{notes.push(format!("本轮有 {unreadable} 个文件或目录无法读取。"));}if !available{notes.push("未找到可读取的本机 Codex 会话记录。".into());}
+    UsageSnapshot{start_ms,end_ms,updated_at:crate::settings::now(),source_available:available,scan_pending:pending,partial:pending||partial_tail_files>0||history_limited||cache.limited||skipped>0||unreadable>0,files_scanned:cache.files.values().filter(|file|file.opened).count(),unreadable_files:unreadable,skipped_records:skipped,source_skipped_records:source_skipped,range_skipped_records:range_skipped,duplicate_records:duplicate,partial_tail_files,scan_progress:ScanProgress::default(),summary,series,models,providers,records,records_truncated,request_count_kind:"deduplicated_usage_records".into(),scope:"existing_local_codex_session_metadata".into(),notes,scan_limits:ScanLimits{history_limited,..cache.limits.clone()},cache_error:None}
 }
 fn read_at(root:&Path,start_ms:u64,end_ms:u64,cache:&mut Cache)->Result<UsageSnapshot,String>{
     read_at_bounded(root,start_ms,end_ms,cache,MAX_EVENTS)
@@ -294,7 +336,12 @@ fn read_at_bounded(root:&Path,start_ms:u64,end_ms:u64,cache:&mut Cache,event_lim
     let floor=start_ms;if cache.root!=root||start_ms<cache.floor{*cache=Cache{root:root.to_path_buf(),floor,..Cache::default()};}
     // Keep the broadest loaded scope when narrowing dates; expanding beyond it
     // resets once above, while 30d -> 7d -> 24h reuses parsed metadata.
-    let(files,mut unreadable,limits)=list_files(root)?;let available=!files.is_empty();cache.limited=limits.linked_paths>0||limits.compressed_files>0||limits.scan_limit;cache.limits=limits;let active=files.iter().map(|(path,_)|path.clone()).collect::<HashSet<_>>();cache.files.retain(|path,_|active.contains(path));
+    let(files,mut unreadable,limits)=list_files(root)?;let available=!files.is_empty();cache.limited=limits.linked_paths>0||limits.compressed_files>0||limits.scan_limit;cache.limits=limits;let active=files.iter().map(|(path,_)|path.clone()).collect::<HashSet<_>>();if cache.files.len()!=active.len() || files.iter().any(|(path,meta)|{
+        let Some(file)=cache.files.get(path) else{return true};
+        let (modified,created)=stamp(meta);
+        !file.opened || file.modified!=modified || file.created!=created || file.len!=meta.len() || (!file.waiting && file.offset<file.len)
+    }) {cache.order.take();}
+    cache.files.retain(|path,_|active.contains(path));
     let mut budget=READ_BUDGET;let mut pending=false;let mut count=cache.files.values().map(|file|file.events.len()).sum::<usize>();
     // At most one bounded batch beyond the retained limit exists during a scan.
     for(path,metadata)in &files{let file=cache.files.entry(path.clone()).or_default();let previous=file.events.len();if budget==0{pending|=file.offset<metadata.len()&&!file.waiting;continue}match scan_file(path,metadata,file,cache.floor,&mut budget,event_limit.clamp(1,4096)){Ok(more)=>pending|=more,Err(())=>unreadable+=1}count=count.saturating_sub(previous)+file.events.len();if count>event_limit{retain_recent(cache,event_limit);count=event_limit;}}

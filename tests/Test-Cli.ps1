@@ -153,7 +153,7 @@ try {
     $runtime=Join-Path $local 'CodexProxyTray';$mockPackage=Join-Path $roaming 'npm/node_modules/@openai/codex';$mockBin=Join-Path $mockPackage 'bin';$mockScript=Join-Path $mockBin 'codex.js';$configPath=Join-Path $runtime 'config.json';$packagePath=Join-Path $mockPackage 'package.json'
     foreach($directory in @($runtime,$mockBin,$qaProfile,$scratch)){[void][IO.Directory]::CreateDirectory($directory)}
     [IO.File]::Copy((Join-Path $PSScriptRoot 'mock-codex.mjs'),$mockScript,$false)
-    Write-NewJson $packagePath ([ordered]@{name='@openai/codex';version='0.0.0-qa';type='commonjs'})
+    Write-NewJson $packagePath ([ordered]@{name='@openai/codex';version='0.0.0-qa';type='commonjs';bin=@{codex='bin/codex.js'}})
     $proxyUrl='http://127.0.0.1:17890';Write-NewJson $configPath ([ordered]@{proxy_url=$proxyUrl;launch_desktop=$false;cli_command=@()})
     $allowedPaths=[Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
     foreach($path in @($ownerPath,$configPath,$packagePath,$mockScript,$qaProfile,$scratch)){

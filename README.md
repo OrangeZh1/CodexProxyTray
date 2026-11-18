@@ -265,3 +265,9 @@ Windows 原生检查先在助手未启动时捕获代理环境基线，再启动
 界面区分后台同步、等待日志写入、跳过的记录、未支持的压缩文件与统计范围限制；正常去重、合并展示和最近 500 条明细限制不代表汇总数据丢失。更新检查失败保留上次成功查到的版本，并明确标记该信息尚未重新确认；手动重试重新请求更新清单。
 
 用量持久索引设计参考 [agent-speed HistoryStore](https://github.com/zoefix/agent-speed/blob/cae43de7b4ab28219815d31616132e4b4b648cf6/windows/src/AgentSpeed.Core/History/HistoryStore.cs) 与 [CC Switch Codex 会话同步](https://github.com/farion1231/cc-switch/blob/86c749b98e76f2ccf7877e718aa3060725aea651/src-tauri/src/services/session_usage_codex.rs) 的机制；服务兼容机制仅参考 agent-speed。这里复用本项目现有解析器与增量读取，没有引入其他项目的数据库实现。
+
+### 审计修复分支的行为
+
+- 流量辅助服务 1.0.2 只采集服务端独立核验的进程。个别目标缺少可确认的应用根或父链时，保留已核验目标的读数并标记累计不完整。旧服务可在设置中显式更新。
+- 价格目录支持 gzip，传输和解压均限制大小。运行日志记录失败阶段、HTTP 状态、字节数和耗时；可在运行日志页打开本机日志目录。
+- 内置更新要求当前程序受 Windows 信任，并校验同一证书签署的分离式 CMS 清单和新版程序。正式签发时，先签署两份 EXE、再生成包内哈希与 ZIP，签署最终安装器。发布者在受控环境中使用 PowerShell 7 的 `scripts/sign-update-manifest.ps1`，以显式指定的证书给包含 ZIP SHA-256 的最终清单生成 `CodexProxyTray-update.json.p7s`，随清单和发行包提供。更换发布证书或从旧未签名版本建立信任时，需单独核实发布者并手动安装可信安装包。普通分支 CI 仅用隔离测试证书验证更新流程。

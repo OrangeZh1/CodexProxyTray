@@ -5,7 +5,7 @@ use crate::worker::Message;
 
 #[derive(Clone,Copy,Deserialize)]#[serde(rename_all="snake_case")]
 pub enum UiEvent{AppearanceChanged,WindowPinOn,WindowPinOff,WindowPinFailed,UsageSettingsChanged,UsageSyncStarted,UsageSyncSuccess,UsageSyncFailed,PricesSyncStarted,PricesSyncSuccess,PricesSyncFailed,CurrencyChanged}
-pub fn note(tx:&Sender<Message>,level:&'static str,category:&'static str,message:&'static str,details:&'static str)->Result<(),String>{tx.send(Message::Notice(level.into(),category.into(),message.into(),details.into())).map_err(|_|"后台日志暂不可用。".into())}
+pub fn note(tx:&Sender<Message>,level:&'static str,category:&'static str,message:&'static str,details:&str)->Result<(),String>{tx.send(Message::Notice(level.into(),category.into(),message.into(),details.into())).map_err(|_|"后台日志暂不可用。".into())}
 pub fn ui(tx:&Sender<Message>,event:UiEvent)->Result<(),String>{
     let(level,category,message)=match event{
         UiEvent::AppearanceChanged=>("info","外观","已调整界面主题"),UiEvent::WindowPinOn=>("info","窗口","已启用窗口置顶"),UiEvent::WindowPinOff=>("info","窗口","已取消窗口置顶"),UiEvent::WindowPinFailed=>("warning","窗口","窗口置顶操作未完成"),
@@ -18,7 +18,7 @@ static HEALTH:Mutex<[Option<bool>;7]>=Mutex::new([None;7]);
 // First successes are silent; repeated errors do not fill the log every poll.
 fn transition(state:&mut Option<bool>,failed:bool)->Option<bool>{let previous=state.replace(failed);if previous==Some(failed)||!failed&&previous.is_none(){None}else{Some(failed)}}
 pub fn changed(key:ReadState,failed:bool)->Option<bool>{let mut states=HEALTH.lock().unwrap_or_else(|error|error.into_inner());transition(&mut states[key as usize],failed)}
-pub fn read_state(tx:&Sender<Message>,key:ReadState,failed:bool,category:&'static str,failure:&'static str,recovery:&'static str){if let Some(failed)=changed(key,failed){let _=note(tx,if failed{"warning"}else{"info"},category,if failed{failure}else{recovery},"");}}
+pub fn read_state(tx:&Sender<Message>,key:ReadState,failed:bool,category:&'static str,failure:&'static str,recovery:&'static str,details:&str){if let Some(failed)=changed(key,failed){let _=note(tx,if failed{"warning"}else{"info"},category,if failed{failure}else{recovery},if failed{details}else{""});}}
 #[cfg(test)]mod tests{
     use super::*;
     #[test]fn closed_ui_vocabulary_rejects_free_text_and_never_carries_arguments(){

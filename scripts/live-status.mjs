@@ -16,6 +16,9 @@ async function nativeStatus(){
     const age=Date.now()-native.updated_at;
     if(!Number.isInteger(native.helper_pid)||native.helper_pid<=0||!Number.isFinite(age)||age< -2000||age>=10000||!Array.isArray(native.logs)||typeof native.backend_ready!=='boolean')return null;
     process.kill(native.helper_pid,0);
+    if(native.logs.length===0){
+      try{const history=JSON.parse(await readFile(join(root,'logs','events-v1.json'),'utf8'));if(history.schema===1&&Array.isArray(history.records))native.logs=history.records.slice(-200);}catch{/* Retain the status snapshot if history is unavailable. */}
+    }
     return {...native,read_only:true};
   }catch{return null;}
 }

@@ -60,6 +60,7 @@ impl Controller {
             let guard_error=match settings::load_guard_enabled(&root){Ok(enabled)=>{status.enabled=enabled;None},Err(error)=>Some(error)};
             let _=fs::create_dir_all(root.join("logs"));let history_path=root.join("logs/events-v1.json");
             let history_writable=match load_history(&history_path) {Ok(records)=>{status.logs=records;true},Err(error)=>{status.log_storage_error=Some(error);false}};
+            let mut last_status_write=None;
             let mut persisted=status.logs.last().map_or(0,|log|log.id);
             if let Some(error)=&config_error {status.enabled=false;status.error=Some(error.clone());}
             let exe=std::env::current_exe().expect("executable path");
@@ -92,7 +93,7 @@ impl Controller {
                     if let Ok(d)=&debug {for package in &held {if let Err(error)=d.disable(package){status.log("error","守护","释放应用包设置失败",format!("{package}\n{error}"));}}}
                     drop(debug);drop(event);status.enabled=false;status.guard_ready=false;status.backend_ready=false;
                     status.log("info","生命周期","助手已退出","已关闭 CLI 守护标志并释放本进程持有的应用包接口。");
-                    publish(&root,&shared,&mut status,&mut persisted,history_writable,&notify);break;
+                    publish(&root,&shared,&mut status,&mut persisted,history_writable,&mut last_status_write,&notify);break;
                 }
                 status.proxy_url=config.proxy_url.clone();status.launch_desktop=config.launch_target.opens_desktop();status.autostart=platform::autostart();status.launch_target=config.launch_target;status.cli_workdir=config.cli_workdir.clone();status.network_enabled=config.network_enabled;status.auto_check_updates=config.auto_check_updates;status.update_interval_hours=config.update_interval_hours;
                 status.connectivity_enabled=config.connectivity_enabled;if status.enabled {status.guard_uptime_ms=guard_started.elapsed().as_millis()as u64;}
@@ -144,13 +145,13 @@ impl Controller {
                             if let Err(message)=action{if !enable{error=Some(format!("流量采样停止尚未确认：{message}"));}result=Err(message);}
                         }
                     }
-                    let next=sampler.snapshot();if next.state!=status.traffic.state{status.log(if next.state==crate::traffic::TrafficState::Unavailable{"warning"}else{"info"},"流量","流量采集状态已变化",format!("状态：{:?}\n{}",next.state,next.message.as_deref().unwrap_or("仅统计已验证的目标进程字节。")));}status.traffic=next;
+                    let next=sampler.snapshot();if next.state!=status.traffic.state||next.partial!=status.traffic.partial{status.log(if next.state==crate::traffic::TrafficState::Unavailable{"warning"}else{"info"},"流量","流量采集状态已变化",format!("状态：{:?}\n{}",next.state,next.message.as_deref().unwrap_or("仅统计已验证的目标进程字节。")));}status.traffic=next;
                 }else{let message="流量采样状态不可访问，停止结果尚未确认。".to_owned();error=Some(message.clone());result=Err(message.clone());status.traffic=crate::traffic::TrafficSnapshot::disabled();status.traffic.state=crate::traffic::TrafficState::Unavailable;status.traffic.message=Some(message);}
                 crate::flow_log::maybe_sample(&status.traffic);status.traffic_enabled=config.traffic_enabled;status.traffic_service=crate::traffic_service::snapshot();
                 if status.error!=error {if let Some(e)=&error {status.log("error","守护","守护状态需要检查",e.clone());}else if status.error.is_some(){status.log("info","守护","守护状态已恢复","本轮检测未再出现此前错误。");}status.error=error;}
                 if !config.launch_target.opens_desktop() {auto_desktop_pending=false;}
                 if !config.launch_target.opens_cli() {auto_cli_pending=false;}
-                if auto_desktop_pending&&status.guard_ready {match native::open_desktop(){Ok(())=>status.log("info","ChatGPT","已按启动偏好请求打开 ChatGPT",format!("应用包：{}",core::FAMILY)),Err(e)=>status.log("error","ChatGPT","打开 ChatGPT 失败",e)}auto_desktop_pending=false;}
+                if auto_desktop_pending&&status.package_count>0&&(!status.enabled||status.guard_ready) {match native::open_desktop(){Ok(())=>status.log("info","ChatGPT","已按启动偏好请求打开 ChatGPT",format!("应用包：{}",core::FAMILY)),Err(e)=>status.log("error","ChatGPT","打开 ChatGPT 失败",e)}auto_desktop_pending=false;}
                 if auto_cli_pending&&status.cli_ready&&!crate::cli_manager::is_mutating() {match crate::launch::open_cli(&root,&config){Ok(())=>status.log("info","CLI","已按启动偏好请求打开 Codex CLI",format!("工作目录：{}",if config.cli_workdir.is_empty(){"用户目录"}else{"已配置"})),Err(e)=>status.log("error","CLI","打开 Codex CLI 失败",e)}auto_cli_pending=false;}
                 crate::update::maybe_automatic(&config);status.update=crate::update::snapshot();status.app_update=crate::app_update::snapshot();
                 crate::connectivity::maybe_automatic(&config);status.connectivity=crate::connectivity::snapshot();
@@ -167,18 +168,18 @@ impl Controller {
                 if let Some(started)=manual {status.log(if result.is_ok()&&status.error.is_none(){"info"}else{"warning"},"检测","手动检测完成",format!("耗时：{} ms\n代理端口：{} · ChatGPT 包：{} · CLI 入口：{}\nChatGPT PID：{}",started.elapsed().as_millis(),if status.proxy_reachable{"可用"}else{"不可用"},status.package_count,if status.cli_ready{"已接入"}else{"未接入"},pid.map_or("未运行".into(),|p|p.to_string())));}
                 if guard_action&&result.is_ok(){if let Some(error)=&status.error {result=Err(format!("设置已处理，但守护需要检查：{error}"));}}
                 if let Err(error)=&result {status.log("error","操作","操作未完成",error.clone());}
-                publish(&root,&shared,&mut status,&mut persisted,history_writable,&notify);
+                publish(&root,&shared,&mut status,&mut persisted,history_writable,&mut last_status_write,&notify);
                 if let Some(reply)=pending {let _=reply.send(result.map(|_|status.clone()));}
                 if first&&config_error.is_none()&&!crate::cli_manager::is_mutating() {
                     match install_cli(&root,&exe,&mut config) {Ok(ready)=>{status.cli_ready=ready;status.log(if ready{"info"}else{"warning"},"CLI",if ready{"Codex CLI 专用入口已就绪"}else{"未检测到 Windows Codex CLI"},if ready{format!("专用入口：{}\n实际程序：{}\n从助手打开 CLI 时使用内部代理入口；普通终端保留官方 npm 入口。",root.join("cli/codex-proxy-cli.exe").display(),config.cli_command.join(" "))}else{"安装后将自动检测并准备专用入口。".into()});},Err(e)=>{let message=format!("CLI 接入失败：{e}");status.log("error","CLI","CLI 入口准备失败",message.clone());cli_error=Some(message.clone());if status.error.is_none(){status.error=Some(message);}}}
                     status.cli_detected=!settings::detect_cli(&root).is_empty();if let Ok(event)=&event {event.set(status.enabled&&status.cli_ready);}
-                    publish(&root,&shared,&mut status,&mut persisted,history_writable,&notify);
+                    publish(&root,&shared,&mut status,&mut persisted,history_writable,&mut last_status_write,&notify);
                 }
                 first=false;
             }
         });Self{status,tx,traffic,worker:Mutex::new(Some(worker))}
     }
-    pub fn snapshot(&self)->Status {let finished=self.worker.lock().unwrap_or_else(|e|e.into_inner()).as_ref().is_some_and(JoinHandle::is_finished);let mut status=self.status.lock().unwrap_or_else(|e|e.into_inner()).clone();status.update=crate::update::snapshot();status.app_update=crate::app_update::snapshot();status.connectivity=crate::connectivity::snapshot();status.traffic_service=crate::traffic_service::snapshot();status.desktop_operation=crate::desktop_lifecycle::snapshot();status.cli_management=crate::cli_manager::snapshot();status.update_notice=crate::update_notice::snapshot();if let Ok(traffic)=self.traffic.lock(){status.traffic=traffic.snapshot();}status.sample_traffic();if finished&&status.backend_ready {status.backend_ready=false;status.enabled=false;status.guard_ready=false;status.error=Some("守护后台已退出，请重新打开助手。".into());}status}
+    pub fn snapshot(&self)->Status {let finished=self.worker.lock().unwrap_or_else(|e|e.into_inner()).as_ref().is_some_and(JoinHandle::is_finished);let mut status=self.status.lock().unwrap_or_else(|e|e.into_inner()).clone();status.update=crate::update::snapshot();status.app_update=crate::app_update::snapshot();status.connectivity=crate::connectivity::snapshot();status.desktop_operation=crate::desktop_lifecycle::snapshot();status.cli_management=crate::cli_manager::snapshot();status.update_notice=crate::update_notice::snapshot();if let Ok(traffic)=self.traffic.lock(){status.traffic=traffic.snapshot();}status.sample_traffic();if finished&&status.backend_ready {status.backend_ready=false;status.enabled=false;status.guard_ready=false;status.error=Some("守护后台已退出，请重新打开助手。".into());}status}
     pub fn stop(&self){let _=self.tx.send(Message::Stop);if let Some(worker)=self.worker.lock().unwrap_or_else(|e|e.into_inner()).take(){let _=worker.join();}}
 }
 impl Drop for Controller {fn drop(&mut self){self.stop();}}
@@ -190,15 +191,22 @@ fn apply_preferences(root:&Path,exe:&Path,config:&mut Config,patch:&Preferences)
     if let Err(error)=settings::save(root,&next){if patch.autostart.is_some(){let _=platform::set_autostart(old,exe);}return Err(error)}*config=next;Ok(())
 }
 fn load_history(path:&Path)->Result<Vec<Log>,String> {if !path.exists(){return Ok(vec![])}if fs::metadata(path).map_err(|e|e.to_string())?.len()>1024*1024{return Err("历史日志超过读取上限，原文件已保留。".into())}let history:History=serde_json::from_slice(&fs::read(path).map_err(|e|e.to_string())?).map_err(|_|"历史日志格式无效，原文件已保留。")?;if history.schema!=1{return Err("历史日志版本不受支持，原文件已保留。".into())}if history.records.iter().any(|log|!core::valid_log_position(log.id,log.at))||history.records.windows(2).any(|pair|pair[0].id>=pair[1].id){return Err("历史日志编号或时间无效，原文件已保留。".into())}Ok(history.records.into_iter().rev().take(LOG_LIMIT).collect::<Vec<_>>().into_iter().rev().collect())}
-fn publish(root:&Path,shared:&Mutex<Status>,status:&mut Status,persisted:&mut u64,history_writable:bool,notify:&impl Fn(&Status)) {
+fn publish(root:&Path,shared:&Mutex<Status>,status:&mut Status,persisted:&mut u64,history_writable:bool,last_write:&mut Option<Instant>,notify:&impl Fn(&Status)) {
     status.desktop_operation=crate::desktop_lifecycle::snapshot();status.cli_management=crate::cli_manager::snapshot();status.update_notice=crate::update_notice::snapshot();status.sample_traffic();
     let newest=status.logs.last().map_or(0,|log|log.id);
+    let log_changed=newest!=*persisted;
     if history_writable&&newest!=*persisted {match settings::write_json(&root.join("logs/events-v1.json"),&History{schema:1,records:status.logs.clone()}) {Ok(())=>{*persisted=newest;status.log_storage_error=None;},Err(error)=>status.log_storage_error=Some(error)}}
     status.revision+=1;status.updated_at=settings::now();*shared.lock().unwrap_or_else(|e|e.into_inner())=status.clone();
     // Confirmation identity and installation paths are IPC-only; runtime detail
     // endpoints and usage records never enter Status at all.
-    let mut saved=status.clone();saved.cli_management.target_token=None;saved.cli_management.install_path=None;
-    let _=settings::write_json(&root.join("status.json"),&saved);notify(status);
+    // Keep the preview and native diagnostics inside their ten-second freshness window.
+    if !status.backend_ready || log_changed || last_write.is_none_or(|at|at.elapsed()>=Duration::from_secs(5)){
+        let mut saved=status.clone();saved.cli_management.target_token=None;saved.cli_management.install_token=None;saved.cli_management.install_path=None;
+        // History has its own atomic file; the preview combines the two.
+        if history_writable && status.log_storage_error.is_none(){saved.logs.clear();}
+        if settings::write_json(&root.join("status.json"),&saved).is_ok(){*last_write=Some(Instant::now());}
+    }
+    notify(status);
 }
 fn install_cli(root:&Path,exe:&Path,config:&mut Config)->Result<bool,String> {
     if crate::cli_manager::is_mutating(){return Err("Codex CLI 管理操作正在进行，暂缓更改专用入口。".into())}

@@ -23,17 +23,27 @@ fn read_optional(path:&Path,limit:u64)->Result<Option<Vec<u8>>,String>{let file=
 fn valid(row:&Entry)->bool{row.pid>0&&row.first_at<=row.last_at&&row.last_at<=8_640_000_000_000_000&&row.process.len()<=100&&row.created.parse::<u64>().is_ok_and(|value|value>0)&&!row.process.chars().any(char::is_control)&&row.local.parse::<SocketAddr>().is_ok()&&row.remote.parse::<SocketAddr>().is_ok()}
 fn valid_sample(row:&Sample)->bool{row.at>0&&row.at<=8_640_000_000_000_000&&[row.receive_bps,row.send_bps].iter().flatten().all(|value|value.is_finite()&&*value>=0.0)}
 pub fn snapshot()->Snapshot{state().lock().unwrap_or_else(|e|e.into_inner()).view.clone()}
-pub fn set_enabled(enabled:bool)->Result<Snapshot,String>{let mut state=state().lock().map_err(|_|"连接日志状态暂不可用。")?;if !state.writable{return Err(state.view.error.clone().unwrap_or_else(||"连接日志不可写。".into()))}settings::write_json(&settings::root().join("flow-log-settings-v1.json"),&Preference{schema:1,enabled})?;state.view.enabled=enabled;if !enabled{for row in &mut state.view.entries{row.present=false;}}state.last=None;Ok(state.view.clone())}
+pub fn set_enabled(enabled:bool)->Result<Snapshot,String>{let mut state=state().lock().map_err(|_|"连接日志状态暂不可用。")?;if !state.writable{return Err(state.view.error.clone().unwrap_or_else(||"连接日志不可写。".into()))}if state.view.enabled && !enabled { persist(&mut state)?; }
+    settings::write_json(&settings::root().join("flow-log-settings-v1.json"),&Preference{schema:1,enabled})?;state.view.enabled=enabled;if !enabled{for row in &mut state.view.entries{row.present=false;}}state.last=None;Ok(state.view.clone())}
 fn merge(view:&mut Snapshot,connections:ConnectionSnapshot,traffic:&TrafficSnapshot){
     let now=connections.sampled_at;let mut by_key=view.entries.drain(..).map(|mut row|{row.present=false;((row.pid,row.created.clone(),row.local.clone(),row.remote.clone()),row)}).collect::<BTreeMap<_,_>>();
     for row in connections.rows{let entry=Entry{first_at:now,last_at:now,pid:row.pid,created:row.process_created.clone(),process:row.process_label,local:row.local,remote:row.remote,present:true};if !valid(&entry){continue}let key=(entry.pid,entry.created.clone(),entry.local.clone(),entry.remote.clone());by_key.entry(key).and_modify(|old|{old.last_at=now;old.present=true;}).or_insert(entry);}
     view.entries=by_key.into_values().collect();view.entries.sort_by_key(|row|std::cmp::Reverse(row.last_at));view.truncated=connections.truncated||view.entries.len()>LIMIT;view.entries.truncate(LIMIT);view.sampled_at=Some(now);
     if view.samples.last().is_none_or(|sample|sample.at!=traffic.timestamp_ms)&&traffic.timestamp_ms>0{let collecting=traffic.state==TrafficState::Collecting;let rate=|value:Option<f64>|value.filter(|n|collecting&&n.is_finite()&&*n>=0.0);view.samples.push(Sample{partial:traffic.partial,at:traffic.timestamp_ms,receive_bps:rate(traffic.receive_bps),send_bps:rate(traffic.send_bps),received_bytes:traffic.received_bytes.filter(|_|collecting),sent_bytes:traffic.sent_bytes.filter(|_|collecting)});if view.samples.len()>LIMIT{view.samples.remove(0);}}
 }
-fn persist(state:&mut State){let root=settings::root();let saved=Saved{schema:1,entries:state.view.entries.clone(),samples:state.view.samples.clone()};if fs::create_dir_all(root.join("logs")).is_err()||settings::write_json(&root.join("logs/flow-v1.json"),&saved).is_err(){state.view.error=Some("连接记录尚未写入磁盘，已有历史已保留。".into());}else{state.last_saved=Some(Instant::now());}}
-pub fn flush(){if let Ok(mut state)=state().lock(){if state.writable&&state.view.enabled{persist(&mut state);}}}
+fn persist(state:&mut State)->Result<(),String>{
+    let root=settings::root();
+    let saved=Saved{schema:1,entries:state.view.entries.clone(),samples:state.view.samples.clone()};
+    let result=fs::create_dir_all(root.join("logs")).map_err(|e|e.to_string()).and_then(|_|settings::write_json(&root.join("logs/flow-v1.json"),&saved));
+    if let Err(error)=result{
+        let reason=format!("连接记录尚未写入磁盘：{error}");
+        state.view.error=Some(reason.clone());return Err(reason)
+    }
+    state.last_saved=Some(Instant::now());state.view.error=None;Ok(())
+}
+pub fn flush(){if let Ok(mut state)=state().lock(){if state.writable&&state.view.enabled{let _=persist(&mut state);}}}
 pub fn maybe_sample(traffic:&TrafficSnapshot){
     let Ok(mut state)=state().try_lock()else{return};if !state.view.enabled||!state.writable||state.last.is_some_and(|last|last.elapsed()<Duration::from_secs(5)){return}state.last=Some(Instant::now());
-    match crate::runtime_details::connections(){Ok(connections)=>{merge(&mut state.view,connections,traffic);state.view.error=None;if state.last_saved.is_none_or(|last|last.elapsed()>=Duration::from_secs(30)){persist(&mut state);}},Err(error)=>state.view.error=Some(error)}
+    match crate::runtime_details::connections(){Ok(connections)=>{merge(&mut state.view,connections,traffic);state.view.error=None;if state.last_saved.is_none_or(|last|last.elapsed()>=Duration::from_secs(30)){let _=persist(&mut state);}},Err(error)=>state.view.error=Some(error)}
 }
 #[cfg(test)]mod tests{use super::*;#[test]fn endpoint_history_is_validated_and_pid_reuse_is_distinct(){let mut row=Entry{first_at:1,last_at:2,pid:3,created:"100".into(),process:"codex.exe".into(),local:"127.0.0.1:1000".into(),remote:"127.0.0.1:7890".into(),present:true};assert!(valid(&row));row.remote="https://private.example/path".into();assert!(!valid(&row));row.remote="[::1]:7890".into();assert!(valid(&row));row.created="not-a-filetime".into();assert!(!valid(&row));}}

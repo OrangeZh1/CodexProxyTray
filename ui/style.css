@@ -707,3 +707,5 @@ html[data-input-modality="pointer"] :is(.fui-Button,.fui-Tab,.fui-Option,.fui-Me
 .app-update-steps .active { color: var(--accent); }
 .app-update-steps .complete { color: var(--good); }
 .app-update-steps .symbol { width: 16px; height: 16px; }
+
+.log-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; }

@@ -128,11 +128,19 @@ fn relay(shared:&Arc<Shared>,stop:&Arc<AtomicBool>,mode:EnableMode)->Result<(),S
     shared.stop_confirmed.store(false,Ordering::Release);
     let result=(||->Result<(),String>{
         pipe.write(&ToCollector::Targets{protocol:PROTOCOL,targets},||child.alive())?;let mut last_message=Instant::now();let mut terminal=false;
+        let mut retries=0;let mut sent_at=Instant::now();
         loop{
             if stop.load(Ordering::Acquire){return Ok(())}
             match accept_frame(shared,&pipe){Ok(Some(state))=>{last_message=Instant::now();terminal=matches!(state,TrafficState::NeedsPermission|TrafficState::Unavailable);},Err(_)if terminal&&shared.stop_confirmed.load(Ordering::Acquire)=>return Ok(()),Err(error)=>return Err(error),Ok(None)=>{}}
             if !child.alive(){if shared.stop_confirmed.load(Ordering::Acquire){return Ok(())}return Err("采样进程退出，但系统会话停止未确认。".into())}
-            let(next,targets)={let targets=shared.targets.lock().map_err(|_|"采样进程名单不可用。")?;(targets.0,targets.1.clone())};if next!=version{pipe.write(&ToCollector::Targets{protocol:PROTOCOL,targets},||child.alive())?;version=next;}
+            let(next,targets)={let targets=shared.targets.lock().map_err(|_|"采样进程名单不可用。")?;(targets.0,targets.1.clone())};if next!=version {retries=0;}
+            let retry=retries<3 && sent_at.elapsed()>=Duration::from_secs(5)
+                && shared.snapshot.lock().is_ok_and(|sample|sample.partial);
+            if next!=version || retry {
+                pipe.write(&ToCollector::Targets{protocol:PROTOCOL,targets},||child.alive())?;
+                if next==version {retries+=1;}
+                version=next;sent_at=Instant::now();
+            }
             if last_message.elapsed()>Duration::from_secs(6){return Err("采样进程响应超时。".into())}thread::sleep(Duration::from_millis(20));
         }
     })();
@@ -172,7 +180,7 @@ fn measured_snapshot(sample:EngineSample,previous:&mut Option<(Instant,u64,u64)>
         *previous=Some((at,sample.sent,sample.received));value
     };
     snapshot.buffer_limited=sample.buffer_limited;snapshot.partial=sample.partial;snapshot.missed_bindings=sample.missed_bindings;snapshot.first_missed_at=sample.first_missed_at;snapshot.last_missed_at=sample.last_missed_at;
-    if sample.partial&&matches!(snapshot.state,TrafficState::Collecting|TrafficState::Starting){snapshot.message=Some("部分短命进程在绑定前已退出或身份发生变化；仅统计已验证进程，累计可能不完整。".into());}
+    if sample.partial&&matches!(snapshot.state,TrafficState::Collecting|TrafficState::Starting){snapshot.message=Some("已跳过无法确认归属或已退出的进程；继续统计已验证目标，累计可能不完整。".into());}
     if sample.buffer_limited{snapshot.message=Some("待核验计量缓冲达到上限，本次累计无法确认完整。".into());}
     snapshot.target_count=sample.target_count;snapshot.lost_events=sample.lost_events;snapshot.lost_buffers=sample.lost_buffers;snapshot
 }

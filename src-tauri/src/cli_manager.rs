@@ -6,17 +6,18 @@ use crate::settings::{self,Config};
 
 const REGISTRY:&str="https://registry.npmjs.org";
 const PACKAGE:&str="@openai/codex";
+static CANCEL:AtomicBool=AtomicBool::new(false);
 static BUSY:AtomicBool=AtomicBool::new(false);
 static MUTATING:AtomicBool=AtomicBool::new(false);
 static STATE:OnceLock<Mutex<CliState>>=OnceLock::new();
 
 #[derive(Clone,Debug,Serialize)]
 pub struct CliState {
-    pub detected:bool,pub supported:bool,pub source:String,pub current:Option<String>,pub latest:Option<String>,
+    pub operation_id:u64,pub detected:bool,pub supported:bool,pub source:String,pub current:Option<String>,pub latest:Option<String>,
     pub target_token:Option<String>,pub checked_at:Option<u64>,pub operation:Option<String>,pub progress:String,
     pub error:Option<String>,pub reason:Option<String>,pub install_path:Option<String>,pub install_token:Option<String>,
 }
-impl Default for CliState{fn default()->Self{Self{detected:false,supported:false,source:"unknown".into(),current:None,latest:None,target_token:None,checked_at:None,operation:None,progress:String::new(),error:None,reason:Some("尚未识别 CLI 安装来源。".into()),install_path:None,install_token:None}}}
+impl Default for CliState{fn default()->Self{Self{operation_id:0,detected:false,supported:false,source:"unknown".into(),current:None,latest:None,target_token:None,checked_at:None,operation:None,progress:String::new(),error:None,reason:Some("尚未识别 CLI 安装来源。".into()),install_path:None,install_token:None}}}
 fn state()->&'static Mutex<CliState>{STATE.get_or_init(||Mutex::new(CliState::default()))}
 pub fn snapshot()->CliState{state().lock().unwrap_or_else(|error|error.into_inner()).clone()}
 pub fn is_mutating()->bool{MUTATING.load(Ordering::Acquire)}
@@ -27,7 +28,8 @@ impl Operation{
         let lease=crate::app_update::management()?;
         BUSY.compare_exchange(false,true,Ordering::AcqRel,Ordering::Acquire).map_err(|_|"另一个 CLI 管理操作仍在进行。".to_owned())?;
         MUTATING.store(mutating,Ordering::Release);let mut view=state().lock().unwrap_or_else(|error|error.into_inner());
-        view.operation=Some(name.into());view.progress=match name{"check"=>"正在检查 Codex CLI 最新版本。","install"=>"正在准备当前用户 npm 安装。","update"=>"正在验证 CLI 安装和活动进程。","uninstall"=>"正在验证要卸载的 CLI。",_=>"正在识别 CLI 安装来源。"}.into();view.error=None;Ok(Self{_lease:lease})
+        CANCEL.store(false,Ordering::Release);
+        view.operation_id=view.operation_id.wrapping_add(1);view.operation=Some(name.into());view.progress=match name{"check"=>"正在检查 Codex CLI 最新版本。","install"=>"正在准备当前用户 npm 安装。","update"=>"正在验证 CLI 安装和活动进程。","uninstall"=>"正在验证要卸载的 CLI。",_=>"正在识别 CLI 安装来源。"}.into();view.error=None;Ok(Self{_lease:lease})
     }
 }
 impl Drop for Operation{fn drop(&mut self){let mut view=state().lock().unwrap_or_else(|error|error.into_inner());view.operation=None;if view.error.is_none(){view.progress.clear();}drop(view);MUTATING.store(false,Ordering::Release);BUSY.store(false,Ordering::Release);}}
@@ -89,7 +91,7 @@ fn local_install()->Result<Option<Install>,String>{
 fn new_install_target()->Result<Install,String>{
     if !settings::detect_cli(&settings::root()).is_empty(){return Err("已有 Codex CLI，未创建重复安装。".into())}
     let prefix=PathBuf::from(std::env::var_os("APPDATA").filter(|v|!v.is_empty()).ok_or("无法确定当前用户目录。")?).join("npm");
-    let paths=std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).collect::<Vec<_>>();let node=paths.into_iter().map(|p|p.join("node.exe")).find(|p|p.is_file()).ok_or("请先安装带 npm 的 Node.js，再安装 Codex CLI。")?;
+    let paths=std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).collect::<Vec<_>>();let node=paths.into_iter().filter(|p|p.is_absolute()).map(|p|p.join("node.exe")).find(|p|p.is_file()).ok_or("请先安装带 npm 的 Node.js，再安装 Codex CLI。")?;
     inspect_new_target(node,prefix)
 }
 fn inspect_new_target(node:PathBuf,prefix:PathBuf)->Result<Install,String>{
@@ -152,18 +154,54 @@ fn mutation_args(install:&Install,action:Mutation,version:Option<&str>,scratch:&
     args.push(match action{Mutation::Install|Mutation::Update=>format!("{PACKAGE}@{}",version.filter(|value|valid_version(value)).ok_or("缺少已验证的目标版本。")?),Mutation::Uninstall=>PACKAGE.into()});
     args.extend(["--global".into(),"--prefix".into(),install.prefix.display().to_string(),"--ignore-scripts".into(),"--no-audit".into(),"--no-fund".into(),"--progress=false".into(),"--update-notifier=false".into(),"--registry".into(),REGISTRY.into(),format!("--@openai:registry={REGISTRY}"),"--userconfig".into(),scratch.join("user.npmrc").display().to_string(),"--globalconfig".into(),scratch.join("global.npmrc").display().to_string(),"--fetch-timeout=30000".into(),"--fetch-retries=1".into()]);Ok(args)
 }
-fn drain(mut reader:impl Read)->String{let mut tail=vec![];let mut chunk=[0u8;4096];while let Ok(count)=reader.read(&mut chunk){if count==0{break}tail.extend_from_slice(&chunk[..count]);if tail.len()>16384{tail.drain(..tail.len()-16384);}}String::from_utf8_lossy(&tail).into_owned()}
+pub fn cancel(id:u64)->Result<(),String>{
+    let mut view=state().lock().unwrap_or_else(|e|e.into_inner());
+    if id!=view.operation_id || !matches!(view.operation.as_deref(),Some("install"|"update"|"uninstall")){return Err("此 CLI 操作已结束。".into())}
+    CANCEL.store(true,Ordering::Release);view.progress="正在取消，请等待本次 npm 进程退出。".into();Ok(())
+}
+fn drain_available(reader:&mut std::process::ChildStderr,tail:&mut Vec<u8>){
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::{Foundation::HANDLE,System::Pipes::PeekNamedPipe};
+    let mut available=0;
+    if unsafe{PeekNamedPipe(HANDLE(reader.as_raw_handle()),None,0,None,Some(&mut available),None)}.is_err(){return}
+    let mut chunk=[0;4096];
+    let mut remaining=available.min(65536) as usize;
+    while remaining>0{
+        let size=remaining.min(chunk.len());
+        let Ok(n)=reader.read(&mut chunk[..size]) else{break};
+        if n==0{break}
+        tail.extend_from_slice(&chunk[..n]);remaining-=n;
+    }
+    if tail.len()>16384{tail.drain(..tail.len()-16384);}
+}
 fn execute_npm(install:&Install,args:&[String],config:&Config,action:Mutation)->Result<(),String>{
-    let mut command=Command::new(&install.node);command.args(args).current_dir(&install.prefix).creation_flags(0x08000000).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).env_clear();
+    let mut command=Command::new(&install.node);command.args(args).current_dir(&install.prefix).creation_flags(0x08000000).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped()).env_clear();
     for name in ["SystemRoot","WINDIR","TEMP","TMP","USERPROFILE","LOCALAPPDATA","APPDATA","PATH","PATHEXT","ComSpec"]{if let Some(value)=std::env::var_os(name){command.env(name,value);}}
     // The package is public; user npmrc, scope registry overrides and Node hooks are not inherited.
     command.env("NPM_CONFIG_UPDATE_NOTIFIER","false").env("NPM_CONFIG_YES","true").env("NPM_CONFIG_LOGS_MAX","0");
     if !matches!(action,Mutation::Uninstall){command.env("HTTP_PROXY",&config.proxy_url).env("HTTPS_PROXY",&config.proxy_url).env("ALL_PROXY",&config.proxy_url).env("NO_PROXY","localhost,127.0.0.1,::1");}
+    if CANCEL.load(Ordering::Acquire){return Err("本次 CLI 操作已取消。".into())}
     let mut child=command.spawn().map_err(|_|"无法启动已验证的 npm 管理器。")?;
-    let stdout=child.stdout.take().ok_or("无法读取 npm 输出。")?;let stderr=child.stderr.take().ok_or("无法读取 npm 错误。")?;
-    let out=thread::spawn(move||drain(stdout));let err=thread::spawn(move||drain(stderr));let started=Instant::now();
-    let status=loop{match child.try_wait(){Ok(Some(status))=>break status,Ok(None)=>{progress(format!("npm 正在{} Codex CLI，已运行 {} 秒。",match action{Mutation::Install=>"安装",Mutation::Update=>"更新",Mutation::Uninstall=>"卸载"},started.elapsed().as_secs()));thread::sleep(Duration::from_millis(250));},Err(_)=>{let status=child.wait().map_err(|_|"无法确认 npm 的最终状态，请查看安装目录后再操作。")?;break status}}};
-    let output=out.join().unwrap_or_default()+&err.join().unwrap_or_default();
+    let mut stderr=child.stderr.take().expect("piped npm stderr");
+    let started=Instant::now();let mut tail=Vec::new();
+    let status=loop{
+        drain_available(&mut stderr,&mut tail);
+        let poll=child.try_wait();
+        if let Ok(Some(status))=poll{break status}
+        let cancelled=CANCEL.load(Ordering::Acquire);
+        if cancelled || started.elapsed()>=Duration::from_secs(300) || poll.is_err(){
+            if child.kill().is_err() && !child.try_wait().is_ok_and(|exit|exit.is_some()){
+                return Err("无法停止本次 npm 操作，请查看本机进程状态。".into())
+            }
+            child.wait().map_err(|_|"无法确认本次 npm 进程已退出。")?;
+            let reason=if cancelled{"已取消"}else if poll.is_err(){"状态读取失败"}else{"超过五分钟时限"};
+            return Err(format!("npm {reason}，本次进程已退出。请检查重新识别的安装状态。"))
+        }
+        progress(format!("npm 正在{} Codex CLI，已运行 {} 秒。",match action{Mutation::Install=>"安装",Mutation::Update=>"更新",Mutation::Uninstall=>"卸载"},started.elapsed().as_secs()));
+        thread::sleep(Duration::from_millis(150));
+    };
+    drain_available(&mut stderr,&mut tail);
+    let output=String::from_utf8_lossy(&tail);
     if !status.success(){let code=output.lines().find_map(|line|line.trim().strip_prefix("npm error code ")).filter(|value|value.len()<=48&&value.chars().all(|value|value.is_ascii_alphanumeric()||value=='_')).unwrap_or("UNKNOWN");return Err(format!("npm {}未完成（退出码 {}，{}）。安装文件可能已变化，请重新检查安装状态；用户配置和历史未由助手删除。",match action{Mutation::Install=>"安装",Mutation::Update=>"更新",Mutation::Uninstall=>"卸载"},status.code().map_or("未知".into(),|value|value.to_string()),code))}Ok(())
 }
 fn active_cli(root:&Path,install:&Install)->Result<bool,String>{

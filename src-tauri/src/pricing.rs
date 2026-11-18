@@ -82,15 +82,54 @@ fn parse(bytes:&[u8])->Result<ReferenceData,String>{
     }
     if entries.is_empty(){return Err("models.dev 暂无可读取的 OpenAI 文本模型。".into())}Ok(ReferenceData{models,catalog:entries})
 }
+fn decode_catalog(wire:Vec<u8>, encoding:&str)->Result<Vec<u8>,String>{
+    match encoding {
+        ""|"identity"=>Ok(wire),
+        "gzip"=>{
+            let mut decoded=Vec::new();
+            flate2::read::MultiGzDecoder::new(wire.as_slice()).take(MAX_CATALOG+1)
+                .read_to_end(&mut decoded).map_err(|_|"gzip 正文不完整或校验失败。")?;
+            if decoded.len() as u64>MAX_CATALOG{return Err("解压后的价格目录超过 12 MiB。".into())}
+            Ok(decoded)
+        }
+        _=>Err("价格目录使用了不支持的内容编码。".into())
+    }
+}
+fn fetch_once(client:&reqwest::blocking::Client)->Result<ReferenceData,(String,bool)>{
+    let start=Instant::now();
+    let response=client.get(SOURCE).header(reqwest::header::ACCEPT_ENCODING,"gzip").send()
+        .map_err(|error|(format!("models.dev 请求失败（{}，{} ms）。",if error.is_timeout(){"等待响应超时"}else if error.is_connect(){"连接代理或 TLS 握手失败"}else{"未取得响应头"},start.elapsed().as_millis()),true))?;
+    let status=response.status();
+    let length=response.content_length();
+    if !status.is_success(){return Err((format!("models.dev 返回 HTTP {}（{} ms）。",status.as_u16(),start.elapsed().as_millis()),status.is_server_error()))}
+    let encoding=response.headers().get(reqwest::header::CONTENT_ENCODING).map(|v|v.to_str().unwrap_or("unsupported").to_ascii_lowercase()).unwrap_or_default();
+    if length.is_some_and(|n|n>MAX_CATALOG){return Err(("models.dev 声明的价格目录超过 12 MiB。".into(),false))}
+    let mut wire=Vec::new();
+    let result=response.take(MAX_CATALOG+1).read_to_end(&mut wire);
+    let diagnostic=||format!("HTTP {}，已收 {} / {} 字节，{} ms",status.as_u16(),wire.len(),length.map_or_else(||"未知".into(),|n|n.to_string()),start.elapsed().as_millis());
+    if let Err(error)=result{return Err((format!("价格正文读取失败（{}，{:?}）。",diagnostic(),error.kind()),true))}
+    if wire.len() as u64>MAX_CATALOG{return Err(("models.dev 价格正文超过 12 MiB。".into(),false))}
+    if length.is_some_and(|n|n!=wire.len() as u64){return Err((format!("价格正文提前结束（{}）。",diagnostic()),true))}
+    let summary=diagnostic();
+    let decoded=decode_catalog(wire,encoding.trim()).map_err(|error|(format!("{error}（{summary}）"),false))?;
+    parse(&decoded).map_err(|error|(format!("{error}（{summary}）"),false))
+}
 fn fetch(config:&crate::settings::Config)->Result<ReferenceData,String>{
-    let client=reqwest::blocking::Client::builder().no_proxy().timeout(Duration::from_secs(15)).redirect(reqwest::redirect::Policy::none())
+    let client=reqwest::blocking::Client::builder().no_proxy().connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(45)).redirect(reqwest::redirect::Policy::none())
         .user_agent(concat!("CodexProxyTray/",env!("CARGO_PKG_VERSION")))
-        .proxy(reqwest::Proxy::all(&config.proxy_url).map_err(|_|"本地代理设置无效。")?).build().map_err(|_|"价格同步暂不可用。")?;
-    let response=client.get(SOURCE).send().map_err(|_|"无法连接 models.dev，请检查本地代理。")?;
-    if !response.status().is_success(){return Err("models.dev 暂不可用，已保留现有价格。".into())}
-    if response.content_length().is_some_and(|size|size>MAX_CATALOG){return Err("models.dev 价格目录超过允许范围。".into())}
-    let mut bytes=vec![];response.take(MAX_CATALOG+1).read_to_end(&mut bytes).map_err(|_|"models.dev 价格目录读取失败。")?;
-    if bytes.len()as u64>MAX_CATALOG{return Err("models.dev 价格目录超过允许范围。".into())}parse(&bytes)
+        .proxy(reqwest::Proxy::all(&config.proxy_url).map_err(|_|"本地代理设置无效。")?).build().map_err(|_|"价格同步客户端创建失败。")?;
+    match fetch_once(&client) {
+        Ok(data)=>Ok(data),
+        Err((reason,false))=>Err(reason),
+        Err((first,true))=>{
+            std::thread::sleep(Duration::from_millis(300));
+            if !crate::settings::load(&crate::settings::root()).is_ok_and(|next|next.network_enabled&&next.proxy_url==config.proxy_url){
+                return Err(format!("{first} 联网设置已改变，已停止重试。"))
+            }
+            fetch_once(&client).map_err(|(last,_)|format!("首次：{first} 重试：{last}"))
+        }
+    }
 }
 fn view(cache:&Cache,network_enabled:bool,force:bool,throttled:Option<u64>)->Snapshot{
     let now=crate::settings::now();let preferences=sync_preferences().lock().unwrap_or_else(|error|error.into_inner());
@@ -133,18 +172,35 @@ pub fn reload()->Result<Snapshot,String>{
     let mut snapshot=view(&cache,network_enabled,false,None);snapshot.error=cache.error.clone();Ok(snapshot)
 }
 pub fn open_directory()->Result<(),String>{let root=crate::settings::root();fs::create_dir_all(&root).map_err(|_|"无法准备本机价格目录。")?;crate::native::open(&root.to_string_lossy()).map_err(|_|"无法打开本机价格目录。".into())}
-pub fn record_auto_result(tx:&Sender<crate::worker::Message>,result:&Result<Snapshot,String>){let settings_failed=sync_preferences().lock().map_or(true,|preferences|preferences.error.is_some());if settings_failed||!result.as_ref().is_ok_and(|value|!value.network_enabled||!value.auto_sync_enabled){crate::event_log::read_state(tx,crate::event_log::ReadState::Prices,result.as_ref().map_or(true,|value|value.error.is_some()),"价格","模型参考价格自动同步未完成","模型参考价格当前可读取");}}
+pub fn record_result(tx:&Sender<crate::worker::Message>,result:&Result<Snapshot,String>,manual:bool){
+    if !manual && result.as_ref().is_ok_and(|v|(!v.network_enabled||!v.auto_sync_enabled)&&sync_preferences().lock().is_ok_and(|p|p.error.is_none())) {return}
+    let reason=match result {Err(error)=>Some(error.as_str()),Ok(view)=>view.error.as_deref()};
+    let failed=reason.is_some();
+    if crate::event_log::changed(crate::event_log::ReadState::Prices,failed).is_some() || manual {
+        let message=match (manual,failed){(true,true)=>"模型参考价格同步未完成",(true,false)=>"模型参考价格同步已结束",(false,true)=>"模型参考价格自动同步未完成",(false,false)=>"模型参考价格当前可读取"};
+        let _=crate::event_log::note(tx,if failed{"warning"}else{"info"},"价格",message,reason.unwrap_or(""));
+    }
+}
 struct AutoRun;
 impl Drop for AutoRun{fn drop(&mut self){AUTO_RUNNING.store(false,Ordering::Release);}}
 /// Worker-side scheduling does no disk/network work and never waits for a fetch.
 pub fn maybe_automatic(config:&crate::settings::Config,tx:&Sender<crate::worker::Message>){
     if !config.network_enabled||!AUTO_ENABLED.load(Ordering::Acquire){return}let Ok(mut checked)=AUTO_CHECK.try_lock()else{return};if checked.is_some_and(|at|at.elapsed()<Duration::from_secs(60)){return}
     if AUTO_RUNNING.compare_exchange(false,true,Ordering::AcqRel,Ordering::Acquire).is_err(){return}*checked=Some(Instant::now());drop(checked);let sender=tx.clone();
-    if std::thread::Builder::new().name("usage-price-sync".into()).spawn(move||{let _run=AutoRun;let result=read(false);record_auto_result(&sender,&result);}).is_err(){AUTO_RUNNING.store(false,Ordering::Release);crate::event_log::read_state(tx,crate::event_log::ReadState::Prices,true,"价格","模型参考价格自动同步未能启动","模型参考价格当前可读取");}
+    if std::thread::Builder::new().name("usage-price-sync".into()).spawn(move||{let _run=AutoRun;let result=read(false);record_result(&sender,&result,false);}).is_err(){AUTO_RUNNING.store(false,Ordering::Release);crate::event_log::read_state(tx,crate::event_log::ReadState::Prices,true,"价格","模型参考价格自动同步未能启动","模型参考价格当前可读取","Windows 未能创建后台同步线程。");}
 }
 
 #[cfg(test)]mod tests{
     use super::*;
+    #[test]fn compressed_catalog_accepts_gzip_and_rejects_truncation(){
+        use std::io::Write;
+        let mut gzip=flate2::write::GzEncoder::new(Vec::new(),flate2::Compression::fast());
+        gzip.write_all(b"sample").unwrap();
+        let mut bytes=gzip.finish().unwrap();
+        assert_eq!(decode_catalog(bytes.clone(),"gzip").unwrap(),b"sample");
+        bytes.pop();assert!(decode_catalog(bytes,"gzip").is_err());
+        assert!(decode_catalog(vec![],"br").is_err());
+    }
     #[test]fn public_prices_require_complete_original_text_rates_and_preserve_units(){
         let bytes=br#"{"openai":{"models":{"gpt-fixture":{"modalities":{"output":["text"]},"cost":{"input":1.25,"output":10,"cache_read":0.125}},"missing-cache":{"modalities":{"output":["text"]},"cost":{"input":2,"output":3}},"image":{"modalities":{"output":["image"]},"cost":{"input":1,"output":2,"cache_read":0}},"negative":{"modalities":{"output":["text"]},"cost":{"input":-1,"output":2,"cache_read":0}}}},"reseller":{"models":{"gpt-fixture":{"modalities":{"output":["text"]},"cost":{"input":"unsupported reseller schema","output":99,"cache_read":99}}}}}"#;
         let reference=parse(bytes).unwrap();let prices=reference.models;assert_eq!(prices.len(),2);assert_eq!(prices["gpt-fixture"].input,1.25);assert_eq!(prices["openai/gpt-fixture"].cached,0.125);assert!(!prices.contains_key("missing-cache"));assert_eq!(reference.catalog.len(),3);assert_eq!(reference.catalog["missing-cache"].cached,None);assert_eq!(reference.catalog["negative"].input,None);assert!(parse(br#"{"other":{"models":{}}}"#).is_err());

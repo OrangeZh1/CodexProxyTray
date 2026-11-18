@@ -25,8 +25,8 @@ const PRODUCT:&str="CodexProxyTray.TrafficService";
 const FILE_SDDL:&str="O:BAG:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)";
 const PROTOCOL:u32=2;
 // Independent of the GUI release. Raise the minimum only for required helper fixes.
-const SERVICE_VERSION:&str="1.0.1";
-const MIN_SERVICE_VERSION:&str="1.0.1";
+const SERVICE_VERSION:&str="1.0.2";
+const MIN_SERVICE_VERSION:&str="1.0.2";
 const MAX_FRAME:usize=4096;
 static SELF_HASH:OnceLock<Result<String,String>>=OnceLock::new();
 static STOP:AtomicBool=AtomicBool::new(false);
@@ -438,10 +438,13 @@ impl CollectorScope{
         for lease in discovered{if !lease_belongs_to(&lease,&self.owner_sid){continue}if let Some((seen,_))=self.allowed.get_mut(&lease.identity){*seen=now;}else{if self.allowed.len()>=4096{return Err("辅助服务进程交接保留数量达到上限。".into())}self.allowed.insert(lease.identity,(now,lease));}}
         let mut accepted=Vec::new();for &identity in requested{
             if self.allowed.contains_key(&identity){accepted.push(identity);continue}
-            let alive=match crate::traffic::open_lifetime_identity(identity).map_err(win)?{Some(process)=>match unsafe{WaitForSingleObject(process.0,0)}{WAIT_TIMEOUT=>true,WAIT_OBJECT_0=>false,_=>return Err("辅助服务无法核验目标进程状态。".into())},None=>false};
-            if alive{return Err(format!("目标进程不属于已核验的 ChatGPT / Codex CLI 范围，已拒绝采样（PID {}，创建标识 {}；服务未能独立确认应用根或完整父链）。",identity.pid,identity.created_filetime))}
-            // An exited identity without our own application-scope proof never enters ETW bindings.
-            if self.missed.len()>=4096&&!self.missed.contains(&identity){return Err("辅助服务遗漏身份记录达到上限。".into())}if self.missed.insert(identity){let at=crate::settings::now();self.first_missed=Some(self.first_missed.map_or(at,|first|first.min(at)));self.last_missed=Some(at);}
+            // Only the service's independently proven identities enter the ETW filter.
+            // Keep a bounded set for the partial-coverage indication, including live misses.
+            if self.missed.len()<4096 && self.missed.insert(identity) {
+                let at=crate::settings::now();
+                self.first_missed.get_or_insert(at);
+                self.last_missed=Some(at);
+            }
         }Ok(accepted)
     }
     pub(crate) fn mark_sample(&self,sample:&mut crate::traffic_etw::EngineSample){
@@ -559,7 +562,15 @@ pub(crate) fn start_collector(token:&str,parent:ProcessIdentity)->Result<OwnedHa
         scope.allowed.get_mut(&child).ok_or("scope_child_proof_missing")?.0=Instant::now()-Duration::from_secs(61);if !scope.targets(&[child])?.contains(&child){return Err("scope_live_child_expired".into())}checks.push("live_child_proof_survives_sixty_seconds");
         let wrong=ProcessIdentity{pid:child.pid,created_filetime:child.created_filetime.saturating_add(1)};if scope.targets(&[wrong])?.contains(&wrong){return Err("scope_wrong_creation_accepted".into())}checks.push("wrong_creation_excluded");
         let other=fixture.directory.join("other-scope");fs::create_dir(&other).map_err(|_|"scope_other_directory")?;let mut unrelated=ScopeFixture::start(&other)?;
-        let root_rejected=scope.targets(&[unrelated.parent_identity()?]).is_err();let child_rejected=scope.targets(&[unrelated.child_identity()]).is_err();let unrelated_rejected=scope.targets(&[identity_on(unsafe{GetCurrentProcess()}).map_err(win)?]).is_err();unrelated.finish()?;
+        let other_root=unrelated.parent_identity()?;
+        let other_child=unrelated.child_identity();
+        let caller=identity_on(unsafe{GetCurrentProcess()}).map_err(win)?;
+        let mixed=scope.targets(&[child,other_root,other_child,caller])?;
+        let root_rejected=!mixed.contains(&other_root);
+        let child_rejected=!mixed.contains(&other_child);
+        let unrelated_rejected=!mixed.contains(&caller);
+        if mixed!=[child]{return Err("scope_verified_sibling_lost".into())}
+        unrelated.finish()?;
         if !root_rejected||!child_rejected||!unrelated_rejected{return Err("scope_unrelated_alive_accepted".into())}checks.extend(["same_name_other_path_rejected","other_scope_child_rejected","unrelated_alive_rejected"]);Ok((leases,checks))
     }
     #[test]fn exited_application_root_handoff_preserves_live_child_without_trusting_requested_identity(){
@@ -633,14 +644,14 @@ pub(crate) fn start_collector(token:&str,parent:ProcessIdentity)->Result<OwnedHa
         let root=std::env::temp_dir().join(format!("codex-traffic-scope-{}-{}",std::process::id(),crate::settings::now()));fs::create_dir(&root).unwrap();
         let mut scope=CollectorScope::new(unsafe{GetCurrentProcess()}).unwrap();scope.root=root.clone();
         let(identity,_,_,lease)=unsafe{crate::native::process_identity_with_lease(std::process::id())}.unwrap();assert!(lease_belongs_to(&lease,&scope.owner_sid));
-        assert!(scope.targets(&[identity]).is_err());
+        assert!(scope.targets(&[identity]).unwrap().is_empty());
         scope.allowed.insert(identity,(Instant::now()-Duration::from_secs(59),lease));assert_eq!(scope.targets(&[identity]).unwrap(),vec![identity]);
         scope.allowed.get_mut(&identity).unwrap().0=Instant::now()-Duration::from_secs(61);assert_eq!(scope.targets(&[identity]).unwrap(),vec![identity]);
         let mut child=Command::new(std::env::current_exe().unwrap()).args(["--exact","traffic_etw::tests::short_lived_binding_fixture"]).env("CODEX_TRAFFIC_BINDING_FIXTURE","1").creation_flags(0x08000000).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
         let(exited,_,_,held)=unsafe{crate::native::process_identity_with_lease(child.id())}.unwrap();assert!(lease_belongs_to(&held,&scope.owner_sid));scope.allowed.insert(exited,(Instant::now(),held));child.stdin.take().unwrap().write_all(b"x").unwrap();assert!(child.wait().unwrap().success());
         assert_eq!(scope.targets(&[exited]).unwrap(),vec![exited]);scope.allowed.get_mut(&exited).unwrap().0=Instant::now()-Duration::from_secs(61);assert!(scope.targets(&[exited]).unwrap().is_empty());
         let unknown=ProcessIdentity{pid:u32::MAX,created_filetime:1};assert!(scope.targets(&[unknown]).unwrap().is_empty());
-        let mut sample=crate::traffic_etw::EngineSample{buffer_limited:false,missed_bindings:0,first_missed_at:None,last_missed_at:None,sent:0,received:0,seen:false,had_targets:false,partial:false,target_count:0,lost_events:Some(0),lost_buffers:Some(0),error:None};scope.mark_sample(&mut sample);assert!(sample.partial&&sample.had_targets);assert_eq!(sample.missed_bindings,2);assert!(sample.first_missed_at.is_some());
+        let mut sample=crate::traffic_etw::EngineSample{buffer_limited:false,missed_bindings:0,first_missed_at:None,last_missed_at:None,sent:0,received:0,seen:false,had_targets:false,partial:false,target_count:0,lost_events:Some(0),lost_buffers:Some(0),error:None};scope.mark_sample(&mut sample);assert!(sample.partial&&sample.had_targets);assert_eq!(sample.missed_bindings,3);assert!(sample.first_missed_at.is_some());
         fs::write(root.join("config.json"),br#"{"new_gui_feature":{"enabled":true},"network_enabled":"future-format","cli_command":[]}"#).unwrap();assert!(scope.targets(&[]).is_ok());
         for invalid in [b"{broken".as_slice(),br#"{"cli_command":null}"#.as_slice(),br#"{"cli_command":"codex.exe"}"#.as_slice(),br#"{"cli_command":[1]}"#.as_slice(),b"[]".as_slice()]{fs::write(root.join("config.json"),invalid).unwrap();assert!(scope.targets(&[]).is_err());let mut token=HANDLE::default();let error=unsafe{OpenThreadToken(GetCurrentThread(),TOKEN_QUERY,true,&mut token)}.unwrap_err();assert_eq!(code(&error),1008);}
         for command in [vec!["x".repeat(32768)],vec!["x".into();17]]{fs::write(root.join("config.json"),serde_json::to_vec(&serde_json::json!({"cli_command":command})).unwrap()).unwrap();assert!(scope.targets(&[]).is_err());}

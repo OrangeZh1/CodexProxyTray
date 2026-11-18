@@ -101,13 +101,32 @@ fn owned_path(path:&Path,root:&Path)->bool{
     let root=root.canonicalize().unwrap_or_else(|_|root.to_path_buf()).to_string_lossy().replace('/',"\\").to_lowercase();
     path.starts_with(&(root.trim_end_matches('\\').to_owned()+"\\"))
 }
+fn npm_entry()->Option<PathBuf>{
+    let base=PathBuf::from(std::env::var_os("APPDATA")?);
+    base.is_absolute().then(||base.join("npm/node_modules/@openai/codex/bin/codex.js"))
+}
+fn named_program(path:&Path,name:&str,root:&Path)->bool{
+    path.is_absolute() && path.file_name().is_some_and(|part|part.eq_ignore_ascii_case(name))
+        && path.is_file() && !owned_path(path,root)
+        && path.canonicalize().is_ok_and(|real|real.file_name().is_some_and(|part|part.eq_ignore_ascii_case(name)))
+}
 pub fn command_available(command:&[String],root:&Path)->bool{
-    let Some(program)=command.first().map(PathBuf::from)else{return false};
-    if !program.is_file()||owned_path(&program,root){return false}
-    if program.file_name().is_some_and(|name|name.to_string_lossy().eq_ignore_ascii_case("node.exe")){
-        return command.get(1).is_some_and(|script|Path::new(script).is_file());
+    match command {
+        [exe]=>named_program(Path::new(exe),"codex.exe",root),
+        [exe,script] if named_program(Path::new(exe),"node.exe",root)=>{
+            let Some(expected)=npm_entry() else{return false};
+            let script=Path::new(script);
+            if !script.is_absolute()||!script.is_file()||!script.canonicalize().is_ok_and(|real|expected.canonicalize().is_ok_and(|entry|entry==real)){return false}
+            let Some(package)=expected.parent().and_then(Path::parent) else{return false};
+            let metadata=fs::File::open(package.join("package.json")).ok().and_then(|f|{
+                use std::io::Read;
+                if f.metadata().ok()?.len()>262144{return None}
+                serde_json::from_reader::<_,serde_json::Value>(f.take(262145)).ok()
+            });
+            metadata.is_some_and(|json|json["name"]=="@openai/codex" && json["bin"]["codex"]=="bin/codex.js")
+        }
+        _=>false,
     }
-    true
 }
 pub fn normalized_executable(path:&Path)->String{path.canonicalize().unwrap_or_else(|_|path.to_path_buf()).to_string_lossy().replace('/',"\\").trim_start_matches("\\\\?\\").to_lowercase()}
 pub fn cli_process_paths(root:&Path,config:&Config)->Vec<String>{
@@ -131,10 +150,20 @@ pub fn cli_process_paths(root:&Path,config:&Config)->Vec<String>{
     let mut result=paths.into_iter().filter(|path|path.is_file()).map(|path|normalized_executable(&path)).collect::<Vec<_>>();result.sort();result.dedup();result
 }
 pub fn detect_cli(root:&Path)->Vec<String>{
-    let npm=PathBuf::from(std::env::var_os("APPDATA").unwrap_or_default()).join("npm/node_modules/@openai/codex/bin/codex.js");
-    let paths=std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).collect::<Vec<_>>();
-    if npm.is_file(){if let Some(node)=paths.iter().map(|p|p.join("node.exe")).find(|p|p.is_file()){return vec![node.to_string_lossy().into(),npm.to_string_lossy().into()]}}
-    for path in paths{let exe=path.join("codex.exe");if exe.is_file()&&!owned_path(&exe,root){return vec![exe.to_string_lossy().into()]}}
+    let paths=std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+        .filter(|path|path.is_absolute()).collect::<Vec<_>>();
+    if let Some(script)=npm_entry().filter(|p|p.is_file()){
+        for directory in &paths {
+            let node=directory.join("node.exe");
+            if !node.is_file(){continue}
+            let command=vec![node.to_string_lossy().into_owned(),script.to_string_lossy().into_owned()];
+            if command_available(&command,root){return command}
+        }
+    }
+    for directory in paths {
+        let exe=directory.join("codex.exe");
+        if named_program(&exe,"codex.exe",root){return vec![exe.to_string_lossy().into_owned()]}
+    }
     vec![]
 }
 pub fn cli_lookup_info(root:&Path)->serde_json::Value {

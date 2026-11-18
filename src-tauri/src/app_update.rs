@@ -58,7 +58,8 @@ pub fn snapshot()->Progress{
     state
 }
 
-pub fn busy()->bool{GATE.lock().unwrap_or_else(|e|e.into_inner()).updating}
+pub fn downloading()->bool{GATE.lock().unwrap_or_else(|e|e.into_inner()).downloading}
+pub fn busy()->bool{let gate=GATE.lock().unwrap_or_else(|e|e.into_inner());gate.downloading||gate.updating}
 enum LeaseKind{Management,Download,Install}
 pub struct Lease{kind:LeaseKind}
 impl Drop for Lease{fn drop(&mut self){let mut gate=GATE.lock().unwrap_or_else(|e|e.into_inner());match self.kind{LeaseKind::Management=>gate.management=gate.management.saturating_sub(1),LeaseKind::Download=>{gate.downloading=false;view().lock().unwrap_or_else(|e|e.into_inner()).busy=false;},LeaseKind::Install=>{gate.updating=false;view().lock().unwrap_or_else(|e|e.into_inner()).busy=false;}}}}
@@ -124,12 +125,12 @@ pub fn prepare(expected:String)->Result<Prepared,String>{
         stage=DownloadStage::Checksums;download(&client,&format!("{base}/SHA256SUMS.txt"),&job.join("release-sums.txt"),65536,false).map_err(|error|format!("获取更新校验清单未完成：{error}"))?;
         let sums=fs::read_to_string(job.join("release-sums.txt")).map_err(|_|"官方校验清单不可读取。")?;let zip_hash=checksum(&sums,&name)?;let manifest_hash=checksum(&sums,"CodexProxyTray-update.json")?;
         stage=DownloadStage::Manifest;download(&client,&format!("{base}/CodexProxyTray-update.json"),&job.join("manifest.json"),65536,false).map_err(|error|format!("获取更新说明未完成：{error}"))?;
+        download(&client,&format!("{base}/CodexProxyTray-update.json.p7s"),&job.join("manifest.p7s"),65536,false).map_err(|error|format!("无法取得发布者签名，本次更新已停止：{error}"))?;
         stage=DownloadStage::Package;download(&client,&format!("{base}/{name}"),&job.join("package.zip"),MAX_ZIP,true).map_err(|error|format!("下载安装包未完成：{error}"))?;stage=DownloadStage::Plan;
         let exe=std::env::current_exe().map_err(|_|"无法确定当前安装位置。")?;
         let identity=unsafe{crate::traffic::identity_on(windows::Win32::System::Threading::GetCurrentProcess())}.map_err(|_|"无法核验助手进程。")?;
         settings::write_json(&job.join("plan.json"),&serde_json::json!({"schema":1,"product":"CodexProxyTray","version":expected,"zip_sha256":zip_hash,"manifest_sha256":manifest_hash,"executable":exe,"data_root":root,"parent_pid":std::process::id(),"parent_created":identity.created_filetime.to_string()}))?;
-        stage=DownloadStage::Prepare;phase("verifying");let mut child=command(&job,"Prepare").spawn().map_err(|_|"无法启动安装包校验。")?;wait_prepare(&mut child,&job)?;stage=DownloadStage::Network;
-        if !settings::load(&root).is_ok_and(|c|c.network_enabled){return Err("联网检测已关闭，更新已停止，原程序保持运行。".into())}
+        stage=DownloadStage::Prepare;phase("verifying");let mut child=command(&job,"Prepare").spawn().map_err(|_|"无法启动安装包校验。")?;wait_prepare(&mut child,&job)?;
         Ok(job)
     })();
     match result{Ok(job)=>Ok(Prepared{job,version:expected,_lease:Some(lease)}),Err(error)=>Err(download_failed(error,job_name,stage))}
@@ -150,6 +151,7 @@ pub fn install_ready(expected:String)->Result<Prepared,String>{
     let exe=std::env::current_exe().map_err(|_|"无法核验当前助手。")?;
     if plan["schema"]!=1||plan["product"]!="CodexProxyTray"||plan["version"]!=expected||plan["executable"].as_str().is_none_or(|path|settings::normalized_executable(Path::new(path))!=settings::normalized_executable(&exe)){return Err("安装目录或下载记录已变化，未开始替换。".into())}
     let identity=unsafe{crate::traffic::identity_on(windows::Win32::System::Threading::GetCurrentProcess())}.map_err(|_|"无法核验助手进程。")?;plan["parent_pid"]=serde_json::json!(std::process::id());plan["parent_created"]=serde_json::json!(identity.created_filetime.to_string());settings::write_json(&package.job.join("plan.json"),&plan)?;
+    fs::write(package.job.join("installer.ps1"),format!("\u{feff}{SCRIPT}")).map_err(|_|"无法写入当前版本的校验程序。")?;
     package.handoff()
 }
 

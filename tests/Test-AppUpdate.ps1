@@ -104,16 +104,43 @@ function Case([string]$Name){
     WaitFor {try{$value=Get-Content -LiteralPath (Join-Path $data 'ui-ready-main.json') -Raw|ConvertFrom-Json;$value.helper_pid -eq $case.parent.Id -and $value.rendered}catch{$false}} 45 'Initial helper did not render'
     return $case
 }
-function Job($Case,[string]$Archive){$path=Join-Path $Case.data ('updates\'+$Case.parent.Id+'-'+[DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds());[void](New-Item -ItemType Directory -Path $path);Copy-Item -LiteralPath $Archive -Destination (Join-Path $path 'package.zip');Copy-Item -LiteralPath (Join-Path $release 'CodexProxyTray-update.json') -Destination (Join-Path $path 'manifest.json');Copy-Item -LiteralPath (Join-Path $release 'SHA256SUMS.txt') -Destination (Join-Path $path 'release-sums.txt');[IO.File]::WriteAllText((Join-Path $path 'installer.ps1'),[IO.File]::ReadAllText((Join-Path $PSScriptRoot '..\src-tauri\src\install_update.ps1')),[Text.UTF8Encoding]::new($true));WriteJson (Join-Path $path 'plan.json') @{schema=1;product='CodexProxyTray';version=$manifest.version;zip_sha256=Hash (Join-Path $path 'package.zip');manifest_sha256=Hash (Join-Path $path 'manifest.json');executable=$Case.exe;data_root=$Case.data;parent_pid=$Case.parent.Id;parent_created=$Case.parent.StartTime.ToUniversalTime().ToFileTimeUtc().ToString()};$Case.job=$path;return $path}
+function New-SignedFixtureArchive([string]$Directory,[string]$Destination){
+    foreach($name in @('CodexProxyTray.exe','codex-proxy-cli.exe')){
+        $signed=Set-AuthenticodeSignature -LiteralPath (Join-Path $Directory $name) -Certificate $testCert -HashAlgorithm SHA256
+        if($signed.Status -ne 'Valid'){throw "Fixture PE signing failed: $($signed.Status)"}
+    }
+    $receiptPath=Join-Path $Directory 'package-receipt.json'
+    $receipt=Get-Content -LiteralPath $receiptPath -Raw|ConvertFrom-Json
+    foreach($file in $receipt.files){$file.sha256=Hash (Join-Path $Directory $file.name)}
+    WriteJson $receiptPath $receipt
+    $sums=Get-ChildItem -LiteralPath $Directory -File|Where-Object Name -ne 'SHA256SUMS.txt'|ForEach-Object {"$(Hash $_.FullName)  $($_.Name)"}
+    [IO.File]::WriteAllText((Join-Path $Directory 'SHA256SUMS.txt'),(($sums -join [Environment]::NewLine)+[Environment]::NewLine),[Text.UTF8Encoding]::new($false))
+    Compress-Archive -LiteralPath @(Get-ChildItem -LiteralPath $Directory|Select-Object -ExpandProperty FullName) -DestinationPath $Destination
+}
+function Job($Case,[string]$Archive){$path=Join-Path $Case.data ('updates\'+$Case.parent.Id+'-'+[DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds());[void](New-Item -ItemType Directory -Path $path);Copy-Item -LiteralPath $Archive -Destination (Join-Path $path 'package.zip');Copy-Item -LiteralPath (Join-Path $release 'CodexProxyTray-update.json') -Destination (Join-Path $path 'manifest.json');Copy-Item -LiteralPath (Join-Path $release 'SHA256SUMS.txt') -Destination (Join-Path $path 'release-sums.txt');[IO.File]::WriteAllText((Join-Path $path 'installer.ps1'),[IO.File]::ReadAllText((Join-Path $PSScriptRoot '..\src-tauri\src\install_update.ps1')),[Text.UTF8Encoding]::new($true));$manifest.zip_sha256=Hash $Archive;WriteJson (Join-Path $path 'manifest.json') $manifest
+    & (Join-Path $PSScriptRoot '../scripts/sign-update-manifest.ps1') -ManifestPath (Join-Path $path 'manifest.json') -ArchivePath $Archive -Certificate $testCert -SignaturePath (Join-Path $path 'manifest.p7s')
+    WriteJson (Join-Path $path 'plan.json') @{schema=1;product='CodexProxyTray';version=$manifest.version;zip_sha256=Hash (Join-Path $path 'package.zip');manifest_sha256=Hash (Join-Path $path 'manifest.json');executable=$Case.exe;data_root=$Case.data;parent_pid=$Case.parent.Id;parent_created=$Case.parent.StartTime.ToUniversalTime().ToFileTimeUtc().ToString()};$Case.job=$path;return $path}
 function Installer($Case,[string]$Phase){$shell=Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe';StartOwned $Case $shell @('-NoLogo','-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',(Join-Path $Case.job 'installer.ps1'),'-Phase',$Phase,'-Job',$Case.job) $Case.target}
 function Quit($Case){$quitter=StartOwned $Case $Case.exe @('--quit');try{[void]$quitter.WaitForExit(10000);WaitFor {$Case.parent.HasExited} 20 'Owned helper refused graceful quit'}finally{$quitter.Dispose()}}
 function StopCase($Case){foreach($process in @(Get-CimInstance Win32_Process -Filter "name='CodexProxyTray.exe'"|Where-Object {$_.ExecutablePath -and $_.ExecutablePath.StartsWith($Case.directory+'\',[StringComparison]::OrdinalIgnoreCase)})){$request=$null;$owned=$null;try{$request=StartOwned $Case $process.ExecutablePath @('--quit');[void]$request.WaitForExit(10000);$owned=Get-Process -Id $process.ProcessId -ErrorAction SilentlyContinue;if($owned -and -not $owned.WaitForExit(10000)){throw 'Owned fixture did not stop; diagnostic tree retained'}}finally{if($owned){$owned.Dispose()};if($request){$request.Dispose()}}}}
 $cases=@()
 try {
     if(@(Get-Process -Name CodexProxyTray -ErrorAction SilentlyContinue).Count){throw 'Another helper exists; it was not touched.'}
+    $testCert=New-SelfSignedCertificate -Type CodeSigningCert -Subject ('CN=CodexProxyTray CI '+[Guid]::NewGuid()) -CertStoreLocation Cert:\CurrentUser\My -KeyExportPolicy NonExportable -NotAfter (Get-Date).AddDays(1)
+    $trust=[Security.Cryptography.X509Certificates.X509Store]::new('Root','CurrentUser')
+    $trust.Open('ReadWrite')
+    $publicCert=[Security.Cryptography.X509Certificates.X509Certificate2]::new($testCert.RawData)
+    $trust.Add($publicCert)
+    $fixturePayload=Join-Path $root 'signed-payload'
+    [IO.Compression.ZipFile]::ExtractToDirectory($zip,$fixturePayload)
+    $zip=Join-Path $root 'signed-test.zip'
+    New-SignedFixtureArchive $fixturePayload $zip
     $good=Case 'success';$cases+=$good;$job=Job $good $zip
     $planPath=Join-Path $job 'plan.json';$plan=Get-Content -LiteralPath $planPath -Raw|ConvertFrom-Json;$validHash=$plan.zip_sha256;$plan.zip_sha256='0'*64;WriteJson $planPath $plan
     $check=Installer $good 'Prepare';$finished=$check.WaitForExit(45000);$outcome=Get-Content -LiteralPath (Join-Path $job 'result.json') -Raw|ConvertFrom-Json;Require ($finished -and $check.ExitCode -ne 0 -and -not $good.parent.HasExited -and $outcome.error -match 'SHA-256 校验失败') 'corrupt_archive_rejected_before_quit'
+    $job=Job $good $zip
+    $sig=Join-Path $job 'manifest.p7s';$altered=[IO.File]::ReadAllBytes($sig);$altered[$altered.Length-1]=$altered[$altered.Length-1] -bxor 1;[IO.File]::WriteAllBytes($sig,$altered)
+    $check=Installer $good 'Prepare';Require ($check.WaitForExit(45000) -and $check.ExitCode -ne 0 -and -not $good.parent.HasExited) 'modified_publisher_signature_rejected'
     $unknown=Join-Path $good.target 'user-notes.txt';[IO.File]::WriteAllText($unknown,'owned synthetic probe');$job=Job $good $zip;$check=Installer $good 'Prepare';Require ($check.WaitForExit(45000) -and $check.ExitCode -ne 0 -and (Test-Path -LiteralPath $unknown) -and -not $good.parent.HasExited) 'unknown_install_file_is_retained_and_blocks_update';Remove-Item -LiteralPath $unknown
     # Use a fresh task ID; previous failed evidence is retained.
     $job=Job $good $zip;$check=Installer $good 'Prepare';Require ($check.WaitForExit(45000) -and $check.ExitCode -eq 0) 'valid_official_package_and_layout_accepted'
@@ -135,9 +162,7 @@ try {
     $code=Join-Path $bad.directory 'NoReadiness.cs';[IO.File]::WriteAllText($code,('[assembly:System.Reflection.AssemblyFileVersion("'+$manifest.version+'.0")][assembly:System.Reflection.AssemblyInformationalVersion("'+$manifest.version+'")]class Program{static void Main(){System.IO.File.WriteAllText(System.IO.Path.Combine(System.Environment.GetEnvironmentVariable("LOCALAPPDATA"),"module-path-observed.txt"),System.Environment.GetEnvironmentVariable("PSModulePath")??"");System.IO.File.WriteAllText(System.IO.Path.Combine(System.Environment.GetEnvironmentVariable("LOCALAPPDATA"),"policy-observed.txt"),System.Environment.GetEnvironmentVariable("PSExecutionPolicyPreference")??"");System.IO.File.Delete(System.IO.Path.Combine(System.Environment.GetEnvironmentVariable("LOCALAPPDATA"),"CodexProxyTray","config.json"));}}'))
     & (Join-Path $env:SystemRoot 'Microsoft.NET\Framework64\v4.0.30319\csc.exe') /nologo /target:winexe ("/out:"+(Join-Path $fake 'CodexProxyTray.exe')) $code
     if($LASTEXITCODE -ne 0){throw 'Synthetic executable did not compile'}
-    $receiptPath=Join-Path $fake 'package-receipt.json';$receipt=Get-Content -LiteralPath $receiptPath -Raw|ConvertFrom-Json;foreach($file in $receipt.files){$file.sha256=Hash (Join-Path $fake $file.name)};WriteJson $receiptPath $receipt
-    $sums=@(Get-ChildItem -LiteralPath $fake|Where-Object Name -ne 'SHA256SUMS.txt'|ForEach-Object {"$(Hash $_.FullName)  $($_.Name)"});[IO.File]::WriteAllText((Join-Path $fake 'SHA256SUMS.txt'),(($sums -join "`n")+"`n"),[Text.UTF8Encoding]::new($false))
-    $fakeZip=Join-Path $bad.directory 'fake.zip';Compress-Archive -LiteralPath @(Get-ChildItem -LiteralPath $fake|Select-Object -ExpandProperty FullName) -DestinationPath $fakeZip
+    $fakeZip=Join-Path $bad.directory 'fake.zip';New-SignedFixtureArchive $fake $fakeZip
     $job=Job $bad $fakeZip;$check=Installer $bad 'Prepare';Require ($check.WaitForExit(45000) -and $check.ExitCode -eq 0) 'synthetic_failure_package_validates_without_bypass'
     $installer=Installer $bad 'Apply';$bad.installer=$installer;WaitFor {Test-Path -LiteralPath (Join-Path $job 'handoff-ready.json')} 10 'Rollback installer handoff failed';Quit $bad
     Require ($installer.WaitForExit(60000) -and $installer.ExitCode -ne 0) 'unready_candidate_does_not_report_success'
@@ -163,6 +188,8 @@ try {
     $report.status='passed'
 } catch {$report.status='failed';$report['error']=$_.Exception.Message;$report['diagnostic_root']=$root;throw}
 finally {
+    if($trust){try{if($publicCert){$trust.Remove($publicCert)}}finally{$trust.Close()}}
+    if($testCert){Remove-Item -LiteralPath ('Cert:\CurrentUser\My\'+$testCert.Thumbprint) -DeleteKey}
     $cleanupFailure=$null
     try {
         try{foreach($case in $cases){foreach($jobFolder in @(Get-ChildItem -LiteralPath (Join-Path $case.data 'updates') -Directory -ErrorAction SilentlyContinue)){foreach($name in @('result.json','plan.json','verified.json','handoff-ready.json','receipt-lifecycle.json','pre-active-version.json','pre-install-journal.json')){$path=Join-Path $jobFolder.FullName $name;if(Test-Path -LiteralPath $path){Copy-Item -LiteralPath $path -Destination (Join-Path $EvidenceDirectory ((Split-Path -Leaf $case.directory)+'-'+$jobFolder.Name+'-'+$name))}}}}}catch{$cleanupFailure=$_;$report.status='failed';$report.cleanup='retained_for_diagnosis';$report['cleanup_error_code']='evidence_copy_failed'}
