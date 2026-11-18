@@ -101,6 +101,20 @@ fn fetch_once(client:&reqwest::blocking::Client)->Result<ReferenceData,(String,b
         .map_err(|error|(format!("models.dev 请求失败（{}，{} ms）。",if error.is_timeout(){"等待响应超时"}else if error.is_connect(){"连接代理或 TLS 握手失败"}else{"未取得响应头"},start.elapsed().as_millis()),true))?;
     read_catalog_response(response,start)
 }
+fn body_failure(error:&std::io::Error)->&'static str{
+    let mut cause=error.get_ref().map(|inner|inner as &(dyn std::error::Error+'static));
+    while let Some(inner)=cause{
+        if inner.downcast_ref::<reqwest::Error>().is_some_and(|e|e.is_timeout()) {return "读取超时"}
+        if inner.downcast_ref::<std::io::Error>().is_some_and(|e|e.kind()==std::io::ErrorKind::TimedOut){return "读取超时"}
+        cause=inner.source();
+    }
+    match error.kind(){
+        std::io::ErrorKind::TimedOut=>"读取超时",
+        std::io::ErrorKind::UnexpectedEof=>"正文提前结束",
+        std::io::ErrorKind::ConnectionReset|std::io::ErrorKind::ConnectionAborted=>"连接中断",
+        _=>"正文传输中断",
+    }
+}
 fn read_catalog_response(response:reqwest::blocking::Response,start:Instant)->Result<ReferenceData,(String,bool)>{
     let status=response.status();
     let length=response.content_length();
@@ -110,7 +124,7 @@ fn read_catalog_response(response:reqwest::blocking::Response,start:Instant)->Re
     let mut wire=Vec::new();
     let result=response.take(MAX_CATALOG+1).read_to_end(&mut wire);
     let diagnostic=||format!("HTTP {}，已收 {} / {} 字节，{} ms",status.as_u16(),wire.len(),length.map_or_else(||"未知".into(),|n|n.to_string()),start.elapsed().as_millis());
-    if let Err(error)=result{return Err((format!("价格正文读取失败（{}，{:?}）。",diagnostic(),error.kind()),true))}
+    if let Err(error)=result{return Err((format!("价格正文{}（{}，{:?}）。",body_failure(&error),diagnostic(),error.kind()),true))}
     if wire.len() as u64>MAX_CATALOG{return Err(("models.dev 价格正文超过 12 MiB。".into(),false))}
     if length.is_some_and(|n|n!=wire.len() as u64){return Err((format!("价格正文提前结束（{}）。",diagnostic()),true))}
     let summary=diagnostic();

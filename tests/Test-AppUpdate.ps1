@@ -127,7 +127,8 @@ $cases=@()
 try {
     if(@(Get-Process -Name CodexProxyTray -ErrorAction SilentlyContinue).Count){throw 'Another helper exists; it was not touched.'}
     $testCert=New-SelfSignedCertificate -Type CodeSigningCert -Subject ('CN=CodexProxyTray CI '+[Guid]::NewGuid()) -CertStoreLocation Cert:\CurrentUser\My -KeyExportPolicy NonExportable -NotAfter (Get-Date).AddDays(1)
-    $trust=[Security.Cryptography.X509Certificates.X509Store]::new('Root','CurrentUser')
+    # The disposable elevated runner uses the machine store to avoid interactive per-user trust prompts.
+    $trust=[Security.Cryptography.X509Certificates.X509Store]::new('Root','LocalMachine')
     $trust.Open('ReadWrite')
     $publicCert=[Security.Cryptography.X509Certificates.X509Certificate2]::new($testCert.RawData)
     $trust.Add($publicCert)
