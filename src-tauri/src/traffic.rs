@@ -40,7 +40,16 @@ impl Coordinator{
     pub fn enable(&mut self,mode:EnableMode)->Result<(),String>{
         self.stop_sampling(false)?;put(&self.shared,TrafficSnapshot::state(TrafficState::Starting,Some("正在建立本用户的进程流量采样。".into())));
         let shared=self.shared.clone();let stop=Arc::new(AtomicBool::new(false));let signal=stop.clone();
-        let thread=thread::Builder::new().name("traffic-ipc".into()).spawn(move||{if let Err(message)=relay(&shared,&signal,mode){put(&shared,TrafficSnapshot::state(TrafficState::Unavailable,Some(message)));}}).map_err(|_|"流量统计通信线程未能启动。")?;
+        let thread=thread::Builder::new().name("traffic-ipc".into()).spawn(move||{
+            for attempt in 0..4{
+                if signal.load(Ordering::Acquire){break}
+                if let Err(message)=relay(&shared,&signal,mode){put(&shared,TrafficSnapshot::state(TrafficState::Unavailable,Some(message)));break}
+                let scope_refused=shared.snapshot.lock().is_ok_and(|v|v.state==TrafficState::Unavailable&&v.message.as_deref().is_some_and(|text|text.starts_with(crate::traffic_service::NO_VERIFIED_SCOPE)));
+                if attempt==3 || !scope_refused || !shared.stop_confirmed.load(Ordering::Acquire){break}
+                let deadline=Instant::now()+Duration::from_secs(5);
+                while !signal.load(Ordering::Acquire)&&Instant::now()<deadline{thread::sleep(Duration::from_millis(100));}
+            }
+        }).map_err(|_|"流量统计通信线程未能启动。")?;
         self.running=Some(Running{stop,thread});Ok(())
     }
     pub fn disable(&mut self)->Result<(),String>{self.stop_sampling(true)}

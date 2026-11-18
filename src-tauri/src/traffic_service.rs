@@ -5,6 +5,7 @@ use serde::{Deserialize,Serialize};
 use windows::{core::{PCWSTR,PWSTR},Win32::{Foundation::*,Security::{*,Authorization::*,Cryptography::*},Storage::FileSystem::*,System::{Diagnostics::ToolHelp::*,Pipes::*,Services::*,Threading::*},UI::Shell::{SHGetFolderPathW,ShellExecuteExW,SHELLEXECUTEINFOW,SEE_MASK_NOCLOSEPROCESS}}};
 use crate::{traffic::{OwnedHandle,identity_on,open_identity},traffic_core::ProcessIdentity};
 
+pub(crate) const NO_VERIFIED_SCOPE:&str="目标进程不属于已核验的 ChatGPT / Codex CLI 范围";
 const NAME:&str="CodexProxyTrayTraffic";
 const DISPLAY:&str="CodexProxyTray Traffic Collector";
 const PIPE:&str=r"\\.\pipe\CodexProxyTray.Traffic.Service.v2";
@@ -419,10 +420,10 @@ fn scope_config(root:&Path)->Result<crate::settings::Config,String>{
 }
 fn lease_belongs_to(lease:&crate::native::ProcessLease,owner:&str)->bool{process_sid(HANDLE(lease.as_handle())).is_ok_and(|sid|sid==owner)}
 pub(crate) struct CollectorScope{
-    user:UserContext,root:PathBuf,owner_sid:String,allowed:HashMap<ProcessIdentity,(Instant,crate::native::ProcessLease)>,missed:HashSet<ProcessIdentity>,pub(crate) last_unverified:Option<ProcessIdentity>,first_missed:Option<u64>,last_missed:Option<u64>,
+    user:UserContext,root:PathBuf,owner_sid:String,allowed:HashMap<ProcessIdentity,(Instant,crate::native::ProcessLease)>,missed:HashSet<ProcessIdentity>,had_verified_request:bool,pub(crate) last_unverified:Option<ProcessIdentity>,first_missed:Option<u64>,last_missed:Option<u64>,
 }
 impl CollectorScope{
-    pub(crate) fn new(parent:HANDLE)->Result<Self,String>{let owner_sid=process_sid(parent)?;let user=UserContext::from_parent(parent)?;let root=user.root()?;Ok(Self{user,root,owner_sid,allowed:HashMap::new(),missed:HashSet::new(),last_unverified:None,first_missed:None,last_missed:None})}
+    pub(crate) fn new(parent:HANDLE)->Result<Self,String>{let owner_sid=process_sid(parent)?;let user=UserContext::from_parent(parent)?;let root=user.root()?;Ok(Self{user,root,owner_sid,allowed:HashMap::new(),missed:HashSet::new(),had_verified_request:false,last_unverified:None,first_missed:None,last_missed:None})}
     pub(crate) fn targets(&mut self,requested:&[ProcessIdentity])->Result<Vec<ProcessIdentity>,String>{
         crate::traffic_core::validate_targets(requested)?;let now=Instant::now();let mut expired=Vec::new();
         for (&identity,(seen,lease)) in &mut self.allowed{
@@ -446,7 +447,18 @@ impl CollectorScope{
                 self.first_missed.get_or_insert(at);
                 self.last_missed=Some(at);
             }
-        }Ok(accepted)
+        }
+        // An empty initial list is allowed for a waiting GUI. It must not grant an
+        // arbitrary same-user client an active trace for an entirely unrelated live list.
+        if !accepted.is_empty(){self.had_verified_request=true;}
+        if !self.had_verified_request{
+            for &identity in &unknown{
+                if crate::traffic::open_identity(identity).map_err(win)?.is_some(){
+                    return Err(format!("{NO_VERIFIED_SCOPE}（PID {}，创建标识 {}）。尚无可独立核验的采样目标。",identity.pid,identity.created_filetime))
+                }
+            }
+        }
+        Ok(accepted)
     }
     pub(crate) fn mark_sample(&self,sample:&mut crate::traffic_etw::EngineSample){
         if self.missed.is_empty(){return}sample.partial=true;sample.had_targets=true;sample.missed_bindings=sample.missed_bindings.saturating_add(self.missed.len()as u64);sample.first_missed_at=match(sample.first_missed_at,self.first_missed){(Some(a),Some(b))=>Some(a.min(b)),(a,b)=>a.or(b)};sample.last_missed_at=match(sample.last_missed_at,self.last_missed){(Some(a),Some(b))=>Some(a.max(b)),(a,b)=>a.or(b)};
@@ -645,7 +657,7 @@ pub(crate) fn start_collector(token:&str,parent:ProcessIdentity)->Result<OwnedHa
         let root=std::env::temp_dir().join(format!("codex-traffic-scope-{}-{}",std::process::id(),crate::settings::now()));fs::create_dir(&root).unwrap();
         let mut scope=CollectorScope::new(unsafe{GetCurrentProcess()}).unwrap();scope.root=root.clone();
         let(identity,_,_,lease)=unsafe{crate::native::process_identity_with_lease(std::process::id())}.unwrap();assert!(lease_belongs_to(&lease,&scope.owner_sid));
-        assert!(scope.targets(&[identity]).unwrap().is_empty());
+        assert!(scope.targets(&[identity]).is_err());
         scope.allowed.insert(identity,(Instant::now()-Duration::from_secs(59),lease));assert_eq!(scope.targets(&[identity]).unwrap(),vec![identity]);
         scope.allowed.get_mut(&identity).unwrap().0=Instant::now()-Duration::from_secs(61);assert_eq!(scope.targets(&[identity]).unwrap(),vec![identity]);
         let mut child=Command::new(std::env::current_exe().unwrap()).args(["--exact","traffic_etw::tests::short_lived_binding_fixture"]).env("CODEX_TRAFFIC_BINDING_FIXTURE","1").creation_flags(0x08000000).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
