@@ -433,20 +433,34 @@ try {
         $before=RootSnapshot
         Require ((RunInstaller $setup) -ne 0 -and (RunUninstaller) -ne 0 -and (RootSnapshot) -ceq $before -and (Test-Path -LiteralPath $reg)) 'protected_code_recovery_reference_blocks_upgrade_and_uninstall'
     }finally{[IO.File]::WriteAllBytes($activePath,$activeBytes)}
-    $configPath=Join-Path $data 'config.json';$originalConfig=[IO.File]::ReadAllBytes($configPath);$shim=$null;$ping=$null;$ownsPing=$false
+    $configPath=Join-Path $data 'config.json';$originalConfig=[IO.File]::ReadAllBytes($configPath);$shim=$null;$childProcess=$null
+    $holdRoot=Join-Path $work 'active-cli-fixture';$stopFile=Join-Path $holdRoot 'stop'
     try {
+        $roaming=Join-Path $holdRoot 'roaming'
+        $package=Join-Path $roaming 'npm/node_modules/@openai/codex'
+        [void](New-Item -ItemType Directory -Path (Join-Path $package 'bin') -Force)
+        WriteJson (Join-Path $package 'package.json') @{name='@openai/codex';bin=@{codex='bin/codex.js'}}
+        $script=Join-Path $package 'bin/codex.js'
+        $js="const fs=require('node:fs'); const stop=process.env.QA_CLI_STOP; const until=Date.now()+120000; const timer=setInterval(()=>{if(fs.existsSync(stop)||Date.now()>until)clearInterval(timer)},100);"
+        [IO.File]::WriteAllText($script,$js,[Text.UTF8Encoding]::new($false))
+        $node=(Get-Command node.exe -CommandType Application -ErrorAction Stop|Select-Object -First 1).Source
         $config=[Text.Encoding]::UTF8.GetString($originalConfig)|ConvertFrom-Json
-        $pingPath=Join-Path $env:SystemRoot 'System32\PING.EXE'
-        $config|Add-Member -NotePropertyName cli_command -NotePropertyValue @($pingPath,'-t','127.0.0.1') -Force;WriteJson $configPath $config
-        $info=[Diagnostics.ProcessStartInfo]::new((Join-Path $installRoot 'current\codex-proxy-cli.exe'));$info.UseShellExecute=$false;$info.CreateNoWindow=$true;$info.WindowStyle='Hidden';$info.RedirectStandardOutput=$true;$info.RedirectStandardError=$true
-        $info.Environment['PATH']=Join-Path $env:SystemRoot 'System32';$info.Environment['APPDATA']=Join-Path $work 'empty-roaming'
-        $shim=[Diagnostics.Process]::Start($info);$stdout=$shim.StandardOutput.ReadToEndAsync();$stderr=$shim.StandardError.ReadToEndAsync();$deadline=[DateTime]::UtcNow.AddSeconds(10)
-        do {$child=Get-CimInstance Win32_Process -Filter "Name='PING.EXE' AND ParentProcessId=$($shim.Id)"|Where-Object {$_.ExecutablePath -ieq $pingPath}|Select-Object -First 1;if($child){$ping=Get-Process -Id $child.ProcessId;[void]$ping.SafeHandle;break};if($shim.HasExited){throw 'synthetic_cli_hold_exited'};Start-Sleep -Milliseconds 100}while([DateTime]::UtcNow -lt $deadline)
-        Require ($null -ne $ping -and $ping.Path -ieq $pingPath -and $ping.StartTime.ToUniversalTime() -ge $shim.StartTime.ToUniversalTime() -and $ping.StartTime.ToUniversalTime().ToString('yyyyMMddHHmmss.ffffff') -ceq $child.CreationDate.ToUniversalTime().ToString('yyyyMMddHHmmss.ffffff')) 'only_owned_loopback_cli_fixture'
-        $ownsPing=$true
-        $before=RootSnapshot;Require ((RunInstaller $setup) -ne 0 -and -not $shim.HasExited -and -not $ping.HasExited -and (RootSnapshot) -ceq $before) 'active_cli_is_not_stopped_or_overwritten'
+        $config|Add-Member -NotePropertyName cli_command -NotePropertyValue @($node,$script) -Force;WriteJson $configPath $config
+        $info=[Diagnostics.ProcessStartInfo]::new((Join-Path $installRoot 'current\codex-proxy-cli.exe'));$info.UseShellExecute=$false;$info.CreateNoWindow=$true;$info.WindowStyle='Hidden'
+        $info.Environment['PATH']=[IO.Path]::GetDirectoryName($node)+';'+(Join-Path $env:SystemRoot 'System32')
+        $info.Environment['APPDATA']=$roaming;$info.Environment['QA_CLI_STOP']=$stopFile
+        $shim=[Diagnostics.Process]::Start($info);$deadline=[DateTime]::UtcNow.AddSeconds(10)
+        do {
+            $child=Get-CimInstance Win32_Process -Filter "Name='node.exe' AND ParentProcessId=$($shim.Id)"|Where-Object {$_.ExecutablePath -ieq $node}|Select-Object -First 1
+            if($child){$childProcess=Get-Process -Id $child.ProcessId;[void]$childProcess.SafeHandle;break}
+            if($shim.HasExited){throw 'synthetic_cli_hold_exited'}
+            Start-Sleep -Milliseconds 100
+        }while([DateTime]::UtcNow -lt $deadline)
+        Require ($null -ne $childProcess -and $childProcess.Path -ieq $node -and $childProcess.StartTime.ToUniversalTime() -ge $shim.StartTime.ToUniversalTime() -and $childProcess.StartTime.ToUniversalTime().ToString('yyyyMMddHHmmss.ffffff') -ceq $child.CreationDate.ToUniversalTime().ToString('yyyyMMddHHmmss.ffffff')) 'only_owned_cli_fixture'
+        $before=RootSnapshot;Require ((RunInstaller $setup) -ne 0 -and -not $shim.HasExited -and -not $childProcess.HasExited -and (RootSnapshot) -ceq $before) 'active_cli_is_not_stopped_or_overwritten'
     } finally {
-        if($ping){if($ownsPing -and -not $ping.HasExited){$ping.Kill();[void]$ping.WaitForExit(5000)};$ping.Dispose()}
+        if(Test-Path -LiteralPath $holdRoot){[IO.File]::WriteAllText($stopFile,'stop')}
+        if($childProcess){$childProcess.Dispose()}
         if($shim){if(-not $shim.WaitForExit(10000)){throw 'owned_cli_fixture_cleanup_blocked'};$shim.Dispose()}
         [IO.File]::WriteAllBytes($configPath,$originalConfig)
     }
