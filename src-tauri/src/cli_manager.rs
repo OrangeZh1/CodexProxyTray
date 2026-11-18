@@ -164,8 +164,11 @@ fn drain_available(reader:&mut std::process::ChildStderr,tail:&mut Vec<u8>){
     use windows::Win32::{Foundation::HANDLE,System::Pipes::PeekNamedPipe};
     let mut available=0;
     if unsafe{PeekNamedPipe(HANDLE(reader.as_raw_handle()),None,0,None,Some(&mut available),None)}.is_err(){return}
+    read_tail(reader,available as usize,tail);
+}
+fn read_tail(reader:&mut impl Read,available:usize,tail:&mut Vec<u8>){
     let mut chunk=[0;4096];
-    let mut remaining=available.min(65536) as usize;
+    let mut remaining=available.min(65536);
     while remaining>0{
         let size=remaining.min(chunk.len());
         let Ok(n)=reader.read(&mut chunk[..size]) else{break};
@@ -180,7 +183,10 @@ fn execute_npm(install:&Install,args:&[String],config:&Config,action:Mutation)->
     // The package is public; user npmrc, scope registry overrides and Node hooks are not inherited.
     command.env("NPM_CONFIG_UPDATE_NOTIFIER","false").env("NPM_CONFIG_YES","true").env("NPM_CONFIG_LOGS_MAX","0");
     if !matches!(action,Mutation::Uninstall){command.env("HTTP_PROXY",&config.proxy_url).env("HTTPS_PROXY",&config.proxy_url).env("ALL_PROXY",&config.proxy_url).env("NO_PROXY","localhost,127.0.0.1,::1");}
-    if CANCEL.load(Ordering::Acquire){return Err("本次 CLI 操作已取消。".into())}
+    supervise_npm(command,action,&CANCEL,Duration::from_secs(300))
+}
+fn supervise_npm(mut command:Command,action:Mutation,cancel:&AtomicBool,limit:Duration)->Result<(),String>{
+    if cancel.load(Ordering::Acquire){return Err("本次 CLI 操作已取消。".into())}
     let mut child=command.spawn().map_err(|_|"无法启动已验证的 npm 管理器。")?;
     let mut stderr=child.stderr.take().expect("piped npm stderr");
     let started=Instant::now();let mut tail=Vec::new();
@@ -188,8 +194,8 @@ fn execute_npm(install:&Install,args:&[String],config:&Config,action:Mutation)->
         drain_available(&mut stderr,&mut tail);
         let poll=child.try_wait();
         if let Ok(Some(status))=poll{break status}
-        let cancelled=CANCEL.load(Ordering::Acquire);
-        if cancelled || started.elapsed()>=Duration::from_secs(300) || poll.is_err(){
+        let cancelled=cancel.load(Ordering::Acquire);
+        if cancelled || started.elapsed()>=limit || poll.is_err(){
             if child.kill().is_err() && !child.try_wait().is_ok_and(|exit|exit.is_some()){
                 return Err("无法停止本次 npm 操作，请查看本机进程状态。".into())
             }
@@ -304,7 +310,15 @@ pub fn install(target_token:String)->Result<CliState,String>{
     #[test]fn npm_arguments_are_pinned_scoped_and_do_not_remove_configuration(){let root=sandbox();let(command,prefix)=fixture(&root);let install=inspect_install(&command,&prefix).unwrap();let update=mutation_args(&install,Mutation::Update,Some("0.168.0"),&root).unwrap();
         assert_eq!(&update[1..3],&["install","@openai/codex@0.168.0"]);assert!(update.windows(2).any(|args|args==["--prefix",prefix.to_str().unwrap()]));assert!(update.contains(&"--global".into()));assert!(update.contains(&"--ignore-scripts".into()));assert!(update.contains(&REGISTRY.into()));
         let first=mutation_args(&install,Mutation::Install,Some("0.168.0"),&root).unwrap();assert_eq!(&first[1..3],&["install","@openai/codex@0.168.0"]);assert!(mutation_args(&install,Mutation::Update,Some("latest && erase"),&root).is_err());let uninstall=mutation_args(&install,Mutation::Uninstall,None,&root).unwrap();assert_eq!(&uninstall[1..3],&["uninstall",PACKAGE]);assert!(!uninstall.iter().any(|arg|arg.contains(".codex")||arg.contains("ChatGPT")));fs::remove_dir_all(root).unwrap();}
-    #[test]fn output_is_drained_but_retention_is_bounded(){let input=vec![b'x';128*1024];assert_eq!(drain(input.as_slice()).len(),16384);for invalid in ["0.1.0-beta","v0.1.0","0.1","01.2.3","1.2.3 & calc"]{assert!(!valid_version(invalid));}}
+    #[test]fn output_is_drained_but_retention_is_bounded(){let input=vec![b'x';128*1024];let mut reader=input.as_slice();let mut tail=vec![];for _ in 0..2{let available=reader.len();read_tail(&mut reader,available,&mut tail);}assert!(reader.is_empty());assert_eq!(tail.len(),16384);for invalid in ["0.1.0-beta","v0.1.0","0.1","01.2.3","1.2.3 & calc"]{assert!(!valid_version(invalid));}}
+    #[test]fn hung_npm_deadline_reaps_only_the_owned_process(){
+        let mut command=Command::new("node");
+        command.args(["-e","setInterval(()=>{},1000)"]).creation_flags(0x08000000)
+            .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
+        let start=Instant::now();
+        let error=supervise_npm(command,Mutation::Install,&AtomicBool::new(false),Duration::from_millis(200)).unwrap_err();
+        assert!(error.contains("时限")&&start.elapsed()<Duration::from_secs(10));
+    }
     #[test]fn isolated_mock_manager_receives_exact_prefix_and_preserves_user_data(){
         let root=sandbox();let(command,prefix)=fixture(&root);let mut install=inspect_install(&command,&prefix).unwrap();
         // CI provides Node. Run only the fresh fake npm entry below, never the installed npm CLI.

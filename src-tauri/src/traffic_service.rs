@@ -419,10 +419,10 @@ fn scope_config(root:&Path)->Result<crate::settings::Config,String>{
 }
 fn lease_belongs_to(lease:&crate::native::ProcessLease,owner:&str)->bool{process_sid(HANDLE(lease.as_handle())).is_ok_and(|sid|sid==owner)}
 pub(crate) struct CollectorScope{
-    user:UserContext,root:PathBuf,owner_sid:String,allowed:HashMap<ProcessIdentity,(Instant,crate::native::ProcessLease)>,missed:HashSet<ProcessIdentity>,first_missed:Option<u64>,last_missed:Option<u64>,
+    user:UserContext,root:PathBuf,owner_sid:String,allowed:HashMap<ProcessIdentity,(Instant,crate::native::ProcessLease)>,missed:HashSet<ProcessIdentity>,pub(crate) last_unverified:Option<ProcessIdentity>,first_missed:Option<u64>,last_missed:Option<u64>,
 }
 impl CollectorScope{
-    pub(crate) fn new(parent:HANDLE)->Result<Self,String>{let owner_sid=process_sid(parent)?;let user=UserContext::from_parent(parent)?;let root=user.root()?;Ok(Self{user,root,owner_sid,allowed:HashMap::new(),missed:HashSet::new(),first_missed:None,last_missed:None})}
+    pub(crate) fn new(parent:HANDLE)->Result<Self,String>{let owner_sid=process_sid(parent)?;let user=UserContext::from_parent(parent)?;let root=user.root()?;Ok(Self{user,root,owner_sid,allowed:HashMap::new(),missed:HashSet::new(),last_unverified:None,first_missed:None,last_missed:None})}
     pub(crate) fn targets(&mut self,requested:&[ProcessIdentity])->Result<Vec<ProcessIdentity>,String>{
         crate::traffic_core::validate_targets(requested)?;let now=Instant::now();let mut expired=Vec::new();
         for (&identity,(seen,lease)) in &mut self.allowed{
@@ -442,6 +442,7 @@ impl CollectorScope{
             // Keep a bounded set for the partial-coverage indication, including live misses.
             if self.missed.len()<4096 && self.missed.insert(identity) {
                 let at=crate::settings::now();
+                self.last_unverified=Some(identity);
                 self.first_missed.get_or_insert(at);
                 self.last_missed=Some(at);
             }

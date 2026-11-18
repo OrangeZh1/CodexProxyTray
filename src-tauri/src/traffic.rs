@@ -201,7 +201,12 @@ fn collect(token:&str,parent_identity:ProcessIdentity)->Result<(),String>{
         if !alive(){return Ok(())}
         if !broker_alive(){return Err("流量辅助服务已退出，本次采样已停止。".into())}
         match pipe.read::<ToCollector>()?{Some(ToCollector::Targets{protocol,targets})if protocol==PROTOCOL=>{let targets=match &mut scope{Some(scope)=>scope.targets(&targets)?,None=>targets};session.set_targets(&targets)?;},Some(ToCollector::Stop{protocol})if protocol==PROTOCOL=>return Ok(()),Some(_)=>return Err("采样协议无效。".into()),None=>{}}
-        if sampled.elapsed()>=Duration::from_secs(1){let at=Instant::now();let mut sample=session.sample();if let Some(scope)=&scope{scope.mark_sample(&mut sample);}let snapshot=measured_snapshot(sample,&mut previous,at);pipe.write(&FromCollector{protocol:PROTOCOL,snapshot,stopped:false},alive)?;sampled=at;}
+        if sampled.elapsed()>=Duration::from_secs(1){let at=Instant::now();let mut sample=session.sample();if let Some(scope)=&scope{scope.mark_sample(&mut sample);}let mut snapshot=measured_snapshot(sample,&mut previous,at);
+            if let Some(id)=scope.as_ref().and_then(|s|s.last_unverified){
+                let detail=format!("服务未能独立确认应用根或父链，已排除 PID {}（创建标识 {}）；累计遗漏标识至少 {} 个。",id.pid,id.created_filetime,snapshot.missed_bindings);
+                snapshot.message=Some(format!("{}\n{detail}",snapshot.message.as_deref().unwrap_or("目标进程核验不完整。")));
+            }
+            pipe.write(&FromCollector{protocol:PROTOCOL,snapshot,stopped:false},alive)?;sampled=at;}
         thread::sleep(Duration::from_millis(20));
     }})();
     // Parent death and IPC errors take this same cleanup path; no global logger name is ever stopped.

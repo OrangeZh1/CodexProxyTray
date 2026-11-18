@@ -176,6 +176,15 @@ pub fn cli_lookup_info(root:&Path)->serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(windows)]
+    #[test]fn persisted_commands_reject_relative_programs_extra_arguments_and_foreign_scripts(){
+        let root=std::env::temp_dir().join("CodexProxyTray-cli-scope-test");
+        let sys=PathBuf::from(std::env::var_os("SystemRoot").unwrap()).join("System32/notepad.exe");
+        assert!(sys.is_file());
+        assert!(!command_available(&[sys.to_string_lossy().into_owned()],&root));
+        assert!(!command_available(&["codex.exe".into()],&root));
+        assert!(!command_available(&["codex.exe".into(),"extra".into()],&root));
+    }
     #[test]fn guard_preference_survives_reloads_without_changing_strict_config(){
         let root=std::env::temp_dir().join(format!("codex-proxy-guard-{}-{}",std::process::id(),now()));fs::create_dir(&root).unwrap();
         save(&root,&Config::default()).unwrap();let original=fs::read(root.join("config.json")).unwrap();

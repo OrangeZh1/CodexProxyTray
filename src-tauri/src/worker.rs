@@ -145,7 +145,7 @@ impl Controller {
                             if let Err(message)=action{if !enable{error=Some(format!("流量采样停止尚未确认：{message}"));}result=Err(message);}
                         }
                     }
-                    let next=sampler.snapshot();if next.state!=status.traffic.state||next.partial!=status.traffic.partial{status.log(if next.state==crate::traffic::TrafficState::Unavailable{"warning"}else{"info"},"流量","流量采集状态已变化",format!("状态：{:?}\n{}",next.state,next.message.as_deref().unwrap_or("仅统计已验证的目标进程字节。")));}status.traffic=next;
+                    let next=sampler.snapshot();if next.state!=status.traffic.state||next.partial!=status.traffic.partial{status.log(if next.partial||next.state==crate::traffic::TrafficState::Unavailable{"warning"}else{"info"},"流量","流量采集状态已变化",format!("状态：{:?}\n{}",next.state,next.message.as_deref().unwrap_or("仅统计已验证的目标进程字节。")));}status.traffic=next;
                 }else{let message="流量采样状态不可访问，停止结果尚未确认。".to_owned();error=Some(message.clone());result=Err(message.clone());status.traffic=crate::traffic::TrafficSnapshot::disabled();status.traffic.state=crate::traffic::TrafficState::Unavailable;status.traffic.message=Some(message);}
                 crate::flow_log::maybe_sample(&status.traffic);status.traffic_enabled=config.traffic_enabled;status.traffic_service=crate::traffic_service::snapshot();
                 if status.error!=error {if let Some(e)=&error {status.log("error","守护","守护状态需要检查",e.clone());}else if status.error.is_some(){status.log("info","守护","守护状态已恢复","本轮检测未再出现此前错误。");}status.error=error;}

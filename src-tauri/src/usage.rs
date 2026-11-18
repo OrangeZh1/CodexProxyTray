@@ -427,6 +427,12 @@ fn timestamp(value:&str)->Option<u64>{
     fn meta(id:&str)->serde_json::Value{serde_json::json!({"timestamp":"2026-11-11T23:00:00Z","type":"session_meta","payload":{"id":id,"timestamp":"2026-11-11T23:00:00Z"}})}
     fn add(file:&mut FileCache,value:serde_json::Value){assert!(consume(file,&serde_json::to_vec(&value).unwrap(),0));}
     fn range()->(u64,u64){(timestamp("2026-11-12T00:00:00Z").unwrap(),timestamp("2026-11-13T00:00:00Z").unwrap())}
+    #[cfg(windows)]
+    #[test]fn unc_and_device_names_are_rejected_before_filesystem_access(){
+        for name in [r"\\example.invalid\share",r"\\?\UNC\example.invalid\share",r"\\.\pipe\unused"]{
+            assert!(check_local_volume(Path::new(name)).is_err());
+        }
+    }
     #[test]fn bounded_all_history_keeps_accepting_appended_and_new_session_records(){
         use std::io::Write;
         let root=std::env::temp_dir().join(format!("usage-cap-{}-{}",std::process::id(),std::time::SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));fs::create_dir_all(root.join("sessions")).unwrap();

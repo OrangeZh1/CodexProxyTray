@@ -9,7 +9,7 @@ const LIMIT:usize=300;
 #[derive(Clone,Default,Serialize,Deserialize)]#[serde(default)]pub struct Snapshot{pub enabled:bool,pub entries:Vec<Entry>,pub samples:Vec<Sample>,pub sampled_at:Option<u64>,pub error:Option<String>,pub truncated:bool}
 #[derive(Serialize,Deserialize)]#[serde(deny_unknown_fields)]struct Preference{schema:u32,enabled:bool}
 #[derive(Serialize,Deserialize)]struct Saved{schema:u32,entries:Vec<Entry>,samples:Vec<Sample>}
-struct State{view:Snapshot,writable:bool,last:Option<Instant>,last_saved:Option<Instant>}
+struct State{view:Snapshot,writable:bool,dirty:bool,last:Option<Instant>,last_saved:Option<Instant>}
 static STATE:OnceLock<Mutex<State>>=OnceLock::new();
 fn state()->&'static Mutex<State>{STATE.get_or_init(||{
     let root=settings::root();let mut view=Snapshot::default();let mut writable=true;
@@ -17,14 +17,23 @@ fn state()->&'static Mutex<State>{STATE.get_or_init(||{
     match preference{Ok(enabled)=>view.enabled=enabled,Err(error)=>{writable=false;view.error=Some(error);}}
     let history=(||->Result<Option<Saved>,String>{let Some(bytes)=read_optional(&root.join("logs/flow-v1.json"),1024*1024)?else{return Ok(None)};let saved:Saved=serde_json::from_slice(&bytes).map_err(|_|"连接历史无法读取，原文件已保留。")?;if saved.schema!=1||saved.entries.len()>LIMIT||saved.samples.len()>LIMIT||!saved.entries.iter().all(valid)||!saved.samples.iter().all(valid_sample){return Err("连接历史格式或范围无效，原文件已保留。".into())}Ok(Some(saved))})();
     match history{Ok(Some(saved))=>{view.entries=saved.entries;for row in &mut view.entries{row.present=false;}view.samples=saved.samples;},Ok(None)=>{},Err(error)=>{writable=false;view.enabled=false;view.error=Some(error);}}
-    Mutex::new(State{view,writable,last:None,last_saved:None})
+    Mutex::new(State{view,writable,dirty:false,last:None,last_saved:None})
 })}
 fn read_optional(path:&Path,limit:u64)->Result<Option<Vec<u8>>,String>{let file=match fs::File::open(path){Ok(file)=>file,Err(error)if error.kind()==std::io::ErrorKind::NotFound=>return Ok(None),Err(_)=>return Err("连接记录不可读取，原文件已保留。".into())};let mut bytes=vec![];file.take(limit+1).read_to_end(&mut bytes).map_err(|_|"连接记录读取失败。")?;if bytes.len()as u64>limit{return Err("连接记录超过安全读取范围，原文件已保留。".into())}Ok(Some(bytes))}
 fn valid(row:&Entry)->bool{row.pid>0&&row.first_at<=row.last_at&&row.last_at<=8_640_000_000_000_000&&row.process.len()<=100&&row.created.parse::<u64>().is_ok_and(|value|value>0)&&!row.process.chars().any(char::is_control)&&row.local.parse::<SocketAddr>().is_ok()&&row.remote.parse::<SocketAddr>().is_ok()}
 fn valid_sample(row:&Sample)->bool{row.at>0&&row.at<=8_640_000_000_000_000&&[row.receive_bps,row.send_bps].iter().flatten().all(|value|value.is_finite()&&*value>=0.0)}
 pub fn snapshot()->Snapshot{state().lock().unwrap_or_else(|e|e.into_inner()).view.clone()}
-pub fn set_enabled(enabled:bool)->Result<Snapshot,String>{let mut state=state().lock().map_err(|_|"连接日志状态暂不可用。")?;if !state.writable{return Err(state.view.error.clone().unwrap_or_else(||"连接日志不可写。".into()))}if state.view.enabled && !enabled { persist(&mut state)?; }
-    settings::write_json(&settings::root().join("flow-log-settings-v1.json"),&Preference{schema:1,enabled})?;state.view.enabled=enabled;if !enabled{for row in &mut state.view.entries{row.present=false;}}state.last=None;Ok(state.view.clone())}
+pub fn set_enabled(enabled:bool)->Result<Snapshot,String>{
+    let mut state=state().lock().map_err(|_|"连接日志状态暂不可用。")?;
+    if !state.writable{return Err(state.view.error.clone().unwrap_or_else(||"连接日志不可写。".into()))}
+    settings::write_json(&settings::root().join("flow-log-settings-v1.json"),&Preference{schema:1,enabled})?;
+    state.view.enabled=enabled;state.last=None;
+    if !enabled{
+        for row in &mut state.view.entries{row.present=false;}
+        if state.dirty{let _=persist(&mut state);}
+    }
+    Ok(state.view.clone())
+}
 fn merge(view:&mut Snapshot,connections:ConnectionSnapshot,traffic:&TrafficSnapshot){
     let now=connections.sampled_at;let mut by_key=view.entries.drain(..).map(|mut row|{row.present=false;((row.pid,row.created.clone(),row.local.clone(),row.remote.clone()),row)}).collect::<BTreeMap<_,_>>();
     for row in connections.rows{let entry=Entry{first_at:now,last_at:now,pid:row.pid,created:row.process_created.clone(),process:row.process_label,local:row.local,remote:row.remote,present:true};if !valid(&entry){continue}let key=(entry.pid,entry.created.clone(),entry.local.clone(),entry.remote.clone());by_key.entry(key).and_modify(|old|{old.last_at=now;old.present=true;}).or_insert(entry);}
@@ -39,11 +48,11 @@ fn persist(state:&mut State)->Result<(),String>{
         let reason=format!("连接记录尚未写入磁盘：{error}");
         state.view.error=Some(reason.clone());return Err(reason)
     }
-    state.last_saved=Some(Instant::now());state.view.error=None;Ok(())
+    state.last_saved=Some(Instant::now());state.dirty=false;state.view.error=None;Ok(())
 }
-pub fn flush(){if let Ok(mut state)=state().lock(){if state.writable&&state.view.enabled{let _=persist(&mut state);}}}
+pub fn flush(){if let Ok(mut state)=state().lock(){if state.writable&&state.dirty{let _=persist(&mut state);}}}
 pub fn maybe_sample(traffic:&TrafficSnapshot){
     let Ok(mut state)=state().try_lock()else{return};if !state.view.enabled||!state.writable||state.last.is_some_and(|last|last.elapsed()<Duration::from_secs(5)){return}state.last=Some(Instant::now());
-    match crate::runtime_details::connections(){Ok(connections)=>{merge(&mut state.view,connections,traffic);state.view.error=None;if state.last_saved.is_none_or(|last|last.elapsed()>=Duration::from_secs(30)){let _=persist(&mut state);}},Err(error)=>state.view.error=Some(error)}
+    match crate::runtime_details::connections(){Ok(connections)=>{merge(&mut state.view,connections,traffic);state.dirty=true;state.view.error=None;if state.last_saved.is_none_or(|last|last.elapsed()>=Duration::from_secs(30)){let _=persist(&mut state);}},Err(error)=>state.view.error=Some(error)}
 }
 #[cfg(test)]mod tests{use super::*;#[test]fn endpoint_history_is_validated_and_pid_reuse_is_distinct(){let mut row=Entry{first_at:1,last_at:2,pid:3,created:"100".into(),process:"codex.exe".into(),local:"127.0.0.1:1000".into(),remote:"127.0.0.1:7890".into(),present:true};assert!(valid(&row));row.remote="https://private.example/path".into();assert!(!valid(&row));row.remote="[::1]:7890".into();assert!(valid(&row));row.created="not-a-filetime".into();assert!(!valid(&row));}}

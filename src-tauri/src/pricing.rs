@@ -99,6 +99,9 @@ fn fetch_once(client:&reqwest::blocking::Client)->Result<ReferenceData,(String,b
     let start=Instant::now();
     let response=client.get(SOURCE).header(reqwest::header::ACCEPT_ENCODING,"gzip").send()
         .map_err(|error|(format!("models.dev 请求失败（{}，{} ms）。",if error.is_timeout(){"等待响应超时"}else if error.is_connect(){"连接代理或 TLS 握手失败"}else{"未取得响应头"},start.elapsed().as_millis()),true))?;
+    read_catalog_response(response,start)
+}
+fn read_catalog_response(response:reqwest::blocking::Response,start:Instant)->Result<ReferenceData,(String,bool)>{
     let status=response.status();
     let length=response.content_length();
     if !status.is_success(){return Err((format!("models.dev 返回 HTTP {}（{} ms）。",status.as_u16(),start.elapsed().as_millis()),status.is_server_error()))}
@@ -154,7 +157,7 @@ pub fn read(force:bool)->Result<Snapshot,String>{
             match fetch(&config){Ok(reference)=>{let fetched_at=crate::settings::now();cache.models=reference.models;cache.catalog=reference.catalog;cache.fetched_at=Some(fetched_at);cache.error=None;
                 let saved=Saved{schema:1,source:SOURCE.into(),fetched_at,models:cache.models.clone(),catalog:cache.catalog.clone()};let fits=serde_json::to_vec_pretty(&saved).is_ok_and(|bytes|bytes.len()as u64<=MAX_CACHE);
                 if !cache.writable||!fits||fs::create_dir_all(&root).is_err()||crate::settings::write_json(&root.join("usage-prices-v1.json"),&saved).is_err(){cache.error=Some("价格已获取，但未能保存本机缓存。".into());}
-            },Err(error)=>cache.error=Some(error)}
+            },Err(error)=>cache.error=Some(if cache.fetched_at.is_some(){format!("{error} 已保留上次成功价格。")}else{error})}
             cache.last_completed=Some(crate::settings::now());
         }}
     }
@@ -200,6 +203,21 @@ pub fn maybe_automatic(config:&crate::settings::Config,tx:&Sender<crate::worker:
         assert_eq!(decode_catalog(bytes.clone(),"gzip").unwrap(),b"sample");
         bytes.pop();assert!(decode_catalog(bytes,"gzip").is_err());
         assert!(decode_catalog(vec![],"br").is_err());
+    }
+    #[test]fn interrupted_http_body_reports_status_bytes_and_retryability(){
+        use std::{net::TcpListener,io::{Read,Write}};
+        let socket=TcpListener::bind("127.0.0.1:0").unwrap();
+        let address=socket.local_addr().unwrap();
+        let server=std::thread::spawn(move||{
+            let(mut stream,_)=socket.accept().unwrap();let mut request=[0;2048];
+            stream.read(&mut request).unwrap();
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\nabc").unwrap();
+        });
+        let start=Instant::now();
+        let response=reqwest::blocking::Client::builder().no_proxy().timeout(Duration::from_secs(4)).build().unwrap().get(format!("http://{address}")).send().unwrap();
+        let Err((reason,retry))=read_catalog_response(response,start)else{panic!("partial body accepted")};
+        assert!(retry && reason.contains("HTTP 200") && reason.contains("100 字节"),"{reason}");
+        server.join().unwrap();
     }
     #[test]fn public_prices_require_complete_original_text_rates_and_preserve_units(){
         let bytes=br#"{"openai":{"models":{"gpt-fixture":{"modalities":{"output":["text"]},"cost":{"input":1.25,"output":10,"cache_read":0.125}},"missing-cache":{"modalities":{"output":["text"]},"cost":{"input":2,"output":3}},"image":{"modalities":{"output":["image"]},"cost":{"input":1,"output":2,"cache_read":0}},"negative":{"modalities":{"output":["text"]},"cost":{"input":-1,"output":2,"cache_read":0}}}},"reseller":{"models":{"gpt-fixture":{"modalities":{"output":["text"]},"cost":{"input":"unsupported reseller schema","output":99,"cache_read":99}}}}}"#;
