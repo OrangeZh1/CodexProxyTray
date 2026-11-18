@@ -1,4 +1,4 @@
-param([ValidateSet('Prepare','Apply','Library')][string]$Phase,[string]$Job)
+param([ValidateSet('Prepare','Apply','Library')][string]$Phase,[string]$Job,[string]$SetupPayloadHash,[string]$SetupSourceCommit)
 $ErrorActionPreference='Stop'
 # The helper uses only protected Windows modules, independent of a PowerShell 7 parent.
 $originalModulePath=$env:PSModulePath
@@ -66,6 +66,17 @@ function VerifySignedManifest([string]$Publisher){
     $manifest=Json $manifestFile
     if($manifest.product -cne 'CodexProxyTray' -or $manifest.schema -ne 1 -or $manifest.version -cne $plan.version -or $manifest.zip_sha256 -cnotmatch '^[a-f0-9]{64}$' -or $manifest.zip_sha256 -cne $plan.zip_sha256 -or (Hash (Join-Path $Job 'package.zip')) -cne $manifest.zip_sha256){throw '签名清单与安装包版本或 SHA-256 不匹配。'}
 }
+function UpdatePublisher(){
+    # Only the already-running Setup passes its compiled ZIP hash and source commit.
+    # The network updater never accepts these inputs from a plan, the webview or the environment.
+    if($SetupPayloadHash -or $SetupSourceCommit){
+        if($SetupSourceCommit -cnotmatch '^[a-f0-9]{40}$' -or $SetupPayloadHash -cnotmatch '^[a-f0-9]{64}$' -or $SetupPayloadHash -cne $plan.zip_sha256 -or (Hash (Join-Path $Job 'package.zip')) -cne $SetupPayloadHash){throw '安装包与当前 Setup 的内嵌载荷不匹配。'}
+        return
+    }
+    $publisher=Publisher $exe
+    VerifySignedManifest $publisher
+    return $publisher
+}
 function VerifyCodePublisher([string]$Directory,[string]$Expected){
     foreach($name in @('CodexProxyTray.exe','codex-proxy-cli.exe')){
         if((Publisher (Join-Path $Directory $name)) -cne $Expected){throw '新版程序的 Windows 发布者与已安装版本不匹配。'}
@@ -111,7 +122,7 @@ try {
     $others=@(OwnProcesses $exe|Where-Object {$_.ProcessId -ne $parent.Id});if($others.Count){throw '另一个进程正在使用助手程序，未开始替换。'}
     if($Phase -eq 'Prepare'){
         if((Hash (Join-Path $Job 'package.zip')) -cne $plan.zip_sha256 -or (Hash (Join-Path $Job 'manifest.json')) -cne $plan.manifest_sha256){throw '官方附件 SHA-256 校验失败。'}
-        $publisher=Publisher $exe;VerifySignedManifest $publisher
+        $publisher=UpdatePublisher
         $manifest=Json (Join-Path $Job 'manifest.json');if($manifest.schema -ne 1 -or $manifest.product -cne 'CodexProxyTray' -or $manifest.version -cne $plan.version){throw '发布清单与目标版本不匹配。'}
         $before=@(Inventory $target);if(-not($before.name -ccontains 'CodexProxyTray.exe') -or -not($before.name -ccontains 'codex-proxy-cli.exe')){throw '不是受支持的完整助手目录。'}
         $oldActive=$null;$oldPrevious=@();if(Test-Path -LiteralPath $activePath){$oldActive=Json $activePath;if($oldActive.schema -ne 1 -or $oldActive.current.path -ine $target){throw '活动版本记录与目录不一致。'};Verify $target $oldActive.current.files;CopyDurable $activePath (Join-Path $Job 'pre-active-version.json')}
@@ -121,8 +132,8 @@ try {
         if((Test-Path -LiteralPath $candidate) -or (Test-Path -LiteralPath $obsolete)){throw '更新暂存目录已存在，未覆盖。'}
         $inspection=Join-Path $Job 'verified-payload'
         [void](New-Item -ItemType Directory -Path $inspection)
-        $package=ExpandPayload (Join-Path $Job 'package.zip') $inspection $plan.version
-        VerifyCodePublisher $inspection $publisher
+        $package=ExpandPayload (Join-Path $Job 'package.zip') $inspection $plan.version $SetupSourceCommit
+        if($publisher){VerifyCodePublisher $inspection $publisher}
         $sums=@($package.files);$receipt=$package.receipt
         $metadata=@{schema=1};foreach($pair in @(@('active','pre-active-version.json'),@('journal','pre-install-journal.json'))){$path=Join-Path $Job $pair[1];$present=Test-Path -LiteralPath $path;$metadata[$pair[0]]=@{present=[bool]$present;sha256=if($present){Hash $path}else{$null}}}
         Durable (Join-Path $Job 'verified.json') @{schema=1;before=$before;after=$sums;old_previous=$oldPrevious;source_commit=$receipt.source_commit;old_active=$oldActive;old_metadata=$metadata;target=$target;previous=$previous;candidate=$candidate;obsolete=$obsolete}
@@ -130,14 +141,14 @@ try {
         [IO.Directory]::Delete($inspection)
         exit 0
     }
-    $publisher=Publisher $exe;VerifySignedManifest $publisher
+    $publisher=UpdatePublisher
     $verified=Json (Join-Path $Job 'verified.json');if($verified.target -ine $target -or $verified.previous -ine $previous -or $verified.candidate -ine $candidate -or $verified.obsolete -ine $obsolete){throw '已校验计划路径发生变化。'}
     Verify $target $verified.before
     if(Test-Path -LiteralPath $candidate){throw '目标暂存目录已有内容，请保留现场并通过安装器恢复。'}else{
         [void](New-Item -ItemType Directory -Path $candidate)
-        [void](ExpandPayload (Join-Path $Job 'package.zip') $candidate $plan.version)
+        [void](ExpandPayload (Join-Path $Job 'package.zip') $candidate $plan.version $SetupSourceCommit)
     }
-    Verify $candidate $verified.after;VerifyCodePublisher $candidate $publisher;if(Test-Path -LiteralPath $previous){Verify $previous $verified.old_previous}
+    Verify $candidate $verified.after;if($publisher){VerifyCodePublisher $candidate $publisher};if(Test-Path -LiteralPath $previous){Verify $previous $verified.old_previous}
     Durable (Join-Path $Job 'handoff-ready.json') @{schema=1;pid=$PID;state='waiting-parent';process_cwd_is_job=([Environment]::CurrentDirectory -ieq $Job);powershell_location_is_job=((Get-Location).ProviderPath -ieq $Job)}
     if(-not(WaitGone $parent.Id $plan.parent_created 30)){throw '助手尚未退出，已取消替换。'}
     if(@(OwnProcesses $exe).Count){throw '新的助手实例仍在运行，已取消替换。'}
