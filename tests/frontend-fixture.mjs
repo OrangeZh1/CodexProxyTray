@@ -81,7 +81,25 @@ function demoUsage({startMs=Date.now()-86400000,endMs=Date.now()}){
     records.push(row);if(!models.has(row.model))models.set(row.model,{model:row.model,...summary()});let bucketModel=bucket.models.find(item=>item.model===row.model);if(!bucketModel){bucketModel={model:row.model,...summary()};bucket.models.push(bucketModel);}
     for(const target of [total,bucket,models.get(row.model),bucketModel]){for(const key of fields)target[key]+=row[key];target.request_count++;}
   }
-  const providers=new Map();for(const row of records){if(!providers.has(row.provider))providers.set(row.provider,{provider:row.provider,...summary(),models:[]});const group=providers.get(row.provider);let model=group.models.find(item=>item.model===row.model);if(!model){model={model:row.model,...summary()};group.models.push(model);}for(const target of [group,model]){for(const key of fields)target[key]+=row[key];target.request_count++;}}
+  const providers=new Map();
+  for(const row of records){
+    if(!providers.has(row.provider))providers.set(row.provider,{provider:row.provider,...summary(),models:[]});
+    const group=providers.get(row.provider);
+    let model=group.models.find(item=>item.model===row.model);
+    if(!model){model={model:row.model,...summary()};group.models.push(model);}
+    for(const target of [group,model]){for(const key of fields)target[key]+=row[key];target.request_count++;}
+    if(row.timing_estimated){
+      for(const target of [group,model,models.get(row.model)]){
+        const means=target.timing_averages??={};
+        for(const [key,value] of [['speed',row.output_tokens_per_second],['ttft',row.ttft_ms],['duration',row.duration_ms]]){
+          if(!Number.isFinite(value)||value<0)continue;
+          const mean=means[key]??={value:0,samples:0};
+          mean.samples++;
+          mean.value+=(value-mean.value)/mean.samples;
+        }
+      }
+    }
+  }
   return{start_ms:startMs,end_ms:endMs,updated_at:Date.now(),source_available:true,scan_pending:false,partial:false,files_scanned:26,unreadable_files:0,skipped_records:0,duplicate_records:0,partial_tail_files:0,summary:total,models:[...models.values()],providers:[...providers.values()],series,records:records.sort((left,right)=>right.at-left.at).slice(0,500),records_truncated:records.length>500,request_count_kind:'deduplicated_usage_records',scope:'演示用量数据；只聚合模型与 token 元数据。',notes:[]};
 }
 const view = () => ({ online, state, price_catalog:{...priceCatalogInfo,auto_sync_enabled:priceAutoSyncEnabled}, defaults: Object.fromEntries(defaults), queued: Object.fromEntries(queued), history });

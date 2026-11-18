@@ -23,8 +23,30 @@ impl Tokens{
     fn add(&mut self,value:Self)->bool{let Some(total)=self.total_tokens.checked_add(value.total_tokens).filter(|value|*value<=MAX_SAFE)else{return false};self.input_tokens+=value.input_tokens;self.cached_input_tokens+=value.cached_input_tokens;self.cache_write_input_tokens+=value.cache_write_input_tokens;self.output_tokens+=value.output_tokens;self.reasoning_output_tokens+=value.reasoning_output_tokens;self.total_tokens=total;true}
 }
 #[derive(Clone,Debug,Default,Serialize)]
-pub struct Summary{#[serde(flatten)]pub tokens:Tokens,pub request_count:u64,pub estimated_cost_usd:Option<f64>,pub missing_price:bool}
+pub struct Summary{#[serde(flatten)]pub tokens:Tokens,pub request_count:u64,pub estimated_cost_usd:Option<f64>,pub missing_price:bool,#[serde(skip_serializing_if="Option::is_none")]timing_averages:Option<TimingAverages>}
 impl Summary{fn add(&mut self,value:Tokens)->bool{if !self.tokens.add(value){return false}self.request_count+=1;self.missing_price=true;true}}
+
+#[derive(Clone,Debug,Default,Serialize)]
+struct Mean { value:f64, samples:u64 }
+impl Mean {
+    fn add(&mut self, value:Option<f64>) {
+        if let Some(value)=value.filter(|value|value.is_finite() && *value>=0.0) {
+            self.samples+=1;
+            self.value+=(value-self.value)/self.samples as f64;
+        }
+    }
+}
+#[derive(Clone,Debug,Default,Serialize)]
+struct TimingAverages { speed:Mean, ttft:Mean, duration:Mean }
+impl Summary {
+    fn add_record(&mut self, tokens:Tokens, timing:Timing) {
+        if !self.add(tokens) || !timing.timing_estimated { return }
+        let means=self.timing_averages.get_or_insert_with(TimingAverages::default);
+        means.speed.add(timing.output_tokens_per_second);
+        means.ttft.add(timing.ttft_ms.map(|ms|ms as f64));
+        means.duration.add(timing.duration_ms.map(|ms|ms as f64));
+    }
+}
 #[derive(Clone,Debug,Serialize)]pub struct Bucket{pub start_ms:u64,pub end_ms:u64,#[serde(flatten)]pub summary:Summary,pub models:Vec<ModelUsage>}
 #[derive(Clone,Debug,Serialize)]pub struct ModelUsage{pub model:String,#[serde(flatten)]pub summary:Summary}
 #[derive(Clone,Copy,Debug,PartialEq,Eq,Serialize,Deserialize)]pub enum TimingSource{#[serde(rename="codex_rollout_estimate")]CodexRolloutEstimate}
@@ -240,9 +262,11 @@ fn aggregate(cache:&Cache,start_ms:u64,end_ms:u64,pending:bool,unreadable:usize,
         };
         if baseline||!value.positive()||event.at<start_ms{continue}
         if !summary.add(value){skipped+=1;continue}
-        let model_key=if models.len()<128||models.contains_key(&event.model){event.model.clone()}else{model_limited=true;"其他模型（合并）".into()};models.entry(model_key.clone()).or_default().add(value);
+        let model_key=if models.len()<128||models.contains_key(&event.model){event.model.clone()}else{model_limited=true;"其他模型（合并）".into()};models.entry(model_key.clone()).or_default().add_record(value,event.timing);
         let provider_key=if providers.len()<128||providers.contains_key(&event.provider){event.provider.clone()}else{provider_limited=true;None};
-        let(provider_summary,provider_models)=providers.entry(provider_key).or_default();provider_summary.add(value);provider_models.entry(model_key.clone()).or_default().add(value);
+        let(provider_summary,provider_models)=providers.entry(provider_key).or_default();
+        provider_summary.add_record(value,event.timing);
+        provider_models.entry(model_key.clone()).or_default().add_record(value,event.timing);
         let at=bucket_start(event.at);bins.entry(at).or_default().add(value);bin_models.entry(at).or_default().entry(model_key).or_default().add(value);
         records.push(UsageRecord{at:event.at,model:event.model.clone(),provider:event.provider.clone(),source_kind:if event.modern{"token_usage_record"}else{"token_count"}.into(),tokens:value,timing:event.timing,estimated_cost_usd:None,missing_price:true});
     }
@@ -381,6 +405,35 @@ fn timestamp(value:&str)->Option<u64>{
         let all=aggregate(&cache,0,end,false,0,true);assert_eq!(all.start_ms,0);assert!(all.series.len()<=182);assert_eq!(all.summary.request_count,1);assert_eq!(all.records[0].provider.as_deref(),Some("fixture-provider"));assert_eq!(all.records[0].source_kind,"token_count");assert_eq!(all.providers[0].models[0].model,"fixture-model");assert_eq!(all.providers[0].summary.tokens.total_tokens,110);
         let long=aggregate(&cache,1,end,false,0,true);assert!(long.series.len()<=182);assert_eq!(long.summary.tokens.total_tokens,110);
         let absent=std::env::temp_dir().join(format!("codex-usage-absent-{}-{}",std::process::id(),crate::settings::now()));let mut empty=Cache::default();let snapshot=read_at(&absent,1,end,&mut empty).unwrap();assert!(!snapshot.source_available);assert!(snapshot.series.len()<=182);assert!(read_at(&absent,end,end,&mut empty).is_err());
+    }
+    #[test]
+    fn group_means_include_older_records_and_count_each_metric_separately(){
+        let (start,end)=range();
+        let mut file=FileCache::default();
+        let tokens=Tokens{output_tokens:1,total_tokens:1,..Tokens::default()};
+        for index in 0..502 {
+            let timing=match index {
+                0=>Timing{ttft_ms:Some(0),duration_ms:Some(200),output_tokens_per_second:Some(5.0),timing_estimated:true,..Timing::default()},
+                1=>Timing{ttft_ms:Some(100),duration_ms:Some(150),timing_estimated:true,..Timing::default()},
+                501=>Timing{ttft_ms:Some(200),duration_ms:Some(600),output_tokens_per_second:Some(2.5),timing_estimated:true,..Timing::default()},
+                _=>Timing::default(),
+            };
+            file.events.push(RawUsage{at:start+index,session:"fixture".into(),model:"model-a".into(),provider:Some(if index==0{"a"}else{"b"}.into()),total:None,last:Some(tokens),response:Some(index.to_string()),modern:true,continuation:false,timing});
+        }
+        let mut cache=Cache::default();
+        cache.files.insert("fixture".into(),file);
+        let result=aggregate(&cache,start,end,false,0,true);
+        assert_eq!(result.records.len(),500);
+        let model=result.models[0].summary.timing_averages.as_ref().unwrap();
+        assert_eq!((model.speed.samples,model.speed.value),(2,3.75));
+        assert_eq!((model.ttft.samples,model.ttft.value),(3,100.0));
+        let b=result.providers.iter().find(|row|row.provider.as_deref()==Some("b")).unwrap();
+        for summary in [&b.summary,&b.models[0].summary] {
+            let means=summary.timing_averages.as_ref().unwrap();
+            assert_eq!((means.speed.samples,means.speed.value),(1,2.5));
+            assert_eq!((means.ttft.samples,means.ttft.value),(2,150.0));
+            assert_eq!((means.duration.samples,means.duration.value),(2,375.0));
+        }
     }
     #[test]fn modern_timing_uses_correlated_turn_output_metadata_and_never_token_count_gaps(){
         let mut file=FileCache::default();add(&mut file,meta("timing-thread"));let base=timestamp("2026-11-12T00:00:00Z").unwrap();

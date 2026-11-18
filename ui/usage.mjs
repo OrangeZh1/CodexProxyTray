@@ -174,8 +174,17 @@ export function withPrices(snapshot,rawPrices={}){
   if(!snapshot||typeof snapshot!=='object')return snapshot;
   const result=structuredClone(snapshot);
   const prices=Object.fromEntries(priceEntries(rawPrices).flatMap(([model,price])=>{const valid=validatePrice(price);return valid?[[model,valid]]:[];}));
-  result.models=(Array.isArray(result.models)?result.models:[]).map(row=>pricedRow(row,prices));
   result.providers=(Array.isArray(result.providers)?result.providers:[]).map(provider=>{const models=(Array.isArray(provider.models)?provider.models:[]).map(row=>pricedRow(row,prices));return {...pricedGroup(provider,models),models};});
+  const modelProviders=new Map();
+  for(const group of result.providers){
+    for(const {model} of group.models){
+      if(!modelProviders.has(model))modelProviders.set(model,new Set());
+      modelProviders.get(model).add(group.provider||'未知服务商');
+    }
+  }
+  result.models=(Array.isArray(result.models)?result.models:[]).map(row=>({
+    ...pricedRow(row,prices),provider_names:[...(modelProviders.get(row.model)||[])].sort(),
+  }));
   result.records=(Array.isArray(result.records)?result.records:[]).map(row=>pricedRow(row,prices));
   result.summary=pricedGroup(result.summary||{},result.models);
   result.series=(Array.isArray(result.series)?result.series:[]).map(bucket=>{
