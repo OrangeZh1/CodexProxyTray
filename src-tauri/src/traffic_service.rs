@@ -400,11 +400,11 @@ impl UserContext{
     }}
     fn targets(&self,root:&Path,anchors:&[&crate::native::ProcessLease],requested:&[ProcessIdentity],owner:&str)->Result<Vec<crate::native::ProcessLease>,String>{
         let _user=Impersonation::begin(self.0.0)?;
-        let config=scope_config(root)?;let mut roots=Vec::new();
+        let config=scope_config(root)?;let cli_paths=crate::settings::cli_process_paths(root,&config);let mut roots=Vec::new();
         // Requested identities are lookup hints only. The service reopens and verifies the
         // real root object, including a root that exited after the GUI retained its handle.
-        for &identity in requested{if let Some(lease)=crate::native::traffic_root_lease(root,&config,identity)?{let sid=process_sid(HANDLE(lease.as_handle())).map_err(|error|format!("无法核验应用根的用户归属（PID {}，创建标识 {}）：{error}",identity.pid,identity.created_filetime))?;if sid==owner{roots.push(lease);}}}
-        let all=anchors.iter().copied().chain(roots.iter()).collect::<Vec<_>>();let mut discovered=crate::native::traffic_targets_with_anchors(root,&config,&all)?;discovered.extend(roots);Ok(discovered)
+        for &identity in requested{if let Some(lease)=crate::native::traffic_root_lease(&cli_paths,identity)?{if lease_belongs_to(&lease,owner){roots.push(lease);}}}
+        let all=anchors.iter().copied().chain(roots.iter()).collect::<Vec<_>>();let mut discovered=crate::native::traffic_targets_with_anchors(&cli_paths,&all)?;discovered.extend(roots);Ok(discovered)
     }
 }
 #[derive(Deserialize)]struct ScopeConfig{#[serde(default)]cli_command:Vec<String>}
@@ -453,8 +453,10 @@ impl CollectorScope{
         if !accepted.is_empty(){self.had_verified_request=true;}
         if !self.had_verified_request{
             for &identity in &unknown{
-                if crate::traffic::open_identity(identity).map_err(win)?.is_some(){
-                    return Err(format!("{NO_VERIFIED_SCOPE}（PID {}，创建标识 {}）。尚无可独立核验的采样目标。",identity.pid,identity.created_filetime))
+                match crate::traffic::open_identity(identity){
+                    Ok(None)=>continue,
+                    Err(error) if code(&error)!=ERROR_ACCESS_DENIED.0=>return Err(win(error)),
+                    _=>return Err(format!("{NO_VERIFIED_SCOPE}（PID {}，创建标识 {}）。尚无可独立核验的采样目标。",identity.pid,identity.created_filetime)),
                 }
             }
         }
@@ -570,6 +572,18 @@ pub(crate) fn start_collector(token:&str,parent:ProcessIdentity)->Result<OwnedHa
     fn verified_handoff(scope:&mut CollectorScope,fixture:&mut ScopeFixture)->Result<(Vec<crate::native::ProcessLease>,Vec<&'static str>),String>{
         let config=scope_config(&scope.root)?;let parent=fixture.parent_identity()?;let child=fixture.child_identity();let mut leases=crate::native::traffic_targets_held(&scope.root,&config)?;leases.retain(|lease|lease.identity==parent||lease.identity==child);
         if ![parent,child].iter().all(|identity|leases.iter().any(|lease|lease.identity==*identity)){return Err("scope_gui_discovery_missing".into())}let mut checks=vec!["gui_discovered_parent_and_child"];
+        for target in [parent,child]{
+            let mut fresh=CollectorScope::new(unsafe{GetCurrentProcess()})?;
+            fresh.root=scope.root.clone();
+            crate::native::with_denied_win32_image(target.pid,||->Result<(),String>{
+                if unsafe{crate::native::process_identity(target.pid)}.is_some(){return Err("scope_image_query_not_denied".into())}
+                let discovered=crate::native::traffic_targets(&fresh.root,&config)?;
+                if ![parent,child].iter().all(|id|discovered.contains(id)){return Err("scope_gui_lost_denied_image_target".into())}
+                if fresh.targets(&[parent,child])?!=[parent,child] || !fresh.missed.is_empty(){return Err("scope_denied_image_coverage_incomplete".into())}
+                Ok(())
+            })?;
+        }
+        checks.extend(["denied_root_image_verified_by_native_path","denied_child_image_verified_by_parent"]);
         fixture.release_parent()?;if unsafe{WaitForSingleObject(HANDLE(fixture.parent.as_raw_handle()),0)}!=WAIT_OBJECT_0||!fixture.child.as_ref().unwrap().is_running()?{return Err("scope_fixture_lifetimes_invalid".into())}checks.push("parent_exited_child_still_alive");
         let accepted=scope.targets(&[parent,child]).map_err(|error|{eprintln!("scope_first_handoff_validation: {}",error.chars().take(500).collect::<String>());"scope_first_handoff_refused"})?;if !accepted.contains(&child)||!scope.allowed.contains_key(&parent){return Err("scope_first_handoff_missing".into())}checks.push("first_handoff_independently_verified");
         scope.allowed.get_mut(&child).ok_or("scope_child_proof_missing")?.0=Instant::now()-Duration::from_secs(61);if !scope.targets(&[child])?.contains(&child){return Err("scope_live_child_expired".into())}checks.push("live_child_proof_survives_sixty_seconds");
@@ -578,7 +592,7 @@ pub(crate) fn start_collector(token:&str,parent:ProcessIdentity)->Result<OwnedHa
         let other_root=unrelated.parent_identity()?;
         let other_child=unrelated.child_identity();
         let caller=identity_on(unsafe{GetCurrentProcess()}).map_err(win)?;
-        let mixed=scope.targets(&[child,other_root,other_child,caller])?;
+        let mixed=crate::native::with_denied_win32_image(other_root.pid,||scope.targets(&[child,other_root,other_child,caller]))?;
         let root_rejected=!mixed.contains(&other_root);
         let child_rejected=!mixed.contains(&other_child);
         let unrelated_rejected=!mixed.contains(&caller);
@@ -588,7 +602,7 @@ pub(crate) fn start_collector(token:&str,parent:ProcessIdentity)->Result<OwnedHa
     }
     #[test]fn exited_application_root_handoff_preserves_live_child_without_trusting_requested_identity(){
         let root=std::env::temp_dir().join(format!("codex-scope-handoff-{}-{}",std::process::id(),crate::settings::now()));fs::create_dir(&root).unwrap();let fixture_dir=root.join("fixture");fs::create_dir(&fixture_dir).unwrap();fs::write(root.join("config.json"),serde_json::to_vec(&serde_json::json!({"cli_command":[fixture_dir.join("codex.exe")]})).unwrap()).unwrap();
-        let mut fixture=ScopeFixture::start(&fixture_dir).unwrap();let mut scope=CollectorScope::new(unsafe{GetCurrentProcess()}).unwrap();scope.root=root.clone();let(leases,checks)=verified_handoff(&mut scope,&mut fixture).unwrap();assert_eq!(checks.len(),8);
+        let mut fixture=ScopeFixture::start(&fixture_dir).unwrap();let mut scope=CollectorScope::new(unsafe{GetCurrentProcess()}).unwrap();scope.root=root.clone();let(leases,checks)=verified_handoff(&mut scope,&mut fixture).unwrap();assert_eq!(checks.len(),10);
         let child=fixture.child_identity();fixture.close_child().unwrap();scope.allowed.get_mut(&child).unwrap().0=Instant::now()-Duration::from_secs(61);assert!(!scope.targets(&[child]).unwrap().contains(&child));drop(leases);drop(scope);fixture.finish().unwrap();fs::remove_file(root.join("config.json")).unwrap();fs::remove_dir(root).unwrap();
     }
     fn probe_trace_absent(token:&str)->Result<bool,String>{
