@@ -43,45 +43,6 @@ function RestoreBeforeSwitch($Proof,[string]$SwitchHash){
     $running=@(OwnProcesses $exe);if($running.Count -gt 1){throw '旧助手出现多个实例，恢复就绪状态无法确认。'};$old=if($running.Count){Get-Process -Id $running[0].ProcessId -ErrorAction Stop}else{StartHelper};try{if($old.MainModule.FileName -ine $exe -or -not(Ready $old)){throw '原助手未通过恢复就绪检查。'};$lifecycle.old_helper_pid=$old.Id;$lifecycle.old_helper_ready=$true}finally{$old.Dispose()}
     $lifecycle.state='pre-switch-restored';Durable (Join-Path $Job 'receipt-lifecycle.json') $lifecycle
 }
-function Publisher([string]$Image){
-    $signature=Get-AuthenticodeSignature -LiteralPath $Image -ErrorAction Stop
-    if($signature.Status -ne 'Valid' -or -not $signature.SignerCertificate){throw '程序缺少受 Windows 信任的发布者签名。请通过已签名的安装包建立更新信任。'}
-    return [Convert]::ToBase64String($signature.SignerCertificate.RawData)
-}
-function VerifySignedManifest([string]$Publisher){
-    Add-Type -AssemblyName System.Security
-    $manifestFile=Join-Path $Job 'manifest.json'
-    $sigFile=Join-Path $Job 'manifest.p7s'
-    foreach($file in @($manifestFile,$sigFile)){
-        Plain $file
-        if((Get-Item -LiteralPath $file).Length -gt 65536){throw '更新清单或签名超出读取上限。'}
-    }
-    $content=[Security.Cryptography.Pkcs.ContentInfo]::new([IO.File]::ReadAllBytes($manifestFile))
-    $cms=[Security.Cryptography.Pkcs.SignedCms]::new($content,$true)
-    $cms.Decode([IO.File]::ReadAllBytes($sigFile))
-    if($cms.SignerInfos.Count -ne 1){throw '更新清单必须具有唯一发布者签名。'}
-    $signer=$cms.SignerInfos[0]
-    if($signer.DigestAlgorithm.Value -cne '2.16.840.1.101.3.4.2.1' -or -not $signer.Certificate -or [Convert]::ToBase64String($signer.Certificate.RawData) -cne $Publisher){throw '更新清单签名与已安装发布者不匹配。'}
-    $cms.CheckSignature($true)
-    $manifest=Json $manifestFile
-    if($manifest.product -cne 'CodexProxyTray' -or $manifest.schema -ne 1 -or $manifest.version -cne $plan.version -or $manifest.zip_sha256 -cnotmatch '^[a-f0-9]{64}$' -or $manifest.zip_sha256 -cne $plan.zip_sha256 -or (Hash (Join-Path $Job 'package.zip')) -cne $manifest.zip_sha256){throw '签名清单与安装包版本或 SHA-256 不匹配。'}
-}
-function UpdatePublisher(){
-    # Only the already-running Setup passes its compiled ZIP hash and source commit.
-    # The network updater never accepts these inputs from a plan, the webview or the environment.
-    if($SetupPayloadHash -or $SetupSourceCommit){
-        if($SetupSourceCommit -cnotmatch '^[a-f0-9]{40}$' -or $SetupPayloadHash -cnotmatch '^[a-f0-9]{64}$' -or $SetupPayloadHash -cne $plan.zip_sha256 -or (Hash (Join-Path $Job 'package.zip')) -cne $SetupPayloadHash){throw '安装包与当前 Setup 的内嵌载荷不匹配。'}
-        return
-    }
-    $publisher=Publisher $exe
-    VerifySignedManifest $publisher
-    return $publisher
-}
-function VerifyCodePublisher([string]$Directory,[string]$Expected){
-    foreach($name in @('CodexProxyTray.exe','codex-proxy-cli.exe')){
-        if((Publisher (Join-Path $Directory $name)) -cne $Expected){throw '新版程序的 Windows 发布者与已安装版本不匹配。'}
-    }
-}
 function ExpandPayload([string]$ZipPath,[string]$Destination,[string]$ExpectedVersion,[string]$ExpectedSource=''){
     Plain $ZipPath;Plain $Destination;if(@(Get-ChildItem -LiteralPath $Destination -Force).Count){throw '安装暂存目录非空，原内容已保留。'}
     $zip=[IO.Compression.ZipFile]::OpenRead($ZipPath)
@@ -120,10 +81,16 @@ try {
     $parent=Get-Process -Id ([int]$plan.parent_pid) -ErrorAction SilentlyContinue
     if(-not(SameParent $parent)){throw '原助手身份已变化，未开始安装。'}
     $others=@(OwnProcesses $exe|Where-Object {$_.ProcessId -ne $parent.Id});if($others.Count){throw '另一个进程正在使用助手程序，未开始替换。'}
+    if($SetupPayloadHash -or $SetupSourceCommit){
+        if($SetupSourceCommit -cnotmatch '^[a-f0-9]{40}$' -or $SetupPayloadHash -cnotmatch '^[a-f0-9]{64}$' -or $SetupPayloadHash -cne $plan.zip_sha256){throw '安装包与当前 Setup 的内嵌载荷不匹配。'}
+    }
+    $zipPath=Join-Path $Job 'package.zip'
+    $manifestPath=Join-Path $Job 'manifest.json'
+    Plain $zipPath;Plain $manifestPath
+    if((Hash $zipPath) -cne $plan.zip_sha256 -or (Hash $manifestPath) -cne $plan.manifest_sha256){throw '官方附件 SHA-256 校验失败。'}
+    $manifest=Json $manifestPath
+    if($manifest.schema -ne 1 -or $manifest.product -cne 'CodexProxyTray' -or $manifest.version -cne $plan.version){throw '发布清单与目标版本不匹配。'}
     if($Phase -eq 'Prepare'){
-        if((Hash (Join-Path $Job 'package.zip')) -cne $plan.zip_sha256 -or (Hash (Join-Path $Job 'manifest.json')) -cne $plan.manifest_sha256){throw '官方附件 SHA-256 校验失败。'}
-        $publisher=UpdatePublisher
-        $manifest=Json (Join-Path $Job 'manifest.json');if($manifest.schema -ne 1 -or $manifest.product -cne 'CodexProxyTray' -or $manifest.version -cne $plan.version){throw '发布清单与目标版本不匹配。'}
         $before=@(Inventory $target);if(-not($before.name -ccontains 'CodexProxyTray.exe') -or -not($before.name -ccontains 'codex-proxy-cli.exe')){throw '不是受支持的完整助手目录。'}
         $oldActive=$null;$oldPrevious=@();if(Test-Path -LiteralPath $activePath){$oldActive=Json $activePath;if($oldActive.schema -ne 1 -or $oldActive.current.path -ine $target){throw '活动版本记录与目录不一致。'};Verify $target $oldActive.current.files;CopyDurable $activePath (Join-Path $Job 'pre-active-version.json')}
         if(Test-Path -LiteralPath $journalPath){$journal=Json $journalPath;if($journal.state -notin @('installed','installed-partial','active','complete')){throw '已有未结束的安装恢复流程，请先处理。'};CopyDurable $journalPath (Join-Path $Job 'pre-install-journal.json')}
@@ -133,7 +100,6 @@ try {
         $inspection=Join-Path $Job 'verified-payload'
         [void](New-Item -ItemType Directory -Path $inspection)
         $package=ExpandPayload (Join-Path $Job 'package.zip') $inspection $plan.version $SetupSourceCommit
-        if($publisher){VerifyCodePublisher $inspection $publisher}
         $sums=@($package.files);$receipt=$package.receipt
         $metadata=@{schema=1};foreach($pair in @(@('active','pre-active-version.json'),@('journal','pre-install-journal.json'))){$path=Join-Path $Job $pair[1];$present=Test-Path -LiteralPath $path;$metadata[$pair[0]]=@{present=[bool]$present;sha256=if($present){Hash $path}else{$null}}}
         Durable (Join-Path $Job 'verified.json') @{schema=1;before=$before;after=$sums;old_previous=$oldPrevious;source_commit=$receipt.source_commit;old_active=$oldActive;old_metadata=$metadata;target=$target;previous=$previous;candidate=$candidate;obsolete=$obsolete}
@@ -141,14 +107,13 @@ try {
         [IO.Directory]::Delete($inspection)
         exit 0
     }
-    $publisher=UpdatePublisher
     $verified=Json (Join-Path $Job 'verified.json');if($verified.target -ine $target -or $verified.previous -ine $previous -or $verified.candidate -ine $candidate -or $verified.obsolete -ine $obsolete){throw '已校验计划路径发生变化。'}
     Verify $target $verified.before
     if(Test-Path -LiteralPath $candidate){throw '目标暂存目录已有内容，请保留现场并通过安装器恢复。'}else{
         [void](New-Item -ItemType Directory -Path $candidate)
         [void](ExpandPayload (Join-Path $Job 'package.zip') $candidate $plan.version $SetupSourceCommit)
     }
-    Verify $candidate $verified.after;if($publisher){VerifyCodePublisher $candidate $publisher};if(Test-Path -LiteralPath $previous){Verify $previous $verified.old_previous}
+    Verify $candidate $verified.after;if(Test-Path -LiteralPath $previous){Verify $previous $verified.old_previous}
     Durable (Join-Path $Job 'handoff-ready.json') @{schema=1;pid=$PID;state='waiting-parent';process_cwd_is_job=([Environment]::CurrentDirectory -ieq $Job);powershell_location_is_job=((Get-Location).ProviderPath -ieq $Job)}
     if(-not(WaitGone $parent.Id $plan.parent_created 30)){throw '助手尚未退出，已取消替换。'}
     if(@(OwnProcesses $exe).Count){throw '新的助手实例仍在运行，已取消替换。'}
@@ -166,7 +131,7 @@ try {
     Durable (Join-Path $Job 'receipt-lifecycle.json') @{schema=1;state='superseded-after-durable-readiness';active_receipt=$activePath;active_receipt_sha256=Hash $activePath;historical_receipts=$active.historical_receipts;retained_rollback=$previous;retired_previous=@{path=$obsolete;files=$verified.old_previous;recovery_status='not-a-rollback-target'};protected_recovery_references=$verified.old_active.recovery_references}
     $journal.state='installed';$journal.obsolete=$null;$journal.candidate=$null;Durable $journalPath $journal
     if($movedPrevious){RemoveCode $obsolete $verified.old_previous}
-    foreach($name in @('package.zip','release-sums.txt','manifest.json','manifest.p7s')){$download=Join-Path $Job $name;if(Test-Path -LiteralPath $download){Plain $download;Remove-Item -LiteralPath $download}}
+    foreach($name in @('package.zip','release-sums.txt','manifest.json')){$download=Join-Path $Job $name;if(Test-Path -LiteralPath $download){Plain $download;Remove-Item -LiteralPath $download}}
     if(Test-Path -LiteralPath (Join-Path $installRoot 'installation.json')){
         $registration=StartHelper '--register-installation';try{if(-not $registration.WaitForExit(20000) -or $registration.ExitCode -ne 0){throw '新版本已健康运行，但 Windows 安装登记同步未完成；请重新运行安装器补登记。'}}finally{$registration.Dispose()}
     }

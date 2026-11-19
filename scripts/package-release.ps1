@@ -53,7 +53,7 @@ try {
             Require ($actual -eq $hashes[$entry.FullName]) ('archive_hash_'+$entry.FullName)
         }
     }finally{$archive.Dispose()}
-    $manifest=[ordered]@{schema=1;product='CodexProxyTray';version=$version;notes=$notes;zip_sha256=(Hash $zipPath)}
+    $manifest=[ordered]@{schema=1;product='CodexProxyTray';version=$version;notes=$notes}
     $manifestPath=Join-Path $output 'CodexProxyTray-update.json'
     [IO.File]::WriteAllText($manifestPath,($manifest|ConvertTo-Json -Depth 4)+"`n",[Text.UTF8Encoding]::new($false))
     Require ((Get-Item -LiteralPath $manifestPath).Length -le 65536) 'update_manifest_within_reader_limit'

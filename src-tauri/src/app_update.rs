@@ -125,7 +125,6 @@ pub fn prepare(expected:String)->Result<Prepared,String>{
         stage=DownloadStage::Checksums;download(&client,&format!("{base}/SHA256SUMS.txt"),&job.join("release-sums.txt"),65536,false).map_err(|error|format!("获取更新校验清单未完成：{error}"))?;
         let sums=fs::read_to_string(job.join("release-sums.txt")).map_err(|_|"官方校验清单不可读取。")?;let zip_hash=checksum(&sums,&name)?;let manifest_hash=checksum(&sums,"CodexProxyTray-update.json")?;
         stage=DownloadStage::Manifest;download(&client,&format!("{base}/CodexProxyTray-update.json"),&job.join("manifest.json"),65536,false).map_err(|error|format!("获取更新说明未完成：{error}"))?;
-        download(&client,&format!("{base}/CodexProxyTray-update.json.p7s"),&job.join("manifest.p7s"),65536,false).map_err(|error|format!("无法取得发布者签名，本次更新已停止：{error}"))?;
         stage=DownloadStage::Package;download(&client,&format!("{base}/{name}"),&job.join("package.zip"),MAX_ZIP,true).map_err(|error|format!("下载安装包未完成：{error}"))?;stage=DownloadStage::Plan;
         let exe=std::env::current_exe().map_err(|_|"无法确定当前安装位置。")?;
         let identity=unsafe{crate::traffic::identity_on(windows::Win32::System::Threading::GetCurrentProcess())}.map_err(|_|"无法核验助手进程。")?;
