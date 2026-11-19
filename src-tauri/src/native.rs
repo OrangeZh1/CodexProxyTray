@@ -179,16 +179,16 @@ fn root_diagnostic(pid:u32,stage:&str,code:u32,value:u32){
 }
 #[cfg(not(test))]
 fn root_diagnostic(_pid:u32,_stage:&str,_code:u32,_value:u32){}
-fn process_image_name(lease:&ProcessLease,flags:u32,diagnostic:bool)->Result<String,String>{unsafe{
+fn process_image_name(lease:&ProcessLease,flags:u32,diagnostic:bool)->std::io::Result<String>{unsafe{
     let mut path=vec![0u16;32768];let mut length=path.len()as u32;
     let success=QueryFullProcessImageNameW(lease.handle,flags,path.as_mut_ptr(),&mut length)!=0;
     let code=if success{0}else{std::io::Error::last_os_error().raw_os_error().unwrap_or(0)as u32};
     if diagnostic{root_diagnostic(lease.identity.pid,if flags==0{"win32_query"}else{"native_query"},code,if success{length}else{0});}
-    if !success{return Err(format!("无法核验目标进程映像（PID {}，查询格式 {}，Windows 错误 {}）。",lease.identity.pid,flags,code))}
-    if length==0||length as usize>=path.len(){return Err("目标进程映像长度无效。".into())}
-    path.truncate(length as usize);String::from_utf16(&path).map_err(|_|"目标进程映像编码无效。".into())
+    if !success{return Err(std::io::Error::from_raw_os_error(code as i32))}
+    if length==0||length as usize>=path.len(){return Err(std::io::Error::new(std::io::ErrorKind::InvalidData,"目标进程映像长度无效。"))}
+    path.truncate(length as usize);String::from_utf16(&path).map_err(|_|std::io::Error::new(std::io::ErrorKind::InvalidData,"目标进程映像编码无效。"))
 }}
-fn process_image(lease:&ProcessLease)->Result<String,String>{process_image_name(lease,0,false).map(|image|crate::settings::normalized_executable(&PathBuf::from(image)))}
+fn process_image(lease:&ProcessLease)->std::io::Result<String>{process_image_name(lease,0,false).map(|image|crate::settings::normalized_executable(&PathBuf::from(image)))}
 fn native_file_image(pid:u32,path:&str,normalizing:bool)->Option<String>{
     use std::os::windows::{fs::OpenOptionsExt,io::AsRawHandle};
     // Query metadata only, preserving the executable's sharing contract. NT
@@ -229,21 +229,43 @@ pub(crate) fn traffic_root_lease(root:&std::path::Path,config:&crate::settings::
     crate::traffic_core::validate_targets(&[identity])?;
     let Some(lease)=process_lifetime_lease(identity.pid)?else{return Ok(None)};
     if lease.identity!=identity{return Ok(None)}
+    verify_traffic_root(root,config,lease)
+}
+fn verify_traffic_root(root:&std::path::Path,config:&crate::settings::Config,lease:ProcessLease)->Result<Option<ProcessLease>,String>{
     let image=match process_image_name(&lease,0,true){
         Ok(image)=>crate::settings::normalized_executable(&PathBuf::from(image)),
         Err(error)=>{
-            if lease.is_running()?{return Err(error)}
+            if lease.is_running()?{
+                // A denied image query cannot prove this candidate is a root.
+                // Let independent discovery and the existing scope gate handle it.
+                if error.raw_os_error()==Some(windows::Win32::Foundation::ERROR_ACCESS_DENIED.0 as i32){return Ok(None)}
+                return Err(format!("无法核验目标进程映像（PID {}，查询格式 0）：{error}",lease.identity.pid))
+            }
             // Win32-name queries can fail after exit even while the exact
             // process object remains held. Accept only an independently read
             // native image path equal to a known CLI file's final native path.
             let Ok(native)=process_image_name(&lease,1,true)else{return Ok(None)};
-            let allowed=known_native_cli_image(identity.pid,&native,root,config);
+            let allowed=known_native_cli_image(lease.identity.pid,&native,root,config);
             return Ok(allowed.then_some(lease))
         }
     };let path=PathBuf::from(&image);
     let name=path.file_name().and_then(|value|value.to_str()).unwrap_or("");
     let allowed=name.eq_ignore_ascii_case("ChatGPT.exe")&&family_matches(lease.handle)||name.eq_ignore_ascii_case("codex.exe")&&crate::settings::cli_process_paths(root,config).iter().any(|expected|expected==&image);
     Ok(allowed.then_some(lease))
+}
+
+#[cfg(test)]
+#[test]
+fn live_candidate_with_denied_image_query_is_not_a_verified_root(){
+    let pid=std::process::id();
+    let identity=process_lifetime_lease(pid).unwrap().unwrap().identity;
+    let handle=unsafe{OpenProcess(windows::Win32::System::Threading::PROCESS_SYNCHRONIZE.0,0,pid)};
+    assert!(!handle.is_null());
+    let lease=ProcessLease{identity,handle};
+    assert!(lease.is_running().unwrap());
+    let error=process_image_name(&lease,0,false).unwrap_err();
+    assert_eq!(error.raw_os_error(),Some(windows::Win32::Foundation::ERROR_ACCESS_DENIED.0 as i32));
+    assert!(verify_traffic_root(&std::env::temp_dir(),&crate::settings::Config::default(),lease).unwrap().is_none());
 }
 
 pub fn memory_bytes()->Option<u64>{unsafe{let mut counters:MemoryCounters=std::mem::zeroed();let size=std::mem::size_of::<MemoryCounters>()as u32;counters.size=size;if GetProcessMemoryInfo(GetCurrentProcess(),&mut counters,size)!=0{Some(counters.working as u64)}else{None}}}

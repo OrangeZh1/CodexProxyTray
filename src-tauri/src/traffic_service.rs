@@ -26,8 +26,8 @@ const PRODUCT:&str="CodexProxyTray.TrafficService";
 const FILE_SDDL:&str="O:BAG:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)";
 const PROTOCOL:u32=2;
 // Independent of the GUI release. Raise the minimum only for required helper fixes.
-const SERVICE_VERSION:&str="1.0.2";
-const MIN_SERVICE_VERSION:&str="1.0.2";
+const SERVICE_VERSION:&str="1.0.3";
+const MIN_SERVICE_VERSION:&str="1.0.3";
 const MAX_FRAME:usize=4096;
 static SELF_HASH:OnceLock<Result<String,String>>=OnceLock::new();
 static STOP:AtomicBool=AtomicBool::new(false);
@@ -674,14 +674,14 @@ pub(crate) fn start_collector(token:&str,parent:ProcessIdentity)->Result<OwnedHa
         let mut record=Receipt{schema:1,product:PRODUCT.into(),owner_sid:"S-1-5-21-1".into(),version:SERVICE_VERSION.into(),protocol:PROTOCOL,sha256:"a".repeat(64),loader_sha256:LOADER_HASH.into(),image:String::new(),service_command:String::new(),phase:"installed".into(),readiness:String::new(),previous:None,created_parent:false};
         assert!(compatible(&record).is_ok());record.sha256="b".repeat(64);assert!(compatible(&record).is_ok());
         record.owner_sid=current_sid().unwrap();assert!(trusted_gui(unsafe{GetCurrentProcess()},&record).is_ok());record.owner_sid="S-1-5-21-999999".into();assert!(trusted_gui(unsafe{GetCurrentProcess()},&record).is_err());
-        record.version="1.0.0".into();assert!(compatible(&record).is_err());record.version="1.9.0".into();assert!(compatible(&record).is_ok());
+        record.version="1.0.2".into();assert!(compatible(&record).is_err());record.version="1.9.0".into();assert!(compatible(&record).is_ok());
         record.version="0.9.0".into();assert!(compatible(&record).is_err());record.version="bad".into();assert!(compatible(&record).is_err());record.version=SERVICE_VERSION.into();record.protocol=0;assert!(compatible(&record).is_err());record.protocol=PROTOCOL+1;assert!(compatible(&record).is_err());
         // Legacy receipts stay readable for a safe explicit uninstall, but cannot claim compatibility.
         let mut legacy=serde_json::to_value(&record).unwrap();legacy.as_object_mut().unwrap().remove("protocol");let legacy:Receipt=serde_json::from_value(legacy).unwrap();assert_eq!(legacy.protocol,0);assert!(compatible(&legacy).is_err());
     }
     #[test]fn explicit_helper_updates_are_versioned_and_journal_transitions_reject_unrelated_backups(){
         let directory=std::env::temp_dir().join(format!("codex-update-policy-{}-{}",std::process::id(),crate::settings::now())).join("TrafficService");let image=directory.join(IMAGE);
-        let old=Receipt{schema:1,product:PRODUCT.into(),owner_sid:"S-1-5-21-1".into(),version:"1.0.0".into(),protocol:PROTOCOL,sha256:"a".repeat(64),loader_sha256:LOADER_HASH.into(),image:image.to_string_lossy().into(),service_command:command(&image).unwrap(),phase:"installed".into(),readiness:"scm_configuration_verified".into(),previous:None,created_parent:true};
+        let old=Receipt{schema:1,product:PRODUCT.into(),owner_sid:"S-1-5-21-1".into(),version:"1.0.2".into(),protocol:PROTOCOL,sha256:"a".repeat(64),loader_sha256:LOADER_HASH.into(),image:image.to_string_lossy().into(),service_command:command(&image).unwrap(),phase:"installed".into(),readiness:"scm_configuration_verified".into(),previous:None,created_parent:true};
         assert!(update_policy(&old).unwrap());let mut current=old.clone();current.version=SERVICE_VERSION.into();current.sha256="b".repeat(64);assert!(!update_policy(&current).unwrap());current.sha256="d".repeat(64);assert!(!update_policy(&current).unwrap(),"GUI hash changes do not force helper replacement");current.sha256="b".repeat(64);
         let mut future=current.clone();future.version="1.9.0".into();assert!(!update_policy(&future).unwrap());future.protocol=PROTOCOL+1;assert!(update_policy(&future).is_err());future.protocol=PROTOCOL;future.version="bad".into();assert!(update_policy(&future).is_err());
         let prepared=UpdateJournal{schema:1,owner_sid:old.owner_sid.clone(),phase:"prepared".into(),old:old.clone(),new:current.clone(),previous:None,was_running:true};assert!(validate_update(&prepared,&directory,&image).is_ok());let mut committed=prepared.clone();committed.phase="committed".into();assert!(update_transition(&prepared,&committed));
