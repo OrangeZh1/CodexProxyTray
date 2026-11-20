@@ -18,7 +18,8 @@ const RUN:&str="Software\\Microsoft\\Windows\\CurrentVersion\\Run";
     fn WaitForSingleObject(handle:Handle,milliseconds:u32)->u32;
     fn SetConsoleCtrlHandler(handler:Option<unsafe extern "system" fn(u32)->i32>,add:i32)->i32;
 }
-fn reg_read(key:&str,name:&str)->Result<Option<(String,u32)>,String>{unsafe{let k=wide(key);let n=wide(name);let(mut len,mut kind)=(0,0);let status=RegGetValueW(HKCU,k.as_ptr(),n.as_ptr(),0x10000006,&mut kind,ptr::null_mut(),&mut len);if status==2{return Ok(None)}if status!=0{return Err(format!("读取用户设置失败：{status}"))}let mut data=vec![0u16;len as usize/2];let status=RegGetValueW(HKCU,k.as_ptr(),n.as_ptr(),0x10000006,&mut kind,data.as_mut_ptr().cast(),&mut len);if status!=0{return Err(format!("读取用户设置失败：{status}"))}Ok(Some((String::from_utf16_lossy(&data[..data.iter().position(|v|*v==0).unwrap_or(data.len())]),kind)))}}
+fn reg_read(key:&str,name:&str)->Result<Option<(String,u32)>,String>{reg_read_at(HKCU,key,name,0x10000006)}
+fn reg_read_at(hive:Handle,key:&str,name:&str,flags:u32)->Result<Option<(String,u32)>,String>{unsafe{let k=wide(key);let n=wide(name);let(mut len,mut kind)=(0,0);let status=RegGetValueW(hive,k.as_ptr(),n.as_ptr(),flags,&mut kind,ptr::null_mut(),&mut len);if status==2{return Ok(None)}if status!=0{return Err(format!("读取用户设置失败：{status}"))}let mut data=vec![0u16;len as usize/2];let status=RegGetValueW(hive,k.as_ptr(),n.as_ptr(),flags,&mut kind,data.as_mut_ptr().cast(),&mut len);if status!=0{return Err(format!("读取用户设置失败：{status}"))}Ok(Some((String::from_utf16_lossy(&data[..data.iter().position(|v|*v==0).unwrap_or(data.len())]),kind)))}}
 fn reg_write(key:&str,name:&str,value:Option<&str>,kind:u32)->Result<(),String>{unsafe{let k=wide(key);let n=wide(name);let mut handle=ptr::null_mut();let status=RegCreateKeyExW(HKCU,k.as_ptr(),0,ptr::null(),0,3,ptr::null_mut(),&mut handle,ptr::null_mut());if status!=0{return Err(format!("无法写入用户设置：{status}"))}let status=match value{Some(v)=>{let data=wide(v);RegSetValueExW(handle,n.as_ptr(),0,kind,data.as_ptr().cast(),(data.len()*2)as u32)},None=>RegDeleteValueW(handle,n.as_ptr())};RegCloseKey(handle);if status!=0&&status!=2{Err(format!("无法保存用户设置：{status}"))}else{Ok(())}}}
 fn autostart_command(exe:&Path)->String{format!("\"{}\" --background",exe.display())}
 pub fn autostart()->bool{std::env::current_exe().ok().and_then(|exe|reg_read(RUN,"CodexProxyTray").ok().flatten().map(|(value,_)|value.eq_ignore_ascii_case(&autostart_command(&exe)))).unwrap_or(false)}
@@ -32,17 +33,68 @@ pub fn migrate_autostart(previous:&Path,current:&Path)->Result<bool,String>{
 pub fn remove_autostart_for(image:&Path)->Result<bool,String>{
     let Some((value,kind))=reg_read(RUN,"CodexProxyTray")?else{return Ok(false)};if !owns_autostart(&value,image){return Ok(false)}reg_write(RUN,"CodexProxyTray",None,kind)?;Ok(true)
 }
+fn notify_environment(){
+    std::thread::spawn(||unsafe{let env=wide("Environment");let mut result=0;SendMessageTimeoutW(0xffffusize as Handle,0x001A,0,env.as_ptr()as isize,2,1000,&mut result);});
+}
 pub fn ensure_user_cli_path(dir:&Path)->Result<(),String>{
     let(original,kind)=reg_read("Environment","Path")?.unwrap_or((String::new(),2));let directory=dir.to_string_lossy();
     if original.split(';').any(|entry|entry.trim().trim_matches('"').trim_end_matches('\\').eq_ignore_ascii_case(directory.trim_end_matches('\\'))||entry.trim().eq_ignore_ascii_case("%APPDATA%\\npm")){return Ok(())}
     let updated=if original.is_empty(){directory.into_owned()}else{format!("{original};{directory}")};reg_write("Environment","Path",Some(&updated),kind)?;
-    std::thread::spawn(||unsafe{let env=wide("Environment");let mut result=0;SendMessageTimeoutW(0xffffusize as Handle,0x001A,0,env.as_ptr()as isize,2,1000,&mut result);});Ok(())
+    notify_environment();Ok(())
 }
 pub fn remove_legacy_cli_path(dir:&Path)->Result<bool,String>{
     let (original,kind)=reg_read("Environment","Path")?.unwrap_or((String::new(),2));let directory=dir.to_string_lossy();
     let updated=original.split(';').filter(|entry|!entry.trim().trim_matches('"').trim_end_matches('\\').eq_ignore_ascii_case(directory.trim_end_matches('\\'))).collect::<Vec<_>>().join(";");
     if updated==original{return Ok(false)}reg_write("Environment","Path",Some(&updated),kind)?;
-    std::thread::spawn(||unsafe{let env=wide("Environment");let mut result=0;SendMessageTimeoutW(0xffffusize as Handle,0x001A,0,env.as_ptr()as isize,2,1000,&mut result);});Ok(true)
+    notify_environment();Ok(true)
+}
+pub fn check_machine_cli_path()->Result<(),String>{
+    const HKLM:Handle=(-2147483646isize) as Handle;
+    let machine_path=reg_read_at(HKLM,r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment","Path",6)?;
+    if let Some((path,_))=machine_path {
+        for directory in std::env::split_paths(&path) {
+            if directory.is_absolute() && ["codex.exe","codex.com","codex.bat","codex.cmd","codex.ps1"].iter().any(|name|directory.join(name).is_file()) {
+                return Err(format!("系统 PATH 中的 {} 已提供 codex，优先于用户入口。请改用助手中的“打开 Codex CLI”。",directory.display()));
+            }
+        }
+    }
+    Ok(())
+}
+fn matches_terminal_dir(entry:&str, dir:&Path)->bool {
+    entry.trim().trim_matches('"').trim_end_matches('\\').eq_ignore_ascii_case(&dir.to_string_lossy())
+}
+fn terminal_path(original:&str, dir:&Path, enabled:bool)->String {
+    let mut entries=Vec::new();
+    let directory=dir.to_string_lossy();
+    if enabled { entries.push(directory.as_ref()); }
+    if !original.is_empty() {
+        entries.extend(original.split(';').filter(|entry| !matches_terminal_dir(entry,dir)));
+    }
+    entries.join(";")
+}
+pub fn terminal_registered(dir:&Path)->Result<bool,String>{
+    Ok(reg_read("Environment","Path")?.is_some_and(|(value,_)|value.split(';').any(|entry|matches_terminal_dir(entry,dir))))
+}
+#[cfg(test)]
+pub(crate) fn user_path_for_test()->Option<(String,u32)> { reg_read("Environment","Path").unwrap() }
+#[cfg(test)]
+#[test]
+fn terminal_path_preserves_others_and_removes_only_its_entry(){
+    let dir=Path::new(r"C:\Profile\CodexProxyTray\terminal");
+    let others=r"%APPDATA%\npm;;C:\Other;C:\Other;";
+    let original=format!(r#"{others}"c:\profile\codexproxytray\terminal\""#);
+    assert_eq!(terminal_path(&original,dir,true),format!(r"{};{}",dir.display(),others.trim_end_matches(';')));
+    assert_eq!(terminal_path(others,dir,false),others);
+    let enabled=terminal_path(others,dir,true);
+    assert_eq!(terminal_path(&enabled,dir,true),enabled);
+    assert_eq!(terminal_path(&enabled,dir,false),others);
+}
+pub fn set_terminal_path(dir:&Path,enabled:bool)->Result<(),String>{
+    if dir.to_string_lossy().contains(';'){return Err("终端入口路径含分号，无法加入用户 PATH。".into())}
+    let (original,kind)=reg_read("Environment","Path")?.unwrap_or((String::new(),2));
+    let updated=terminal_path(&original,dir,enabled);
+    if updated!=original { reg_write("Environment","Path",Some(&updated),kind)?;notify_environment(); }
+    Ok(())
 }
 pub fn wait_for_console_child(){
     // This handler belongs only to the shim; unlike the ignore flag it is not inherited.

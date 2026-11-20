@@ -153,6 +153,12 @@ jobs:
           $testExecutable=@($testExecutables)[0]
           if(-not (Test-Path -LiteralPath $testExecutable -PathType Leaf) -or $testExecutable.Contains("`n") -or $testExecutable.Contains("`r")){throw 'The current test executable is missing or invalid.'}
           "service_probe_executable=$testExecutable" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+      - name: 验证 CMD 终端接入、暂停与关闭
+        shell: pwsh
+        run: |
+          $env:CODEX_PROXY_TEST_SHIM=Join-Path $env:CARGO_TARGET_DIR 'x86_64-pc-windows-msvc/release/codex-proxy-cli.exe'
+          & '${{ steps.native-tests.outputs.service_probe_executable }}' terminal::tests::cmd_uses_opted_in_entry_and_restores_official_command --exact --ignored --test-threads=1
+          exit $LASTEXITCODE
       - name: 真实公开更新附件下载检查
         timeout-minutes: 4
         shell: pwsh

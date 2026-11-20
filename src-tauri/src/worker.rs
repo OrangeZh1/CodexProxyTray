@@ -10,7 +10,7 @@ const LOG_LIMIT:usize=200;
 #[derive(Clone,Serialize)] pub struct Status {
     pub revision:u64,pub enabled:bool,pub guard_ready:bool,pub proxy_url:String,pub proxy_reachable:bool,
     pub package_count:usize,pub package_version:Option<String>,pub codex_running:bool,pub restart_required:bool,
-    pub cli_detected:bool,pub cli_ready:bool,pub autostart:bool,pub launch_desktop:bool,pub backend_ready:bool,
+    pub cli_detected:bool,pub cli_ready:bool,pub terminal_integration:bool,pub terminal_error:Option<String>,pub autostart:bool,pub launch_desktop:bool,pub backend_ready:bool,
     pub error:Option<String>,pub logs:Vec<Log>,pub helper_pid:u32,pub updated_at:u64,pub started_at:u64,
     pub proxy_latency_ms:Option<f64>,pub probe_history:Vec<Probe>,pub desktop_pid:Option<u32>,pub tcp_connections:Option<usize>,pub helper_memory_bytes:Option<u64>,pub log_storage_error:Option<String>,
     pub launch_target:LaunchTarget,pub cli_workdir:String,pub network_enabled:bool,pub auto_check_updates:bool,pub update_interval_hours:u32,pub update:crate::update::UpdateState,
@@ -23,7 +23,7 @@ const LOG_LIMIT:usize=200;
     pub traffic_enabled:bool,pub traffic_service:crate::traffic_service::ServiceSnapshot,
 }
 impl Status {
-    fn new()->Self {Self{revision:0,enabled:false,guard_ready:false,proxy_url:core::DEFAULT_PROXY.into(),proxy_reachable:false,package_count:0,package_version:None,codex_running:false,restart_required:false,cli_detected:false,cli_ready:false,autostart:platform::autostart(),launch_desktop:false,backend_ready:true,error:None,logs:vec![],helper_pid:std::process::id(),updated_at:settings::now(),started_at:settings::now(),proxy_latency_ms:None,probe_history:vec![],desktop_pid:None,tcp_connections:None,helper_memory_bytes:None,log_storage_error:None,launch_target:LaunchTarget::None,cli_workdir:String::new(),network_enabled:true,auto_check_updates:false,update_interval_hours:6,update:crate::update::snapshot(),guard_uptime_ms:0,connectivity_enabled:true,connectivity:crate::connectivity::snapshot(),traffic:crate::traffic::TrafficSnapshot::disabled(),traffic_history:vec![],desktop_operation:crate::desktop_lifecycle::snapshot(),cli_management:crate::cli_manager::snapshot(),update_notice:crate::update_notice::snapshot(),app_update:crate::app_update::snapshot(),desktop_proxy:crate::desktop_proxy::state(None,core::DEFAULT_PROXY,false),traffic_enabled:false,traffic_service:crate::traffic_service::snapshot()}}
+    fn new()->Self {Self{revision:0,enabled:false,guard_ready:false,proxy_url:core::DEFAULT_PROXY.into(),proxy_reachable:false,package_count:0,package_version:None,codex_running:false,restart_required:false,cli_detected:false,cli_ready:false,terminal_integration:false,terminal_error:None,autostart:platform::autostart(),launch_desktop:false,backend_ready:true,error:None,logs:vec![],helper_pid:std::process::id(),updated_at:settings::now(),started_at:settings::now(),proxy_latency_ms:None,probe_history:vec![],desktop_pid:None,tcp_connections:None,helper_memory_bytes:None,log_storage_error:None,launch_target:LaunchTarget::None,cli_workdir:String::new(),network_enabled:true,auto_check_updates:false,update_interval_hours:6,update:crate::update::snapshot(),guard_uptime_ms:0,connectivity_enabled:true,connectivity:crate::connectivity::snapshot(),traffic:crate::traffic::TrafficSnapshot::disabled(),traffic_history:vec![],desktop_operation:crate::desktop_lifecycle::snapshot(),cli_management:crate::cli_manager::snapshot(),update_notice:crate::update_notice::snapshot(),app_update:crate::app_update::snapshot(),desktop_proxy:crate::desktop_proxy::state(None,core::DEFAULT_PROXY,false),traffic_enabled:false,traffic_service:crate::traffic_service::snapshot()}}
     fn sample_traffic(&mut self){
         use crate::traffic::TrafficState;
         let sample=&self.traffic;
@@ -48,7 +48,7 @@ fn traffic_demand(guard:bool,preference:bool,valid_config:bool,service_paused:bo
 fn traffic_action(desired:bool,applied:bool,stop_pending:bool,requested:bool)->Option<bool>{if stop_pending{Some(false)}else if requested||desired!=applied{Some(desired)}else{None}}
 fn traffic_action_finished(enable:bool,success:bool,applied:bool)->(bool,bool){if enable{(true,false)}else if success{(false,false)}else{(applied,true)}}
 #[derive(Default)]pub struct Preferences {pub autostart:Option<bool>,pub launch_target:Option<LaunchTarget>,pub cli_workdir:Option<String>,pub network_enabled:Option<bool>,pub auto_check_updates:Option<bool>,pub update_interval_hours:Option<u32>,pub connectivity_enabled:Option<bool>}
-pub enum Message {Enabled(bool,Option<Reply>),TrafficEnabled(bool,Reply),ServicePause(Reply),ServiceFinished(bool,Reply),Notice(String,String,String,String),Proxy(String,Reply),System(Preferences,Reply),Refresh(Reply),Launch(Reply),LaunchCli(Reply),Stop}
+pub enum Message {Enabled(bool,Option<Reply>),TerminalIntegration(bool,Reply),TrafficEnabled(bool,Reply),ServicePause(Reply),ServiceFinished(bool,Reply),Notice(String,String,String,String),Proxy(String,Reply),System(Preferences,Reply),Refresh(Reply),Launch(Reply),LaunchCli(Reply),Stop}
 pub struct Controller {pub status:Arc<Mutex<Status>>,pub tx:Sender<Message>,pub traffic:Arc<Mutex<crate::traffic::Coordinator>>,worker:Mutex<Option<JoinHandle<()>>>}
 impl Controller {
     pub fn new(notify:impl Fn(&Status)+Send+'static)->Self {
@@ -69,11 +69,34 @@ impl Controller {
             status.log("info","生命周期","守护进程已启动",format!("版本 {} · PID {}\n程序：{}\n配置：{}",env!("CARGO_PKG_VERSION"),status.helper_pid,exe.display(),root.display()));
             status.log("info","配置","已读取启动配置",format!("代理：{}\n登录自动启动：{} · 启动目标：{}",config.proxy_url,yes(status.autostart),target_name(config.launch_target)));
             if let Err(error)=platform::remove_legacy_cli_path(&root.join("cli")){status.log("warning","CLI","旧版命令入口的 PATH 项未能移除",error);}
+            let terminal_dir=root.join("terminal");
+            let terminal_source=exe.with_file_name("codex-proxy-cli.exe");
+            match platform::terminal_registered(&terminal_dir) {
+                Ok(true)=>{
+                    status.terminal_integration=true;
+                    if let Err(error)=crate::terminal::enable(&root,&terminal_source) {
+                        status.terminal_error=Some(error.clone());status.log("warning","CLI","终端接入需要检查",error);
+                    }
+                },
+                Ok(false)=>{},
+                Err(error)=>status.log("warning","CLI","无法读取终端接入设置",error),
+            }
             let mut cli_error=None;let mut first=true;let restarting=std::env::args().any(|arg|arg=="--after-update");let mut auto_desktop_pending=!restarting&&config.launch_target.opens_desktop()&&config_error.is_none();let mut auto_cli_pending=!restarting&&config.launch_target.opens_cli()&&config_error.is_none();let mut cli_checked=Instant::now();let mut update_seen=status.update.checked_at;let mut traffic_applied=false;let mut traffic_stop_pending=false;let mut service_paused=false;
             loop {
                 let(mut pending,mut result,mut stopping,mut guard_action,mut manual)=(None,Ok(()),false,false,None);let mut traffic_requested=false;
                 if !first {match rx.recv_timeout(Duration::from_secs(2)) {
                     Ok(Message::Enabled(enabled,reply))=>{pending=reply;if enabled&&config_error.is_some(){result=Err("请先保存有效的代理设置。".into());}else if let Err(error)=settings::save_guard_enabled(&root,enabled){result=Err(error);}else{guard_action=true;traffic_requested=true;if enabled&&!status.enabled {guard_started=Instant::now();status.guard_uptime_ms=0;}if status.enabled&&!enabled {status.guard_uptime_ms=guard_started.elapsed().as_millis()as u64;}status.enabled=enabled;status.log("info","守护",if enabled{"已启用代理守护"}else{"已暂停代理守护"},"作用于 ChatGPT 与 Windows Codex CLI；已运行进程保留启动时的环境。");}},
+                    Ok(Message::TerminalIntegration(enabled,reply))=>{
+                        pending=Some(reply);
+                        result=if enabled && (config_error.is_some() || !status.cli_ready || crate::cli_manager::is_mutating()) {
+                            Err("请等待 Codex CLI 专用入口就绪后再开启。".into())
+                        } else if enabled { crate::terminal::enable(&root,&terminal_source) }
+                        else { crate::terminal::disable(&root) };
+                        if result.is_ok(){
+                            status.terminal_integration=enabled;status.terminal_error=None;
+                            status.log("info","CLI",if enabled{"已开启终端接入"}else{"已关闭终端接入"},"重新打开终端后生效。");
+                        }
+                    },
                     Ok(Message::TrafficEnabled(enabled,reply))=>{pending=Some(reply);if config_error.is_some(){result=Err("配置无法读取，请先修复配置。".into());}else{let mut next=config.clone();next.traffic_enabled=enabled;match settings::save(&root,&next){Ok(())=>{config=next;traffic_requested=true;},Err(error)=>result=Err(error)}}},
                     Ok(Message::ServicePause(reply))=>{pending=Some(reply);service_paused=true;traffic_requested=true;},
                     Ok(Message::ServiceFinished(uninstalled,reply))=>{pending=Some(reply);service_paused=false;traffic_requested=true;if uninstalled{config.traffic_enabled=false;if config_error.is_none(){if let Err(error)=settings::save(&root,&config){status.log("warning","配置","辅助服务已卸载，但统计偏好未能保存",error);}}else{status.log("warning","配置","辅助服务已卸载，原配置文件已保留","配置原本无法读取，未覆盖它；本次运行已停止统计。");}}},
@@ -171,7 +194,7 @@ impl Controller {
                 publish(&root,&shared,&mut status,&mut persisted,history_writable,&mut last_status_write,&notify);
                 if let Some(reply)=pending {let _=reply.send(result.map(|_|status.clone()));}
                 if first&&config_error.is_none()&&!crate::cli_manager::is_mutating() {
-                    match install_cli(&root,&exe,&mut config) {Ok(ready)=>{status.cli_ready=ready;status.log(if ready{"info"}else{"warning"},"CLI",if ready{"Codex CLI 专用入口已就绪"}else{"未检测到 Windows Codex CLI"},if ready{format!("专用入口：{}\n实际程序：{}\n从助手打开 CLI 时使用内部代理入口；普通终端保留官方 npm 入口。",root.join("cli/codex-proxy-cli.exe").display(),config.cli_command.join(" "))}else{"安装后将自动检测并准备专用入口。".into()});},Err(e)=>{let message=format!("CLI 接入失败：{e}");status.log("error","CLI","CLI 入口准备失败",message.clone());cli_error=Some(message.clone());if status.error.is_none(){status.error=Some(message);}}}
+                    match install_cli(&root,&exe,&mut config) {Ok(ready)=>{status.cli_ready=ready;status.log(if ready{"info"}else{"warning"},"CLI",if ready{"Codex CLI 专用入口已就绪"}else{"未检测到 Windows Codex CLI"},if ready{format!("专用入口：{}\n实际程序：{}\n从助手打开 CLI 时使用内部代理入口。普通终端按“终端接入”设置启动。",root.join("cli/codex-proxy-cli.exe").display(),config.cli_command.join(" "))}else{"安装后将自动检测并准备专用入口。".into()});},Err(e)=>{let message=format!("CLI 接入失败：{e}");status.log("error","CLI","CLI 入口准备失败",message.clone());cli_error=Some(message.clone());if status.error.is_none(){status.error=Some(message);}}}
                     status.cli_detected=!settings::detect_cli(&root).is_empty();if let Ok(event)=&event {event.set(status.enabled&&status.cli_ready);}
                     publish(&root,&shared,&mut status,&mut persisted,history_writable,&mut last_status_write,&notify);
                 }

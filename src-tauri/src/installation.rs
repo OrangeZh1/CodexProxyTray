@@ -55,14 +55,14 @@ fn path_text(path:&Path)->Result<String,String>{
 }
 fn absolute(path:&Path)->bool{path.is_absolute()&&!path.components().any(|part|matches!(part,Component::ParentDir|Component::CurDir))&&path.to_str().is_some_and(|value|!value.contains(['\0','"'])&&value.encode_utf16().count()<32767)}
 fn same_path(first:&Path,second:&Path)->bool{matches!((path_text(first),path_text(second)),(Ok(a),Ok(b))if a.eq_ignore_ascii_case(&b))}
-fn plain(path:&Path)->Result<(),String>{
+pub(crate) fn plain(path:&Path)->Result<(),String>{
     for part in path.ancestors(){let metadata=fs::symlink_metadata(part).map_err(|_|"安装路径无法验证，原文件已保留。")?;if metadata.file_attributes()&0x400!=0{return Err("安装路径包含重解析点，原文件已保留。".into())}}Ok(())
 }
-fn read_json<T:for<'de>Deserialize<'de>>(path:&Path,limit:u64)->Result<T,String>{
+pub(crate) fn read_json<T:for<'de>Deserialize<'de>>(path:&Path,limit:u64)->Result<T,String>{
     plain(path)?;let file=File::open(path).map_err(|_|"安装记录无法读取。")?;let metadata=file.metadata().map_err(|_|"安装记录无法验证。")?;if !metadata.is_file()||metadata.len()>limit{return Err("安装记录超过读取范围。".into())}
     let mut bytes=vec![];file.take(limit+1).read_to_end(&mut bytes).map_err(|_|"安装记录读取失败。")?;if bytes.len()as u64>limit{return Err("安装记录超过读取范围。".into())}serde_json::from_slice(&bytes).map_err(|_|"安装记录格式无效，原文件已保留。".into())
 }
-fn sha256(path:&Path)->Result<String,String>{unsafe{
+pub(crate) fn sha256(path:&Path)->Result<String,String>{unsafe{
     plain(path)?;let metadata=fs::metadata(path).map_err(|_|"安装文件无法读取。")?;if !metadata.is_file()||metadata.len()>128*1024*1024{return Err("安装文件超过校验范围。".into())}
     let mut algorithm=BCRYPT_ALG_HANDLE::default();if BCryptOpenAlgorithmProvider(&mut algorithm,BCRYPT_SHA256_ALGORITHM,PCWSTR::null(),BCRYPT_OPEN_ALGORITHM_PROVIDER_FLAGS(0)).0<0{return Err("无法创建安装文件校验。".into())}
     let mut hash=BCRYPT_HASH_HANDLE::default();let result=(||{if BCryptCreateHash(algorithm,&mut hash,None,None,0).0<0{return Err("无法初始化安装文件校验。".into())}let mut file=File::open(path).map_err(|_|"安装文件校验读取失败。")?;let mut bytes=[0u8;65536];let mut total=0u64;loop{let count=file.read(&mut bytes).map_err(|_|"安装文件校验读取失败。")?;if count==0{break}total+=count as u64;if total>128*1024*1024{return Err("安装文件超过校验范围。".into())}if BCryptHashData(hash,&bytes[..count],0).0<0{return Err("安装文件校验失败。".into())}}if total!=metadata.len(){return Err("安装文件在校验期间发生变化。".into())}let mut digest=[0u8;32];if BCryptFinishHash(hash,&mut digest,0).0<0{return Err("安装文件校验失败。".into())}Ok(digest.iter().map(|byte|format!("{byte:02x}")).collect())})();if !hash.0.is_null(){let _=BCryptDestroyHash(hash);}let _=BCryptCloseAlgorithmProvider(algorithm,0);result
@@ -204,7 +204,7 @@ pub fn set_process_identity()->Result<(),String>{unsafe{let id=wide(APP_ID);SetC
 pub fn entry(args:&[OsString])->Option<i32>{
     if !args.iter().any(|value|value=="--register-installation"||value=="--unregister-installation"){return None}let action=args.first().and_then(|value|value.to_str()).unwrap_or("");
     Some(match (||{if args.len()!=1||!matches!(action,"--register-installation"|"--unregister-installation"){return Err("安装注册参数无效。".to_owned())}let owner=current_sid()?;let _lock=identity_lock(&owner)?;let installation=Installation::own(&owner)?;
-        if action=="--register-installation"{let desktop=desktop_preference(&installation)?;register(&installation,desktop)?;shortcut(&installation.exe,Some(&installation.root),true)?;desktop_shortcut(&installation,desktop)}else{if let Some(previous)=registration(&owner)?{if !same_installation(&previous,&installation.receipt){return Err("产品注册项属于其他安装，未移除任何入口。".into())}}remove_shortcuts(&installation)?;desktop_shortcut(&installation,false)?;crate::platform::remove_autostart_for(&PathBuf::from(path_text(&installation.exe)?))?;unregister(&installation)}
+        if action=="--register-installation"{let desktop=desktop_preference(&installation)?;register(&installation,desktop)?;shortcut(&installation.exe,Some(&installation.root),true)?;desktop_shortcut(&installation,desktop)}else{if let Some(previous)=registration(&owner)?{if !same_installation(&previous,&installation.receipt){return Err("产品注册项属于其他安装，未移除任何入口。".into())}}crate::terminal::cleanup(&crate::settings::root())?;remove_shortcuts(&installation)?;desktop_shortcut(&installation,false)?;crate::platform::remove_autostart_for(&PathBuf::from(path_text(&installation.exe)?))?;unregister(&installation)}
     })(){Ok(())=>0,Err(error)=>{eprintln!("{error}");2}})
 }
 

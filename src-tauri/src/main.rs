@@ -14,6 +14,7 @@ mod core;
 #[cfg(windows)] mod folder_picker;
 #[cfg(windows)] mod settings;
 #[cfg(windows)] mod platform;
+#[cfg(windows)] mod terminal;
 #[cfg(windows)] mod worker;
 #[cfg(windows)] mod update;
 #[cfg(windows)] mod app_update;
@@ -54,6 +55,7 @@ mod core;
     async fn request(state:State<'_,Controller>,make:impl FnOnce(std::sync::mpsc::Sender<Result<Status,String>>)->Message+Send+'static)->Result<Status,String>{request_to(state.tx.clone(),make).await}
     async fn request_to(tx:std::sync::mpsc::Sender<Message>,make:impl FnOnce(std::sync::mpsc::Sender<Result<Status,String>>)->Message+Send+'static)->Result<Status,String>{let _lease=crate::app_update::management()?;tauri::async_runtime::spawn_blocking(move||{let(reply,rx)=std::sync::mpsc::channel();tx.send(make(reply)).map_err(|_|"后台已退出".to_owned())?;rx.recv_timeout(std::time::Duration::from_secs(8)).map_err(|_|"操作仍在处理中，请查看当前状态。".to_owned())?}).await.map_err(|e|e.to_string())?}
     #[tauri::command] async fn set_enabled(enabled:bool,state:State<'_,Controller>)->Result<Status,String>{request(state,move|r|Message::Enabled(enabled,Some(r))).await}
+    #[tauri::command] async fn set_terminal_integration(enabled:bool,state:State<'_,Controller>)->Result<Status,String>{request(state,move|r|Message::TerminalIntegration(enabled,r)).await}
     #[tauri::command] async fn save_proxy(proxy_url:String,state:State<'_,Controller>)->Result<Status,String>{request(state,move|r|Message::Proxy(proxy_url,r)).await}
     #[tauri::command] async fn save_system(autostart:Option<bool>,launch_target:Option<crate::settings::LaunchTarget>,cli_workdir:Option<String>,network_enabled:Option<bool>,auto_check_updates:Option<bool>,update_interval_hours:Option<u32>,connectivity_enabled:Option<bool>,state:State<'_,Controller>)->Result<Status,String>{request(state,move|r|Message::System(Preferences{autostart,launch_target,cli_workdir,network_enabled,auto_check_updates,update_interval_hours,connectivity_enabled},r)).await}
     #[tauri::command]async fn choose_cli_workdir(initial_directory:Option<String>,window:tauri::WebviewWindow,state:State<'_,Controller>)->Result<Option<String>,String>{
@@ -141,7 +143,7 @@ mod core;
         let refreshing=std::env::args().any(|s|s=="--refresh");
         let background=quitting||refreshing||std::env::args().any(|s|s=="--background");
         let app=tauri::Builder::default().manage(UiStartup{ready:AtomicBool::new(false),show_requested:AtomicBool::new(!background),page:std::sync::Mutex::new(None),tray_ready:AtomicBool::new(false),tray_requested:AtomicBool::new(false),tray_height:AtomicU32::new(380),tray_point:std::sync::Mutex::new(None)}).plugin(tauri_plugin_single_instance::init(|app,args,_|{if args.iter().any(|arg|arg=="--quit"){if let Err(error)=request_quit(app){let _=app.state::<Controller>().tx.send(Message::Notice("warning".into(),"生命周期".into(),"退出助手已暂缓".into(),error));}}else if args.iter().any(|arg|arg=="--refresh"){let(tx,_)=std::sync::mpsc::channel();let _=app.state::<Controller>().tx.send(Message::Refresh(tx));}else if !args.iter().any(|arg|arg=="--background"){show(app);}}))
-            .invoke_handler(tauri::generate_handler![get_status,report_ui_error,record_ui_event,frontend_ready,navigate_main,quit_helper,set_enabled,save_proxy,save_system,choose_cli_workdir,refresh_status,launch_codex,launch_cli,capture_desktop_target,manage_desktop,check_cli_updates,cancel_cli,install_cli,update_cli,uninstall_cli,get_runtime_connections,get_runtime_memory,get_usage,get_usage_prices,set_usage_price_sync,reload_usage_prices,open_usage_prices_dir,get_usage_exchange_rate,check_updates,download_app_update,install_app_update,get_flow_logs,set_flow_logging,check_connectivity,enable_traffic,disable_traffic,install_traffic_service,uninstall_traffic_service,open_release,open_source,open_logs])
+            .invoke_handler(tauri::generate_handler![get_status,report_ui_error,record_ui_event,frontend_ready,navigate_main,quit_helper,set_enabled,set_terminal_integration,save_proxy,save_system,choose_cli_workdir,refresh_status,launch_codex,launch_cli,capture_desktop_target,manage_desktop,check_cli_updates,cancel_cli,install_cli,update_cli,uninstall_cli,get_runtime_connections,get_runtime_memory,get_usage,get_usage_prices,set_usage_price_sync,reload_usage_prices,open_usage_prices_dir,get_usage_exchange_rate,check_updates,download_app_update,install_app_update,get_flow_logs,set_flow_logging,check_connectivity,enable_traffic,disable_traffic,install_traffic_service,uninstall_traffic_service,open_release,open_source,open_logs])
             .setup(move|app|{
                 if quitting {app.handle().exit(0);return Ok(());}
                 TrayIconBuilder::with_id("main-tray").icon(tray_image()).tooltip("CodexProxyTray").show_menu_on_left_click(false)
