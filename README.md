@@ -48,9 +48,9 @@ CodexProxyTray 为 ChatGPT 桌面端和 Windows Codex CLI 提供带代理的启�
 
 ### 下载正式版本
 
-当前正式版本为 [v0.2.9](https://github.com/OrangeZh1/CodexProxyTray/releases/tag/v0.2.9)。推荐选择 Windows x64 安装包 `CodexProxyTray-v0.2.9-windows-x64-setup.exe`，按“欢迎 → 安装位置 → 图标选项 → 安装 → 完成”操作。新安装可选择其他本机目录或磁盘，并选择是否创建桌面快捷方式；默认使用当前用户目录，已有安装升级沿用原位置。安装器会注册“已安装的应用”和正常启动入口；配置与日志单独保存。
+当前正式版本为 [v0.2.10](https://github.com/OrangeZh1/CodexProxyTray/releases/tag/v0.2.10)。推荐选择 Windows x64 安装包 `CodexProxyTray-v0.2.10-windows-x64-setup.exe`，按“欢迎 → 安装位置 → 图标选项 → 安装 → 完成”操作。新安装可选择其他本机目录或磁盘，并选择是否创建桌面快捷方式；默认使用当前用户目录，已有安装升级沿用原位置。安装器会注册“已安装的应用”和正常启动入口；配置与日志单独保存。
 
-也提供 `CodexProxyTray-v0.2.9-windows-x64.zip` 便携包。完整解压到固定目录后运行 `CodexProxyTray.exe`，便携运行不等于标准安装。
+也提供 `CodexProxyTray-v0.2.10-windows-x64.zip` 便携包。完整解压到固定目录后运行 `CodexProxyTray.exe`，便携运行不等于标准安装。
 
 已标准安装、但旧版内置更新报 `current` 目录被占用时，请手动下载本版 Setup，沿用原安装位置升级。新安装器会核验并处理代码尚未切换的失败任务，保留原更新包、配置、日志和失败记录；无法验证的状态会保留现场并停止。
 
@@ -65,7 +65,7 @@ GitHub 自动生成的 Source code 是源码归档；日常使用请下载上面
 1. 启动本机代理客户端，确认 HTTP / mixed 端口可用；使用该端口接入目标应用时，无需特意开启 TUN 或系统全局代理。
 2. 打开 CodexProxyTray，在“代理”页填入地址并点击“应用”。
 3. 确认代理端口可用、对应应用已接入，并保持守护开启。
-4. 打开 ChatGPT，或从助手打开 Codex CLI。要在项目目录直接输入 `codex`，请在支持此功能的版本中开启“设置 → Codex CLI → 终端接入”，完全退出并重开 CMD、Windows Terminal 或承载终端的编辑器。
+4. 打开 ChatGPT，或从助手打开 Codex CLI。要在项目目录直接输入 `codex`，请开启“设置 → Codex CLI → 终端接入”，完全退出并重开 CMD、Windows Terminal 或承载终端的编辑器。
 5. 关闭主窗口，让助手留在托盘继续运行。
 
 **首次接入时注意：**
@@ -73,13 +73,12 @@ GitHub 自动生成的 Source code 是源码归档；日常使用请下载上面
 - 已经运行的 ChatGPT 保留原来的启动环境。保存工作后，在方便时手动完整退出并重新打开一次，新的代理环境才会生效。
 - “终端接入”默认关闭。开启时助手将自己的终端入口目录放在当前用户 PATH 首位，继续调用原有 CLI。守护运行时，新启动的 CLI 使用已保存的代理。暂停守护或退出助手后，后续启动沿用终端环境。关闭“终端接入”后，新终端恢复官方入口。
 - 在新 CMD 中用 `where codex` 检查优先入口，开启后首项应为 `%LOCALAPPDATA%\CodexProxyTray\terminal\codex.exe`。运行 `codex --proxy-info` 可以核对守护和代理地址。项目内同名程序、PowerShell 别名或自定义终端 PATH 可能有更高优先级。
-- v0.2.9 正式版可通过“打开 Codex CLI”使用代理入口；终端接入开关尚未随该版本发布。
 - 登录自动启动和启动后自动打开应用默认关闭，可在设置中开启。
 - 没有保存记录时代理守护默认暂停；手动开启或暂停后，下次启动恢复该选择。
 
 ## 界面与功能
 
-以下功能说明对应 [v0.2.9](https://github.com/OrangeZh1/CodexProxyTray/releases/tag/v0.2.9)，发行包内容以对应 Release 说明为准；旧版便携包需要更新后才能使用新增功能。
+以下功能说明对应 [v0.2.10](https://github.com/OrangeZh1/CodexProxyTray/releases/tag/v0.2.10)，发行包内容以对应 Release 说明为准；旧版便携包需要更新后才能使用新增功能。
 
 | 页面 | 可以做什么 |
 | --- | --- |
@@ -267,6 +266,11 @@ Windows 原生检查先在助手未启动时捕获代理环境基线，再启动
 界面区分后台同步、等待日志写入、跳过的记录、未支持的压缩文件与统计范围限制；正常去重、合并展示和最近 500 条明细限制不代表汇总数据丢失。更新检查失败保留上次成功查到的版本，并明确标记该信息尚未重新确认；手动重试重新请求更新清单。
 
 用量持久索引设计参考 [agent-speed HistoryStore](https://github.com/zoefix/agent-speed/blob/cae43de7b4ab28219815d31616132e4b4b648cf6/windows/src/AgentSpeed.Core/History/HistoryStore.cs) 与 [CC Switch Codex 会话同步](https://github.com/farion1231/cc-switch/blob/86c749b98e76f2ccf7877e718aa3060725aea651/src-tauri/src/services/session_usage_codex.rs) 的机制；服务兼容机制仅参考 agent-speed。这里复用本项目现有解析器与增量读取，没有引入其他项目的数据库实现。
+
+### v0.2.10 的主要变化
+
+- “设置 → Codex CLI → 终端接入”新增默认关闭的开关。开启后，完全退出并重新打开终端，即可在项目目录输入 `codex` 使用守护代理。
+- 支持独立会话的 CLI 会在本次启动中使用当前代理，可继续传入提示词、模型参数或 `resume --last`。关闭接入后，新终端恢复官方命令入口。
 
 ### v0.2.9 的主要变化
 
