@@ -106,7 +106,9 @@ mod tests {
         let package=npm.join("node_modules/@openai/codex");
         fs::create_dir_all(package.join("bin")).unwrap();
         fs::write(package.join("package.json"),br#"{"name":"@openai/codex","bin":{"codex":"bin/codex.js"}}"#).unwrap();
-        fs::write(package.join("bin/codex.js"),include_bytes!("../../tests/mock-codex.mjs")).unwrap();
+        let script=package.join("bin/codex.js");
+        let legacy_cli=include_str!("../../tests/mock-codex.mjs");
+        fs::write(&script,legacy_cli).unwrap();
         fs::write(npm.join("codex.cmd"),b"@echo official\r\n").unwrap();
         env::set_var("LOCALAPPDATA",temp.path());env::set_var("APPDATA",&roaming);
         let root=settings::root();fs::create_dir(&root).unwrap();
@@ -134,10 +136,15 @@ mod tests {
         let event=platform::GuardEvent::new(&settings::event_name(&root)).unwrap();
         event.set(true);
         let read=|args:&str|serde_json::from_str::<serde_json::Value>(&run(&effective,args)).unwrap();
+        assert_eq!(read("codex")["argv"],serde_json::json!([]));
+        let help="if(process.argv[2]==='--help'){console.log('  --no-daemon  Run without the shared server');process.exit(0);}";
+        fs::write(&script,format!("{help}\n{legacy_cli}")).unwrap();
         let guarded=read("codex");
         assert_eq!(guarded["argv"],serde_json::json!(["--no-daemon"]));
         assert_eq!(guarded["proxy"]["HTTPS_PROXY"],crate::core::DEFAULT_PROXY);
         assert_eq!(read("codex resume --last")["argv"],serde_json::json!(["--no-daemon","resume","--last"]));
+        assert_eq!(read("codex -m demo hello")["argv"],serde_json::json!(["--no-daemon","-m","demo","hello"]));
+        assert_eq!(read("codex --no-daemon")["argv"],serde_json::json!(["--no-daemon"]));
         event.set(false);
         assert!(read("codex")["proxy"]["HTTPS_PROXY"].is_null());
         assert_eq!(read("codex")["argv"],serde_json::json!([]));

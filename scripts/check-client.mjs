@@ -173,14 +173,18 @@ for(const view of ['main','tray'])for(const theme of ['light','dark']){
       assert.equal(window.document.querySelector('#autostart').getAttribute('aria-busy'),'false');
       backend.terminal_integration=true;backend.revision++;integration.resolve(structuredClone(backend));
       await until(()=>terminalSwitch.checked && !terminalSwitch.disabled,'Terminal integration enabled');
+      await dismissNotices();
       const failedDisable=hold('set_terminal_integration');
       terminalSwitch.click();await until(()=>failedDisable.started,'Terminal integration disable starts');
       failedDisable.reject(Error('模拟终端设置写入失败'));
       await until(()=>terminalSwitch.checked && !terminalSwitch.disabled,'Failed disable preserves terminal setting');
+      await until(()=>window.document.querySelector('.app-toast')?.textContent.includes('模拟终端设置写入失败'),'Terminal integration failure is visible');
+      await dismissNotices();
       const disableIntegration=hold('set_terminal_integration');
       terminalSwitch.click();await until(()=>disableIntegration.started,'Retry terminal integration disable');
       backend.terminal_integration=false;backend.revision++;disableIntegration.resolve(structuredClone(backend));
       await until(()=>!terminalSwitch.checked && !terminalSwitch.disabled,'Terminal integration disabled');
+      await dismissNotices();
       const directoryInput=window.document.querySelector('#cli-workdir'),directoryPicker=window.document.querySelector('#choose-cli-workdir'),beforeDirectorySave=count('save_system');assert.equal(directoryPicker.getAttribute('aria-label'),'浏览工作目录');const cancelledPicker=hold('choose_cli_workdir');directoryPicker.click();await until(()=>cancelledPicker.started,'Directory picker starts');await delay(180);assert.equal(directoryPicker.getAttribute('aria-busy'),'true');assert.equal(directoryInput.getAttribute('aria-busy'),'false');assert.equal(window.document.querySelector('#autostart').getAttribute('aria-busy'),'false');cancelledPicker.resolve(null);await until(()=>directoryPicker.getAttribute('aria-busy')==='false','Cancelling folder selection settles');assert.equal(count('save_system'),beforeDirectorySave,'A cancelled folder dialog never saves a path');
       const failedPicker=hold('choose_cli_workdir');directoryPicker.click();await until(()=>failedPicker.started,'Directory picker failure starts');failedPicker.reject(Error('QA 选择工作目录失败'));await until(()=>directoryPicker.getAttribute('aria-busy')==='false','Folder error clears picker loading');assert.equal(count('save_system'),beforeDirectorySave);await until(()=>window.document.querySelector('.app-toast')?.textContent.includes('QA 选择工作目录失败'),'Folder picker error is visible');await dismissNotices();
       const selectedDirectory='C:\\QA\\ChosenWorkspace',selectedPicker=hold('choose_cli_workdir'),selectedDirectorySave=hold('save_system');directoryPicker.click();await until(()=>selectedPicker.started,'Select a synthetic folder');selectedPicker.resolve(selectedDirectory);await until(()=>selectedDirectorySave.started,'Selected folder is validated through save_system');assert.equal(call('save_system').args.cliWorkdir,selectedDirectory);await until(()=>directoryPicker.getAttribute('aria-busy')==='false','After the dialog closes, saving belongs to the directory input');assert.equal(directoryInput.getAttribute('aria-busy'),'true');Object.assign(backend,{revision:backend.revision+1,cli_workdir:selectedDirectory});selectedDirectorySave.resolve(structuredClone(backend));await until(()=>directoryInput.getAttribute('aria-busy')==='false','Selected directory save completes');assert.equal(directoryInput.value,selectedDirectory);

@@ -8,15 +8,18 @@ mod settings;
 #[cfg(windows)]
 fn separate_session(command:&[String], args:&[std::ffi::OsString])->bool {
     use std::{os::windows::process::CommandExt, process::{Command,Stdio}};
-    if !(args.is_empty() || args.first().is_some_and(|arg|arg=="resume" || arg=="fork"))
-        || args.iter().any(|arg|arg=="--no-daemon" || arg=="--remote" || arg.to_string_lossy().starts_with("--remote=")) {
+    if args.iter().take_while(|arg| *arg!="--").any(|arg|
+        matches!(arg.to_str(), Some("--no-daemon"|"--remote"|"-h"|"--help"|"-V"|"--version"))
+        || arg.to_string_lossy().starts_with("--remote="))
+        || args.first().is_some_and(|arg|matches!(arg.to_str(),Some("app-server"|"remote-control"|"exec-server"|"mcp-server"))) {
         return false;
     }
     // CLI installations predate --no-daemon. Probe the selected installation,
     // without opening a console, before changing an interactive launch.
-    Command::new(&command[0]).args(&command[1..]).args(["--no-daemon","--version"])
-        .creation_flags(0x08000000).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null())
-        .status().is_ok_and(|status|status.success())
+    Command::new(&command[0]).args(&command[1..]).arg("--help")
+        .creation_flags(0x08000000).stdin(Stdio::null()).stderr(Stdio::null())
+        .output().is_ok_and(|output|output.status.success() && String::from_utf8_lossy(&output.stdout)
+            .lines().any(|line|line.split_whitespace().next()==Some("--no-daemon")))
 }
 
 #[cfg(windows)]
